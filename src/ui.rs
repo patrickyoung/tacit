@@ -4,6 +4,8 @@ use rune::{
 };
 use std::path::PathBuf;
 use tacit::{
+    art::{self, Garden, Style},
+    generated_art::{self, Gallery},
     model::{Role, Session, classify},
     storage,
     voice::{self, Command as VoiceCommand, Event as VoiceEvent},
@@ -78,6 +80,10 @@ enum VoiceState {
 
 pub struct State {
     pub session: Session,
+    art: Garden,
+    gallery: Gallery,
+    art_style: Style,
+    art_active: bool,
     pub draft: TextEdit,
     selected: Option<u64>,
     history: Vec<Session>,
@@ -103,6 +109,8 @@ pub struct State {
     organizer_status: String,
     previewed_draft: String,
     revealed_selection: Option<u64>,
+    recording_worker: Option<tacit::recording::Worker>,
+    pending_recordings: std::collections::HashSet<u64>,
     voice_worker: Option<voice::Worker>,
     voice_state: VoiceState,
     voice_status: String,
@@ -149,6 +157,10 @@ impl State {
     fn empty() -> Self {
         Self {
             session: Session::default(),
+            art: Garden::default(),
+            gallery: Gallery::default(),
+            art_style: Style::default(),
+            art_active: false,
             draft: TextEdit::new(""),
             selected: None,
             history: vec![],
@@ -174,6 +186,8 @@ impl State {
             organizer_status: "Offline · local rules".into(),
             previewed_draft: String::new(),
             revealed_selection: None,
+            recording_worker: None,
+            pending_recordings: Default::default(),
             voice_worker: None,
             voice_state: VoiceState::Unavailable,
             voice_status: "Hex is not connected".into(),
@@ -190,6 +204,8 @@ impl State {
         ]
         .into_iter()
         .map(|(id, name)| tacit::model::Category {
+            motif: None,
+            illustration: None,
             id: id.into(),
             name: name.into(),
         })
@@ -205,10 +221,22 @@ impl State {
             thought.category = Some(category.into());
         }
         s.organizer_status = "✦ Whole map refined · your words preserved".into();
+        s.art = Garden::settled(&s.session);
+        s
+    }
+    pub fn generated_demo() -> Self {
+        let mut s = Self::themed_demo();
+        s.gallery.load_demo(&s.session);
+        s
+    }
+    pub fn art_demo() -> Self {
+        let mut s = Self::themed_demo();
+        s.art = Garden::default();
         s
     }
     pub fn demo() -> Self {
         Self {
+            art: Garden::settled(&Session::demo()),
             session: Session::demo(),
             ..Self::empty()
         }
@@ -253,7 +281,7 @@ impl State {
         match event {
             VoiceEvent::Ready => {
                 self.voice_state = VoiceState::Ready;
-                self.voice_status = "Hex ready · speech stays local".into();
+                self.voice_status = "Hex ready · transcription stays local".into();
             }
             VoiceEvent::Recording => {
                 self.voice_state = VoiceState::Recording;
@@ -266,14 +294,29 @@ impl State {
                 if words.trim().is_empty() {
                     self.voice_status = "No speech heard. Try again.".into();
                 } else {
-                    let mut text = self.draft.text.clone();
-                    if !text.is_empty() && !text.ends_with(char::is_whitespace) {
-                        text.push('\n');
+                    if self.read_only {
+                        return;
                     }
-                    text.push_str(words.trim());
-                    self.draft = TextEdit::new(text);
-                    self.voice_status =
-                        "Speech added to your draft · review, then Enter to keep".into();
+                    self.checkpoint();
+                    let id = self.session.add(&words).unwrap();
+                    self.selected = Some(id);
+                    self.save();
+                    let request = tacit::recording::Request {
+                        id,
+                        text: words.trim().to_owned(),
+                        context: self.session.clone(),
+                    };
+                    if self
+                        .recording_worker
+                        .as_ref()
+                        .is_some_and(|w| w.send.send(request).is_ok())
+                    {
+                        self.pending_recordings.insert(id);
+                        self.voice_status = "Recording saved · separating ideas in context…".into();
+                    } else {
+                        self.voice_status =
+                            "Full recording kept · automatic splitting needs OpenRouter".into();
+                    }
                 }
             }
             VoiceEvent::Cancelled => {
@@ -284,6 +327,42 @@ impl State {
                 self.voice_state = VoiceState::Unavailable;
                 self.voice_status = message;
             }
+        }
+    }
+    fn receive_recording(&mut self, response: tacit::recording::Response) {
+        if !self.pending_recordings.remove(&response.id) || self.read_only {
+            return;
+        }
+        let Some(index) = self
+            .session
+            .thoughts
+            .iter()
+            .position(|t| t.id == response.id && t.text == response.text && !t.pinned)
+        else {
+            return;
+        };
+        match response.result {
+            Ok(chunks)
+                if !chunks.is_empty()
+                    && chunks.iter().all(|c| !c.trim().is_empty())
+                    && chunks.concat() == response.text =>
+            {
+                self.checkpoint();
+                let count = chunks.len();
+                self.session.thoughts[index].text = chunks[0].trim().into();
+                self.session.thoughts[index].role = classify(&chunks[0]);
+                self.session.thoughts[index].category = None;
+                for (offset, chunk) in chunks.iter().enumerate().skip(1) {
+                    self.session.add(chunk);
+                    let thought = self.session.thoughts.pop().unwrap();
+                    self.session.thoughts.insert(index + offset, thought);
+                }
+                self.session.interpretation = None;
+                self.voice_status = format!("Recording → {count} thoughts · organizing in context");
+                self.save();
+            }
+            Err(error) => self.voice_status = format!("{error} · full recording kept"),
+            _ => self.voice_status = "Invalid split · full recording kept".into(),
         }
     }
     fn checkpoint(&mut self) {
@@ -332,6 +411,7 @@ impl State {
         }
     }
     fn undo(&mut self) {
+        self.pending_recordings.clear();
         if let Some(previous) = self.history.pop() {
             self.revision += 1;
             self.session = previous;
@@ -576,6 +656,13 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         let heading_x = if left { leaf_x + 10.0 } else { leaf_x };
         labels.push(
             row()
+                .key(format!(
+                    "theme-heading-{}",
+                    groups[group]
+                        .0
+                        .clone()
+                        .unwrap_or_else(|| format!("lens-{group}"))
+                ))
                 .absolute(heading_x, first_y - 45.0)
                 .gap(8.0)
                 .center_y()
@@ -599,6 +686,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         if entries.is_empty() {
             labels.push(
                 label("Let a thought take root…", 13.0, MUTED)
+                    .key(format!("empty-branch-{group}"))
                     .w(leaf_w)
                     .absolute(leaf_x, first_y + 12.0),
             );
@@ -686,24 +774,118 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             labels.push(node);
         }
     }
-    let halo = Path::new()
-        .move_to([center[0] - 88.0, center[1] - 42.0])
-        .cubic_to(
-            [center[0] - 105.0, center[1] - 100.0],
-            [center[0] + 95.0, center[1] - 100.0],
-            [center[0] + 90.0, center[1] - 20.0],
-        )
-        .cubic_to(
-            [center[0] + 111.0, center[1] + 84.0],
-            [center[0] - 106.0, center[1] + 95.0],
-            [center[0] - 88.0, center[1] - 42.0],
-        )
+    // Rounded, overlapping cloud lobes leave a calm interior for the title.
+    let p = |x: f32, y: f32| [center[0] + x, center[1] + y];
+    let cloud = Path::new()
+        .move_to(p(-82.0, -43.0))
+        .cubic_to(p(-88.0, -73.0), p(-54.0, -88.0), p(-32.0, -70.0))
+        .cubic_to(p(-18.0, -103.0), p(33.0, -100.0), p(45.0, -69.0))
+        .cubic_to(p(77.0, -83.0), p(105.0, -61.0), p(96.0, -33.0))
+        .cubic_to(p(127.0, -17.0), p(122.0, 25.0), p(96.0, 36.0))
+        .cubic_to(p(103.0, 69.0), p(66.0, 88.0), p(43.0, 73.0))
+        .cubic_to(p(25.0, 96.0), p(-18.0, 96.0), p(-37.0, 75.0))
+        .cubic_to(p(-66.0, 91.0), p(-99.0, 70.0), p(-94.0, 42.0))
+        .cubic_to(p(-126.0, 30.0), p(-126.0, -13.0), p(-101.0, -27.0))
+        .cubic_to(p(-100.0, -38.0), p(-92.0, -43.0), p(-82.0, -43.0))
         .close();
     drawing = drawing
-        .fill_path(&halo, WHITE)
-        .stroke_path(&halo, 2.5, LineCap::Round, GOLD);
-    let mut sheet = el().key("tree-sheet").w(width).h(height).child(
+        .fill_path(&cloud, WHITE)
+        .stroke_path(&cloud, 2.5, LineCap::Round, GOLD);
+    let mut sheet = el().key("tree-sheet").w(width).h(height);
+    let mut art_layer = el()
+        .key("background-art")
+        .absolute(0.0, 0.0)
+        .size(width, height);
+    if s.art_style != Style::Off {
+        let size = (width / 2.0 - leaf_w - 94.0).clamp(56.0, 124.0);
+        for layer in &s.art.layers {
+            if cx.is_reduced_motion() && layer.retiring() {
+                continue;
+            }
+            let slot = layer.concept.slot;
+            let left = slot % 2 == 0;
+            let x = if left {
+                leaf_w + 25.0
+            } else {
+                width - leaf_w - 25.0 - size
+            };
+            let y = offsets.get(slot / 2).copied().unwrap_or(height - 180.0)
+                - if slot < 2 { 20.0 } else { 70.0 };
+            let pigment = color(Role::ALL[slot % 4]);
+            let accent = color(Role::ALL[(slot + 1) % 4]);
+            let progress = if cx.is_reduced_motion() {
+                1.0
+            } else {
+                layer.reveal(s.art.now)
+            };
+            let opacity = if cx.is_reduced_motion() {
+                1.0
+            } else {
+                layer.opacity(s.art.now)
+            };
+            art_layer = art_layer.child(
+                canvas(art::draw(
+                    layer.concept.motif,
+                    s.art_style,
+                    pigment,
+                    accent,
+                    size,
+                    progress,
+                ))
+                .key(format!("theme-art-{}", layer.serial))
+                .absolute(x, y)
+                .size(size, size)
+                .opacity(opacity * (1.0 - s.gallery.coverage(&layer.concept.key)))
+                .motion(Spring::new(1.2, 0.05)),
+            );
+        }
+    }
+    if s.art_style != Style::Off {
+        let size = (width / 2.0 - leaf_w - 94.0).clamp(56.0, 140.0);
+        for layer in &s.gallery.layers {
+            if cx.is_reduced_motion() && layer.retired.is_some() {
+                continue;
+            }
+            let slot = layer.slot;
+            let x = if slot % 2 == 0 {
+                leaf_w + 25.0
+            } else {
+                width - leaf_w - 25.0 - size
+            };
+            let y = offsets.get(slot / 2).copied().unwrap_or(height - 180.0)
+                - if slot < 2 { 20.0 } else { 70.0 };
+            let progress = if cx.is_reduced_motion() {
+                1.0
+            } else {
+                layer.progress(s.gallery.now)
+            };
+            let opacity = if cx.is_reduced_motion() {
+                1.0
+            } else {
+                layer.opacity(s.gallery.now)
+            };
+            let art = el()
+                .key(format!("generated-{}-{}", layer.key, layer.fingerprint))
+                .absolute(x, y)
+                .size(size, size)
+                .motion(Spring::new(1.2, 0.05))
+                .opacity(opacity * progress.min(0.4) / 0.4)
+                .child(
+                    el().absolute(0.0, 0.0)
+                        .size(size, size * progress)
+                        .clip_fade(0.0, 0.0, 0.0, if progress < 1.0 { 16.0 } else { 0.0 })
+                        .child(
+                            el().pixels(layer.image.pixels())
+                                .absolute(0.0, 0.0)
+                                .size(size, size),
+                        ),
+                );
+            art_layer = art_layer.child(art);
+        }
+    }
+    sheet = sheet.child(art_layer).child(
         canvas(drawing)
+            .key("tree-branches")
             .size(width, height)
             .opacity(if cx.is_reduced_motion() {
                 1.0
@@ -772,6 +954,9 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             "toggle-story",
             |s| s.story = !s.story,
         ))
+        .child(button(s.art_style.label(), "art-style", |s| {
+            s.art_style = s.art_style.next()
+        }))
         .child(button("Undo", "undo", State::undo));
     let title = col()
         .gap(8.0)
@@ -904,12 +1089,26 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .center_y()
             .child(
                 label(
-                    format!("{}  ·  {}", s.status, s.organizer_status),
+                    format!(
+                        "{}  ·  {}{}",
+                        s.status,
+                        s.organizer_status,
+                        if s.gallery.status.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  ·  {}", s.gallery.status)
+                        }
+                    ),
                     11.0,
                     MUTED,
                 )
                 .grow(1.0),
             )
+            .child(if s.gallery.worker.is_some() {
+                button("Retry art", "retry-art", |s| s.gallery.retry())
+            } else {
+                el()
+            })
             .child(button("Retry save", "save", State::save)),
     )
 }
@@ -941,6 +1140,24 @@ fn inspector(s: &State) -> El {
             14.0,
             MUTED,
         ));
+    }
+    let selected_theme = s
+        .session
+        .thoughts
+        .iter()
+        .find(|t| Some(t.id) == s.selected)
+        .and_then(|t| t.category.as_ref())
+        .map(|id| format!("theme-{id}"));
+    if s.art_style != Style::Off
+        && let Some(art) = s.gallery.layers.iter().rev().find(|l| {
+            l.retired.is_none() && selected_theme.as_ref().is_none_or(|key| &l.key == key)
+        })
+    {
+        panel = panel.child(label("VISUAL THREAD", 10.0, MUTED)).child(
+            el().key("art-detail")
+                .pixels(art.image.pixels())
+                .size(230.0, 230.0),
+        );
     }
     if let Some(i) = &s.session.interpretation {
         panel = panel.child(label("POSSIBLE CONNECTIONS", 10.0, MUTED));
@@ -1057,6 +1274,18 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
     match cloud {
         Ok(Some(config)) => {
             s.organizer_status = "OpenRouter · quick themes + thoughtful review".into();
+            if std::env::var("TACIT_IMAGE_ART").as_deref() != Ok("off") {
+                s.gallery.worker = Some(generated_art::Worker::start(
+                    config.clone(),
+                    s.gallery.model.clone(),
+                    wake.clone(),
+                ));
+                s.gallery.status = "Art · ready to illustrate themes".into();
+            }
+            let recording_wake = wake.clone();
+            s.recording_worker = Some(tacit::recording::Worker::start(config.clone(), move || {
+                recording_wake()
+            }));
             let fast_wake = wake.clone();
             s.worker = Some(config.start(false, move || fast_wake()));
             s.reviewer = Some(config.start(true, move || wake()));
@@ -1076,7 +1305,16 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
     }
 }
 pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
-    let mut changed = false;
+    let art_deadline = s.art.update(&s.session, now);
+    let image_changed = s.gallery.update(&s.session, s.art_style, s.busy, now, tx);
+    let mut changed = image_changed || s.art_active || art_deadline.is_some();
+    s.art_active = art_deadline.is_some();
+    if s.art_style != Style::Off
+        && !s.story
+        && let Some(delay) = art_deadline
+    {
+        tx.wake_after(std::time::Duration::from_secs_f64(delay));
+    }
     while let Some(event) = s
         .voice_worker
         .as_ref()
@@ -1106,6 +1344,17 @@ pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
             tx.scroll_into_view(format!("thought-{id}"));
         }
         changed = true;
+    }
+    while let Some(response) = s
+        .recording_worker
+        .as_ref()
+        .and_then(|w| w.receive.try_recv().ok())
+    {
+        s.receive_recording(response);
+        changed = true;
+    }
+    if !s.pending_recordings.is_empty() {
+        return changed;
     }
     if s.worker.is_none() {
         return changed;
@@ -1366,16 +1615,106 @@ mod tests {
         assert_eq!(fast_requests.try_recv().unwrap().revision, 2);
     }
     #[test]
-    fn voice_result_preserves_a_typed_draft_and_waits_for_review() {
+    fn background_art_style_cycles_without_changing_the_map() {
+        let mut rt = runtime((820.0, 640.0));
+        let before = rt.state.session.clone();
+        let ids = rt
+            .state
+            .art
+            .layers
+            .iter()
+            .map(|l| l.serial)
+            .collect::<Vec<_>>();
+        for expected in [Style::Chalk, Style::Marker, Style::Off, Style::Pastel] {
+            click(&mut rt, "art-style");
+            assert!(rt.state.art_style == expected);
+            assert_eq!(rt.state.session, before);
+        }
+        rt.state.draft = TextEdit::new("Draft text does not trigger background redraws");
+        rt.frame(10.0);
+        assert_eq!(
+            ids,
+            rt.state
+                .art
+                .layers
+                .iter()
+                .map(|l| l.serial)
+                .collect::<Vec<_>>()
+        );
+        assert!(!rt.state.art_active);
+    }
+    #[test]
+    fn recording_split_keeps_order_is_undoable_and_ignores_cancelled_results() {
+        let mut state = State::empty();
+        state.receive_voice(
+            VoiceEvent::Transcript("Meetings help. Budgets hurt.".into()),
+            0.0,
+        );
+        let id = state.selected.unwrap();
+        state.pending_recordings.insert(id);
+        state.session.add("A later typed thought");
+        state.receive_recording(tacit::recording::Response {
+            id,
+            text: "Meetings help. Budgets hurt.".into(),
+            result: Ok(vec!["Meetings help. ".into(), "Budgets hurt.".into()]),
+        });
+        assert_eq!(
+            state
+                .session
+                .thoughts
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Meetings help.", "Budgets hurt.", "A later typed thought"]
+        );
+        state.session.validate().unwrap();
+        state.undo();
+        assert_eq!(
+            state.session.thoughts[0].text,
+            "Meetings help. Budgets hurt."
+        );
+        state.pending_recordings.insert(id);
+        state.undo();
+        let before = state.session.clone();
+        state.receive_recording(tacit::recording::Response {
+            id,
+            text: "Meetings help. Budgets hurt.".into(),
+            result: Ok(vec!["Meetings help. ".into(), "Budgets hurt.".into()]),
+        });
+        assert_eq!(state.session, before);
+    }
+    #[test]
+    fn invalid_split_or_removed_recording_never_loses_words() {
+        let mut state = State::empty();
+        state.receive_voice(VoiceEvent::Transcript("Full original words".into()), 0.0);
+        let id = state.selected.unwrap();
+        state.pending_recordings.insert(id);
+        state.receive_recording(tacit::recording::Response {
+            id,
+            text: "Full original words".into(),
+            result: Ok(vec!["Made up text".into()]),
+        });
+        assert_eq!(state.session.thoughts[0].text, "Full original words");
+        state.pending_recordings.insert(id);
+        state.remove_selected();
+        state.receive_recording(tacit::recording::Response {
+            id,
+            text: "Full original words".into(),
+            result: Ok(vec!["Full original words".into()]),
+        });
+        assert!(state.session.thoughts.is_empty());
+    }
+    #[test]
+    fn voice_result_preserves_typed_draft_and_saves_recording() {
         let mut state = State::demo();
         state.draft = TextEdit::new("My typed thought.");
         let before = state.session.clone();
         state.receive_voice(VoiceEvent::Transcript("My spoken thought.".into()), 0.0);
-        assert_eq!(state.draft.text, "My typed thought.\nMy spoken thought.");
-        assert_eq!(state.session, before);
+        assert_eq!(state.draft.text, "My typed thought.");
+        assert_eq!(state.session.thoughts.len(), before.thoughts.len() + 1);
         assert_eq!(state.voice_state, VoiceState::Ready);
         state.capture();
-        assert_eq!(state.session.thoughts.len(), before.thoughts.len() + 1);
+        assert_eq!(state.session.thoughts.len(), before.thoughts.len() + 2);
     }
     #[test]
     fn voice_controls_record_stop_and_cancel_without_duplicate_commands() {
@@ -1405,6 +1744,13 @@ mod tests {
         click(&mut rt, "voice-cancel");
         assert_eq!(commands.try_recv().unwrap(), VoiceCommand::Cancel);
         events.send(VoiceEvent::Cancelled).unwrap();
-        assert_eq!(rt.state.draft.text, "A thought");
+        assert_eq!(rt.state.draft.text, "");
+        assert!(
+            rt.state
+                .session
+                .thoughts
+                .iter()
+                .any(|t| t.text == "A thought")
+        );
     }
 }

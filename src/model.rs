@@ -151,6 +151,9 @@ impl Session {
                 || c.id.len() > 60
                 || c.name.trim().is_empty()
                 || c.name.chars().count() > 36
+                || c.illustration
+                    .as_ref()
+                    .is_some_and(|s| s.chars().count() > 400)
                 || !category_ids.insert(&c.id)
             {
                 return Err("Invalid saved theme".into());
@@ -209,6 +212,10 @@ pub fn classify(text: &str) -> Role {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Category {
+    #[serde(default)]
+    pub illustration: Option<String>,
+    #[serde(default)]
+    pub motif: Option<crate::art::Motif>,
     pub id: String,
     pub name: String,
 }
@@ -252,6 +259,9 @@ impl Interpretation {
                 || c.id.len() > 60
                 || c.name.trim().is_empty()
                 || c.name.chars().count() > 36
+                || c.illustration
+                    .as_ref()
+                    .is_some_and(|s| s.chars().count() > 400)
                 || !category_ids.insert(&c.id)
             {
                 return Err("Invalid or duplicate theme".into());
@@ -260,7 +270,13 @@ impl Interpretation {
         for t in session.thoughts.iter().filter(|t| t.pinned) {
             if let Some(id) = &t.category {
                 let original = session.categories.iter().find(|c| &c.id == id);
-                if self.categories.iter().find(|c| &c.id == id) != original {
+                if self
+                    .categories
+                    .iter()
+                    .find(|c| &c.id == id)
+                    .map(|c| &c.name)
+                    != original.map(|c| &c.name)
+                {
                     return Err("Review changed a pinned theme".into());
                 }
             }

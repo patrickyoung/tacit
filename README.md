@@ -20,13 +20,36 @@ Type a thought and watch its tentative placement update immediately. Press **Ent
 
 The map is a colorful radial tree: an illustrated central idea, tapered curved branches, and shorter thought labels. Select a thought to read its complete original wording. OpenRouter creates up to eight named thematic branches. Offline, four narrative lenses provide a starting point: observations, questions, tensions, and possibilities. Moving a thought pins its classification so the organizer cannot override it. Long regions scroll; smaller windows move the inspector controls beneath the map. Colored branches indicate classification, not causal claims.
 
+## Generated thematic artwork
+
+Tacit now uses OpenRouter image-generation models to paint original scenes for its themes. The default is `openai/gpt-image-2.5-flare`, with medium quality and transparent backgrounds. The **Art · pastel** control cycles through pastel, chalk, bold marker, and off. The image model receives a theme's visual brief and name, not the entire notebook. Older themes without a brief use up to three kept thoughts as context.
+
+The semantic organizer writes a concrete scene brief for each category and preserves it verbatim until the meaning changes. Images are generated on an independent background worker after themes have settled for five seconds. Classification and typing stay responsive. Images arrive one at a time; a feathered 2.4-second reveal and crossfade preserve the previous artwork while replacements are generated. Existing vector motifs remain the immediate/offline fallback. Reduced-motion mode shows completed images without reveal effects.
+
+Generation uses your existing OpenRouter key and credits. The cache is keyed by model, style and scene prompt, so reopening a map or returning to a style reuses its art. Cache files live under `$XDG_CACHE_HOME/tacit/art` (default `~/.cache/tacit/art`), with private permissions on Unix, bounded to 128 PNGs / 256 MiB. These images may depict private notebook concepts. No API keys or plaintext prompts are stored in the image cache.
+
+Set `TACIT_IMAGE_ART=off` to disable cloud image generation while keeping local artwork. `TACIT_IMAGE_MODEL` overrides the default; the selected model must support the Images API, transparent PNG output, medium quality and square aspect ratio. **Art · off** also stops queued work. A request already running may finish into the cache, but obsolete results cannot replace current art. Failed images preserve existing artwork; **Retry art** retries without changing your thoughts. No automatic retry loop runs.
+
+The visual vocabulary is no longer limited to the twelve fallback icons: generated scenes can combine concepts from the thoughts. Raster artwork reveals as a soft wash; the fallback vectors retain their stroke-by-stroke animation. Style selection is currently per app session.
+
+To verify the complete image-generation path with one fictional demo theme (a paid request unless cached):
+
+```sh
+cargo run -- --check-image
+cargo run -- --scene generated --snap /tmp/tacit-generated.png --size 1280x860
+```
+
+Normal headless snapshots never contact the network; the generated demo scene loads only existing cache entries. The explicit `--check-image` diagnostic validates the PNG by decoding it before caching.
+
 ## Voice with Hex
 
 Open your installed Hex desktop app with its microphone permission granted and a model ready. Tacit connects automatically on launch; no microphone is opened until you click **Listen**.
 
 1. Click **Listen** and speak. The red recording indicator and elapsed timer stay visible.
 2. Click **Stop & transcribe**. Hex returns the raw transcript directly to Tacit without changing the clipboard or pasting elsewhere.
-3. Review the text in the composer and press **Enter** to keep it. Speech appends to any existing typed draft.
+3. The transcript is saved immediately. With OpenRouter configured, Tacit separates it into coherent thoughts, then categorizes them using the surrounding discussion. Your typed draft stays untouched.
+
+Splitting follows ideas and topic changes, keeping explanations and dependent references together. The model selects boundaries in the original words; it cannot rewrite, omit or reorder them. The fast classifier receives the discussion context, and the stronger review reconciles the whole map afterward. **Undo** can restore the unsplit recording; undoing while a split is pending cancels its application. If splitting fails or OpenRouter is unavailable, the full transcript remains on the map. Transcription stays local in Hex; semantic splitting and classification send text to OpenRouter. Splitting happens after Stop, not while the microphone is recording.
 
 **Cancel** or **Escape** while recording discards that recording and preserves your draft. While Hex is transcribing, Tacit remains usable. A capture is owned by Tacit; it refuses to start while Hex is recording elsewhere. Authentication and ownership tokens stay in memory and are never written into the notebook or logs. The background worker sends lease heartbeats and attempts to cancel an unfinished capture on shutdown; Hex expires abandoned recordings after ten seconds without renewal.
 
@@ -34,6 +57,8 @@ Use **Reconnect Hex** after starting/restarting Hex or resolving an error. A rea
 
 ```sh
 cargo run -- --check-hex
+# Optional live check with a fictional multi-topic transcript (uses OpenRouter):
+cargo run -- --check-recording
 ```
 
 This first integration uses Hex's desktop capture API (macOS and Linux), which returns the transcript after Stop. It does **not** stream partial words yet. Windows desktop capture is currently unsupported by Hex and is reported as unavailable. Headless snapshots and automated tests never connect to your installed Hex or start its microphone.
@@ -102,6 +127,8 @@ Headless runs do not read or write your real notebook or contact OpenRouter, Oll
 
 ## Structure and current scope
 
+- `src/art.rs`: offline motifs, hand-drawn strokes, coalesced illustration transitions.
+- `src/generated_art.rs`: image model requests, stable scene briefs, bounded private cache, replacement transitions.
 - `src/model.rs`: original thoughts, narrative roles, validated model interpretations.
 - `src/storage.rs`: session loading, atomic saves, exclusive session lock.
 - `src/organizer.rs`: independent OpenRouter fast/review workers, Ollama fallback, and response validation.
@@ -109,4 +136,4 @@ Headless runs do not read or write your real notebook or contact OpenRouter, Oll
 - `src/ui.rs`: Rune canvas, vector illustrations, input, inspector, and narrative view.
 - `design/living-map.html`: the earlier conceptual exploration, independent of the Rust app.
 
-This is a first working vertical slice. The tree uses up to eight thematic branches (four narrative lenses offline) and scrolls as it grows; it is not yet an infinite spatial graph. Nested subthemes, custom illustrations per subject, drag positioning, relationship rejection, session browsing, and SVG/PDF export remain future work. The local-model integration is tested with fixtures; model quality and live inference still need validation with an installed model.
+This is a first working vertical slice. The tree uses up to eight thematic branches (four narrative lenses offline) and scrolls as it grows; it is not yet an infinite spatial graph. Nested subthemes, drag positioning, relationship rejection, session browsing, and SVG/PDF export remain future work. The local-model integration is tested with fixtures; model quality and live inference still need validation with an installed model.

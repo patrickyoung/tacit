@@ -3120,6 +3120,8 @@ dependencies = [
 name = "tacit"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "blake3",
  "openrouter-rs",
  "rune",
  "serde",

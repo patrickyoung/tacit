@@ -67,10 +67,14 @@ fn themes_validate_references_and_protect_pinned_names_and_placements() {
     let mut p = proposal(&s);
     p.categories = vec![
         Category {
+            motif: None,
+            illustration: None,
             id: "decisions".into(),
             name: "Decisions".into(),
         },
         Category {
+            motif: None,
+            illustration: None,
             id: "time".into(),
             name: "Time to think".into(),
         },
