@@ -87,6 +87,15 @@ pub struct State {
     read_only: bool,
     story: bool,
     worker: Option<tacit::organizer::Worker>,
+    reviewer: Option<tacit::organizer::Worker>,
+    review_requested: Option<u64>,
+    review_applied: Option<u64>,
+    fast_finished: Option<u64>,
+    review_due: f64,
+    settling: f32,
+    settled_at: f64,
+    busy: bool,
+    pulse: f32,
     revision: u64,
     requested: Option<u64>,
     observed: u64,
@@ -149,6 +158,15 @@ impl State {
             read_only: false,
             story: false,
             worker: None,
+            reviewer: None,
+            review_requested: None,
+            review_applied: None,
+            fast_finished: None,
+            review_due: 3.0,
+            settling: 1.0,
+            settled_at: -10.0,
+            busy: false,
+            pulse: 0.0,
             revision: 0,
             requested: None,
             observed: 0,
@@ -162,6 +180,32 @@ impl State {
             voice_started: 0.0,
             voice_seconds: 0,
         }
+    }
+    pub fn themed_demo() -> Self {
+        let mut s = Self::demo();
+        s.session.categories = [
+            ("time", "Time to think"),
+            ("decisions", "Clear ownership"),
+            ("belonging", "Being included"),
+        ]
+        .into_iter()
+        .map(|(id, name)| tacit::model::Category {
+            id: id.into(),
+            name: name.into(),
+        })
+        .collect();
+        for (thought, category) in s.session.thoughts.iter_mut().zip([
+            "time",
+            "decisions",
+            "belonging",
+            "decisions",
+            "belonging",
+            "time",
+        ]) {
+            thought.category = Some(category.into());
+        }
+        s.organizer_status = "✦ Whole map refined · your words preserved".into();
+        s
     }
     pub fn demo() -> Self {
         Self {
@@ -458,28 +502,65 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         .layout_size("map")
         .map_or(920.0, |size| size[0])
         .max(700.0);
-    let count = |role| {
-        s.session.thoughts.iter().filter(|t| t.role == role).count()
-            + usize::from(!s.draft.text.trim().is_empty() && classify(&s.draft.text) == role)
+    // Themes carry stable IDs; the original narrative lenses remain the offline fallback.
+    let mut groups: Vec<(Option<String>, String, Role)> = if s.session.categories.is_empty() {
+        Role::ALL
+            .into_iter()
+            .map(|r| (None, branch_name(r).into(), r))
+            .collect()
+    } else {
+        s.session
+            .categories
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (Some(c.id.clone()), c.name.clone(), Role::ALL[i % 4]))
+            .collect()
     };
-    let upper = (count(Role::Observation).max(count(Role::Question)).max(2) as f32 * 72.0 + 70.0)
-        .max(210.0);
-    let lower =
-        (count(Role::Tension).max(count(Role::Possibility)).max(2) as f32 * 72.0 + 70.0).max(210.0);
-    let height = upper + lower + 60.0;
-    let center = [width / 2.0, upper + 25.0];
+    if !s.session.categories.is_empty()
+        && (s.session.thoughts.iter().any(|t| t.category.is_none())
+            || !s.draft.text.trim().is_empty())
+    {
+        groups.push((None, "Taking root".into(), Role::Observation));
+    }
+    let matches = |t: &tacit::model::Thought, group: usize| {
+        if s.session.categories.is_empty() {
+            t.role == groups[group].2
+        } else {
+            t.category == groups[group].0
+        }
+    };
+    let draft_group = if s.session.categories.is_empty() {
+        Role::ALL
+            .iter()
+            .position(|r| *r == classify(&s.draft.text))
+            .unwrap_or(0)
+    } else {
+        groups.len() - 1
+    };
+    let counts: Vec<usize> = (0..groups.len())
+        .map(|i| {
+            s.session.thoughts.iter().filter(|t| matches(t, i)).count()
+                + usize::from(!s.draft.text.trim().is_empty() && i == draft_group)
+        })
+        .collect();
+    let mut offsets = Vec::new();
+    let mut height = 0.0f32;
+    for pair in counts.chunks(2) {
+        offsets.push(height + 55.0);
+        height += (pair.iter().copied().max().unwrap_or(1).max(2) as f32 * 72.0 + 100.0).max(230.0);
+    }
+    height = height.max(460.0);
+    let center = [width / 2.0, height / 2.0];
     let leaf_w = (width * 0.27).min(255.0);
     let mut drawing = Shape::new();
     let mut labels = Vec::new();
-    for (role, left, top) in [
-        (Role::Observation, true, true),
-        (Role::Question, false, true),
-        (Role::Tension, true, false),
-        (Role::Possibility, false, false),
-    ] {
+    for (group, (_, name, role)) in groups.iter().enumerate() {
+        let role = *role;
+        let left = group % 2 == 0;
+        let first_y = offsets[group / 2];
+        let top = first_y < center[1];
         let ink = color(role);
-        let first_y = if top { 55.0 } else { upper + 105.0 };
-        let n = count(role).max(1);
+        let n = counts[group].max(1);
         let fork_y = first_y + ((n - 1) as f32 * 72.0) / 2.0 + 54.0;
         let fork_x = if left {
             leaf_w + 55.0
@@ -499,16 +580,20 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(canvas(illustration(role)).size(38.0, 34.0))
-                .child(label(branch_name(role), 22.0, ink).font(TextStyle::new(22.0, 600.0))),
+                .child(
+                    label(name, 20.0, ink)
+                        .font(TextStyle::new(20.0, 600.0))
+                        .max_w(leaf_w - 44.0),
+                ),
         );
         let mut entries: Vec<(Option<u64>, String)> = s
             .session
             .thoughts
             .iter()
-            .filter(|t| t.role == role)
+            .filter(|t| matches(t, group))
             .map(|t| (Some(t.id), t.text.clone()))
             .collect();
-        if !s.draft.text.trim().is_empty() && classify(&s.draft.text) == role {
+        if !s.draft.text.trim().is_empty() && group == draft_group {
             entries.push((None, s.draft.text.clone()));
         }
         if entries.is_empty() {
@@ -563,7 +648,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 .fill(if selected {
                     ink.alpha(0.10)
                 } else {
-                    Color::TRANSPARENT
+                    ink.alpha((1.0 - s.settling) * 0.13)
                 })
                 .hover(ink.alpha(0.08))
                 .motion(SPRING)
@@ -617,27 +702,46 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
     drawing = drawing
         .fill_path(&halo, WHITE)
         .stroke_path(&halo, 2.5, LineCap::Round, GOLD);
-    let mut sheet = el()
-        .key("tree-sheet")
-        .w(width)
-        .h(height)
-        .child(canvas(drawing).size(width, height));
+    let mut sheet = el().key("tree-sheet").w(width).h(height).child(
+        canvas(drawing)
+            .size(width, height)
+            .opacity(if cx.is_reduced_motion() {
+                1.0
+            } else {
+                0.35 + 0.65 * s.settling
+            }),
+    );
     for node in labels {
         sheet = sheet.child(node);
     }
     sheet = sheet.child(
         col()
             .key("central-idea")
-            .absolute(center[0] - 78.0, center[1] - 65.0)
+            .absolute(center[0] - 78.0, center[1] - 62.0)
             .w(156.0)
-            .h(136.0)
+            .h(124.0)
             .center()
-            .gap(7.0)
-            .child(canvas(illustration(Role::Observation)).size(40.0, 34.0))
+            .gap(5.0)
+            .child(canvas(illustration(Role::Observation)).size(32.0, 26.0))
             .child(
-                label(short_label(&s.session.title), 18.0, INK).font(TextStyle::new(18.0, 600.0)),
+                label(short_label(&s.session.title), 16.0, INK).font(TextStyle::new(16.0, 600.0)),
             )
-            .child(label("THE CENTRAL IDEA", 9.0, GOLD)),
+            .child(
+                label(
+                    if s.busy {
+                        "✦  FINDING CONNECTIONS"
+                    } else {
+                        "THE CENTRAL IDEA"
+                    },
+                    9.0,
+                    GOLD,
+                )
+                .opacity(if s.busy && !cx.is_reduced_motion() {
+                    0.55 + 0.45 * s.pulse
+                } else {
+                    1.0
+                }),
+            ),
     );
     col()
         .key("map")
@@ -769,6 +873,8 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(label(
             if s.draft.text.trim().is_empty() {
                 "Enter to keep  ·  Shift+Enter for a new line  ·  your words stay yours".into()
+            } else if !s.session.categories.is_empty() {
+                "Taking root · keep this thought to find its theme".into()
             } else {
                 format!(
                     "Finding a home: {}  ·  suggestion from local rules",
@@ -826,8 +932,8 @@ fn inspector(s: &State) -> El {
                     .wrap_anywhere()
                     .selectable(true),
             )
-            .child(label(t.role.label(), 12.0, MUTED))
-            .child(button("Move to next lens", "move", State::move_selected))
+            .child(label(s.session.placement(t), 12.0, MUTED))
+            .child(button("Move to next branch", "move", State::move_selected))
             .child(button("Remove thought", "remove", State::remove_selected));
     } else {
         panel = panel.child(label(
@@ -863,12 +969,16 @@ fn inspector(s: &State) -> El {
         .child(el().grow(1.0))
         .child(label("An open reading", 15.0, GREEN))
         .child(label(
-            "Each color is a lens. Follow a curved branch from the central idea to your own words.",
+            "Follow a colored branch from the central idea to your own words.",
             12.0,
             MUTED,
         ))
         .child(label(
-            "Local rules suggest a lens. You have the final say.",
+            if s.session.categories.is_empty() {
+                "Local rules suggest a starting point. You have the final say."
+            } else {
+                "Themes are suggestions. Move a thought to pin its place."
+            },
             12.0,
             MUTED,
         ))
@@ -882,7 +992,7 @@ fn compact_inspector(s: &State) -> El {
         r = r
             .child(
                 label(
-                    format!("Selected {:02} · {}", t.id, t.role.label()),
+                    format!("Selected {:02} · {}", t.id, s.session.placement(t)),
                     11.0,
                     MUTED,
                 )
@@ -935,6 +1045,29 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
     let voice_wake = wake.clone();
     s.voice_worker = Some(voice::Worker::start(move || voice_wake()));
     s.voice_command(VoiceCommand::Check);
+    let backend = std::env::var("TACIT_ORGANIZER").unwrap_or_default();
+    if backend == "offline" {
+        return;
+    }
+    let cloud = if backend == "ollama" {
+        Ok(None)
+    } else {
+        tacit::organizer::CloudConfig::from_env()
+    };
+    match cloud {
+        Ok(Some(config)) => {
+            s.organizer_status = "OpenRouter · quick themes + thoughtful review".into();
+            let fast_wake = wake.clone();
+            s.worker = Some(config.start(false, move || fast_wake()));
+            s.reviewer = Some(config.start(true, move || wake()));
+            return;
+        }
+        Err(error) => {
+            s.organizer_status = error;
+            return;
+        }
+        Ok(None) => {}
+    }
     if let Ok(model) = std::env::var("TACIT_MODEL")
         && !model.trim().is_empty()
     {
@@ -977,11 +1110,46 @@ pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     if s.worker.is_none() {
         return changed;
     }
-    while let Some(response) = s.worker.as_ref().and_then(|w| w.receive.try_recv().ok()) {
+    let progress = ((now - s.settled_at) / 0.85).clamp(0.0, 1.0) as f32;
+    if s.settling != progress {
+        s.settling = progress;
+        changed = true;
+    }
+    if s.settling < 1.0 || s.busy {
+        s.pulse = ((now * 3.0).sin() as f32 + 1.0) / 2.0;
+        tx.wake_after(std::time::Duration::from_millis(33));
+        changed = true;
+    }
+    while let Some(response) = s.reviewer.as_ref().and_then(|w| w.receive.try_recv().ok()) {
         if response.revision == s.revision {
+            s.busy = false;
             match response.result.and_then(|i| i.apply(&mut s.session)) {
                 Ok(()) => {
-                    s.organizer_status = "Organized by local model · suggestions".into();
+                    s.review_applied = Some(s.revision);
+                    s.organizer_status = "✦ Whole map refined · your words preserved".into();
+                    s.settled_at = now;
+                    s.settling = 0.0;
+                    s.save();
+                }
+                Err(e) => s.organizer_status = format!("Review: {e} · keeping quick themes"),
+            }
+            changed = true;
+        }
+    }
+    while let Some(response) = s.worker.as_ref().and_then(|w| w.receive.try_recv().ok()) {
+        if response.revision == s.revision && s.review_applied != Some(s.revision) {
+            s.fast_finished = Some(s.revision);
+            s.busy = false;
+            match response.result.and_then(|i| i.apply(&mut s.session)) {
+                Ok(()) => {
+                    s.organizer_status = if s.reviewer.is_some() {
+                        "Quick themes ready · review follows after a pause"
+                    } else {
+                        "Organized by local model · suggestions"
+                    }
+                    .into();
+                    s.settled_at = now;
+                    s.settling = 0.0;
                     s.save();
                 }
                 Err(e) => s.organizer_status = format!("{e} · keeping local organization"),
@@ -991,7 +1159,9 @@ pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     if s.observed != s.revision {
         s.observed = s.revision;
-        s.due = now + 0.8;
+        s.due = now + 0.18;
+        s.review_due = now + 3.0;
+        s.busy = false;
     }
     if s.requested != Some(s.revision) && !s.session.thoughts.is_empty() {
         if now >= s.due {
@@ -1000,7 +1170,8 @@ pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 session: s.session.clone(),
             };
             if s.worker.as_ref().unwrap().send.send(request).is_ok() {
-                s.organizer_status = "Finding the thread… local model is thinking".into();
+                s.organizer_status = "Finding a home for your thoughts…".into();
+                s.busy = true;
             } else {
                 s.organizer_status = "Organizer stopped · local rules remain available".into();
             }
@@ -1009,6 +1180,31 @@ pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         } else {
             tx.wake_after(std::time::Duration::from_secs_f64((s.due - now).max(0.01)));
         }
+    }
+    if let Some(reviewer) = &s.reviewer
+        && s.review_requested != Some(s.revision)
+        && s.fast_finished == Some(s.revision)
+        && !s.session.thoughts.is_empty()
+    {
+        if now >= s.review_due {
+            let request = tacit::organizer::Request {
+                revision: s.revision,
+                session: s.session.clone(),
+            };
+            if reviewer.send.send(request).is_ok() {
+                s.organizer_status = "✦ Stepping back · refining the whole map…".into();
+                s.busy = true;
+            }
+            s.review_requested = Some(s.revision);
+            changed = true;
+        } else {
+            tx.wake_after(std::time::Duration::from_secs_f64(
+                (s.review_due - now).max(0.01),
+            ));
+        }
+    }
+    if s.busy || s.settling < 1.0 {
+        tx.wake_after(std::time::Duration::from_millis(33));
     }
     changed
 }
@@ -1090,6 +1286,7 @@ mod tests {
         state.requested = Some(2);
         let before = state.session.clone();
         let proposal = tacit::model::Interpretation {
+            categories: vec![],
             title: "Outdated title".into(),
             narrative: "Outdated interpretation".into(),
             assignments: before
@@ -1097,6 +1294,7 @@ mod tests {
                 .iter()
                 .map(|t| tacit::model::Assignment {
                     id: t.id,
+                    category: None,
                     role: Role::Question,
                 })
                 .collect(),
@@ -1119,6 +1317,53 @@ mod tests {
         assert!(poll(&mut state, 2.0, &mut Tx::default()));
         assert_eq!(state.session, before);
         assert!(state.organizer_status.contains("test timeout"));
+    }
+    #[test]
+    fn review_waits_for_fast_pass_and_quiet_period_and_rejects_old_edits() {
+        use std::sync::mpsc;
+        let mut s = State::demo();
+        let (fast_send, fast_requests) = mpsc::channel();
+        let (fast_response, fast_receive) = mpsc::channel();
+        let (review_send, review_requests) = mpsc::channel();
+        let (review_response, review_receive) = mpsc::channel();
+        s.worker = Some(tacit::organizer::Worker {
+            send: fast_send,
+            receive: fast_receive,
+        });
+        s.reviewer = Some(tacit::organizer::Worker {
+            send: review_send,
+            receive: review_receive,
+        });
+        s.revision = 1;
+        let mut tx = Tx::default();
+        poll(&mut s, 0.0, &mut tx);
+        assert!(fast_requests.try_recv().is_err());
+        poll(&mut s, 0.2, &mut tx);
+        assert_eq!(fast_requests.try_recv().unwrap().revision, 1);
+        assert!(review_requests.try_recv().is_err());
+        fast_response
+            .send(tacit::organizer::Response {
+                revision: 1,
+                result: Err("fixture".into()),
+            })
+            .unwrap();
+        poll(&mut s, 1.0, &mut tx);
+        assert!(review_requests.try_recv().is_err());
+        poll(&mut s, 3.1, &mut tx);
+        assert_eq!(review_requests.try_recv().unwrap().revision, 1);
+        s.revision = 2;
+        let before = s.session.clone();
+        review_response
+            .send(tacit::organizer::Response {
+                revision: 1,
+                result: Err("stale review".into()),
+            })
+            .unwrap();
+        poll(&mut s, 3.2, &mut tx);
+        assert_eq!(s.session, before);
+        assert!(!s.organizer_status.contains("stale review"));
+        poll(&mut s, 3.4, &mut tx);
+        assert_eq!(fast_requests.try_recv().unwrap().revision, 2);
     }
     #[test]
     fn voice_result_preserves_a_typed_draft_and_waits_for_review() {

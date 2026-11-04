@@ -16,9 +16,9 @@ The demo is an isolated, editable example; it never writes to your real session.
 cargo run
 ```
 
-Type a thought and watch its tentative placement update immediately. Press **Enter** to keep it; **Shift+Enter** adds a newline. Select a thought to inspect its original words, move it to the next lens, or remove it. **Undo** reverses the last capture, move, or removal. **Read the thread** switches to a narrative view. Tab navigates controls. Cmd+S (Ctrl+S on Linux) retries saving, and Escape clears selection.
+Type a thought and watch its tentative placement update immediately. Press **Enter** to keep it; **Shift+Enter** adds a newline. Select a thought to inspect its original words, move it to the next branch, or remove it. **Undo** reverses the last capture, move, or removal. **Read the thread** switches to a narrative view. Tab navigates controls. Cmd+S (Ctrl+S on Linux) retries saving, and Escape clears selection.
 
-The map is a colorful radial tree: an illustrated central idea, tapered curved branches, and shorter thought labels. Select a thought to read its complete original wording. Four stable narrative lenses organize the branches: observations, questions, tensions, and possibilities. Moving a thought pins its classification so the organizer cannot override it. Long regions scroll; smaller windows move the inspector controls beneath the map. Colored branches indicate classification, not causal claims.
+The map is a colorful radial tree: an illustrated central idea, tapered curved branches, and shorter thought labels. Select a thought to read its complete original wording. OpenRouter creates up to eight named thematic branches. Offline, four narrative lenses provide a starting point: observations, questions, tensions, and possibilities. Moving a thought pins its classification so the organizer cannot override it. Long regions scroll; smaller windows move the inspector controls beneath the map. Colored branches indicate classification, not causal claims.
 
 ## Voice with Hex
 
@@ -38,6 +38,27 @@ cargo run -- --check-hex
 
 This first integration uses Hex's desktop capture API (macOS and Linux), which returns the transcript after Stop. It does **not** stream partial words yet. Windows desktop capture is currently unsupported by Hex and is reported as unavailable. Headless snapshots and automated tests never connect to your installed Hex or start its microphone.
 
+## OpenRouter: quick themes, thoughtful review
+
+Tacit uses the community [openrouter-rs](https://github.com/realmorrisliu/openrouter-rs) SDK and OpenRouter's strict JSON-schema output. Configure `OPENROUTER_API_KEY`, or store the key in a private file at `$XDG_CONFIG_HOME/tacit/openrouter.key` (default `~/.config/tacit/openrouter.key`, mode `600`). `TACIT_OPENROUTER_KEY_FILE` overrides the file location. Keys are never stored in notebook JSON or logged.
+
+Run `cargo run` normally after configuring a key. OpenRouter takes priority over Ollama. Set `TACIT_ORGANIZER=offline` to disable AI, or `TACIT_ORGANIZER=ollama` to explicitly select the local model.
+
+- **Immediate:** local draft placement; keeping a thought saves it immediately.
+- **Fast pass:** after 180 ms without a committed edit, `google/gemini-3.1-flash-lite` creates themes and classifies thoughts. Once themes exist, only unclassified thoughts are sent with the theme list. Provider routing favors latency, with reasoning disabled and a 15-second deadline. Network feedback is not guaranteed to be instant.
+- **Review:** after three seconds without a committed edit and completion of the fast pass, `anthropic/claude-sonnet-4.6` reviews the complete map, refines themes, and develops the narrative and tentative relationships. It has its own worker and a 90-second deadline.
+- **Transitions:** thought labels spring into their new positions, colored branches fade back in, and a soft pulse marks ongoing organization. Rune's reduced-motion preference suppresses the fade and pulse.
+
+Override models with `TACIT_FAST_MODEL` and `TACIT_REVIEW_MODEL`; choose models supporting structured output. Each pass validates IDs, theme references and complete assignment coverage before applying anything. Your wording and pinned placements remain intact, including pinned theme names. Theme IDs retain branch order. Old responses are discarded after capture, correction, removal or Undo. Each worker coalesces queued edits, and there are no automatic retry loops. Another committed edit retries after an error.
+
+Only kept thoughts and theme metadata go to OpenRouter and its model providers; drafts and Hex audio stay out of these requests. Cloud calls use your OpenRouter credits. Automatic organization is bounded to 200 thoughts / 64 KiB of input per request; larger maps remain editable locally. Older notebooks load without migration.
+
+A small live diagnostic sends only the built-in fictional demo, runs initial classification, one incremental classification, and the full review, then prints timing and validation counts:
+
+```sh
+cargo run -- --check-openrouter
+```
+
 ## Local semantic organization
 
 Without configuration, Tacit works entirely offline using simple, explicitly labeled classification rules. This fallback is not semantic AI.
@@ -48,9 +69,9 @@ For model-generated classifications, a session title, a narrative, and suggested
 TACIT_MODEL=your-installed-model cargo run
 ```
 
-Tacit sends committed thoughts to `http://127.0.0.1:11434/api/generate`, after an 800 ms quiet period. Draft text is only previewed with local rules. The worker stays off the UI thread, coalesces pending edits, rejects stale results, validates references, and respects pinned classifications. Model-generated links appear beneath their source thoughts and in the margin; select a link to inspect its target. All model interpretations are suggestions.
+Tacit sends committed thoughts to `http://127.0.0.1:11434/api/generate`, after a 180 ms quiet period. Draft text is only previewed with local rules. The worker stays off the UI thread, coalesces pending edits, rejects stale results, validates references, and respects pinned classifications. Model-generated links appear beneath their source thoughts and in the margin; select a link to inspect its target. All model interpretations are suggestions.
 
-A missing server, unknown model, timeout, or invalid response leaves thought capture usable and reports the problem in the status line. Another edit requests organization again. No model is downloaded or server started automatically. Tacit only calls loopback; use an actual local model if you want all inference to stay on your machine.
+A missing server, unknown model, timeout, or invalid response leaves thought capture usable and reports the problem in the status line. Another edit requests organization again. No model is downloaded or server started automatically. The Ollama backend only calls loopback; use an actual local model if you want all inference to stay on your machine.
 
 ## Storage
 
@@ -74,17 +95,18 @@ Rune's headless tools use the same view and input runtime as the desktop app:
 ```sh
 cargo run -- --demo --snap /tmp/tacit.png --size 1280x860
 cargo run -- --demo --snap /tmp/tacit-small.png --size 820x640
+cargo run -- --scene themes --snap /tmp/tacit-themes.png --size 1280x860
 ```
 
-Headless runs do not read or write your real notebook or contact Ollama. Tests exercise real text entry, selection, reclassification, deletion, undo, storage, locking, organizer validation, and stale-result handling.
+Headless runs do not read or write your real notebook or contact OpenRouter, Ollama, or Hex. Tests exercise real text entry, selection, reclassification, deletion, undo, storage, locking, organizer validation, and stale-result handling.
 
 ## Structure and current scope
 
 - `src/model.rs`: original thoughts, narrative roles, validated model interpretations.
 - `src/storage.rs`: session loading, atomic saves, exclusive session lock.
-- `src/organizer.rs`: background Ollama worker and response validation.
+- `src/organizer.rs`: independent OpenRouter fast/review workers, Ollama fallback, and response validation.
 - `src/voice.rs`: authenticated Hex discovery, owned recording lifecycle, and lease management.
 - `src/ui.rs`: Rune canvas, vector illustrations, input, inspector, and narrative view.
 - `design/living-map.html`: the earlier conceptual exploration, independent of the Rust app.
 
-This is a first working vertical slice. The tree uses four stable primary branches and scrolls as it grows; it is not yet an infinite spatial graph. Freeform thematic clusters, custom illustrations per subject, drag positioning, relationship rejection, session browsing, and SVG/PDF export remain future work. The local-model integration is tested with fixtures; model quality and live inference still need validation with an installed model.
+This is a first working vertical slice. The tree uses up to eight thematic branches (four narrative lenses offline) and scrolls as it grows; it is not yet an infinite spatial graph. Nested subthemes, custom illustrations per subject, drag positioning, relationship rejection, session browsing, and SVG/PDF export remain future work. The local-model integration is tested with fixtures; model quality and live inference still need validation with an installed model.

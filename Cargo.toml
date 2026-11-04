@@ -11,6 +11,8 @@ serde_json = "1"
 ureq = { version = "3", default-features = false, features = ["json"] }
 
 rune = { git = "https://github.com/anomalyco/rune.git", rev = "801e61aac1c93c8e0eef3ee0d1f13f8560af4f37", default-features = false, features = ["metal-backend"] }
+openrouter-rs = "0.24.0"
+tokio = { version = "1.54.1", features = ["rt", "time", "net"] }
 
 [profile.dev.package."*"]
 debug = false
