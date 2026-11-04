@@ -39,27 +39,27 @@ const WHITE: Color = Color {
     a: 1.0,
 };
 const GREEN: Color = Color {
-    r: 0.063724,
-    g: 0.162647,
-    b: 0.106539,
+    r: 0.024,
+    g: 0.31,
+    b: 0.14,
     a: 1.0,
 };
 const GOLD: Color = Color {
-    r: 0.380056,
-    g: 0.162647,
-    b: 0.033105,
+    r: 0.72,
+    g: 0.25,
+    b: 0.015,
     a: 1.0,
 };
 const BLUE: Color = Color {
-    r: 0.083535,
-    g: 0.162647,
-    b: 0.273838,
+    r: 0.035,
+    g: 0.2,
+    b: 0.62,
     a: 1.0,
 };
 const RED: Color = Color {
-    r: 0.380056,
-    g: 0.106539,
-    b: 0.078288,
+    r: 0.65,
+    g: 0.035,
+    b: 0.1,
     a: 1.0,
 };
 const SPRING: Spring = Spring::new(0.45, 0.15);
@@ -226,15 +226,6 @@ fn color(role: Role) -> Color {
         Role::Possibility => GOLD,
     }
 }
-fn name(role: Role) -> &'static str {
-    match role {
-        Role::Observation => "THE GROUND",
-        Role::Question => "THE OPEN QUESTION",
-        Role::Tension => "THE TENSION",
-        Role::Possibility => "A WAY FORWARD",
-    }
-}
-
 // Small, meaningful line drawings: seeds, a branching path, opposing forces, and a bridge.
 fn illustration(role: Role) -> Shape {
     let c = color(role);
@@ -322,119 +313,248 @@ fn illustration(role: Role) -> Shape {
     }
     shape.view_box(72.0, 64.0)
 }
-fn island(s: &State, role: Role) -> El {
-    let accent = color(role);
-    let mut notes = col().w_full().gap(8.0);
-    for thought in s.session.thoughts.iter().filter(|t| t.role == role) {
-        let id = thought.id;
-        let selected = s.selected == Some(id);
-        notes = notes.child(
-            col()
-                .key(format!("thought-{id}"))
-                .w_full()
-                .gap(4.0)
-                .padding(10.0)
-                .radius(6.0)
-                .fill(if selected { WHITE } else { PAPER })
-                .border(if selected { 1.0 } else { 0.0 }, accent)
-                .hover(WHITE)
-                .role("button")
-                .focusable(true)
+fn branch_name(role: Role) -> &'static str {
+    match role {
+        Role::Observation => "Noticing",
+        Role::Question => "Wondering",
+        Role::Tension => "Tensions",
+        Role::Possibility => "Possibilities",
+    }
+}
+fn short_label(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 58 {
+        flat
+    } else {
+        format!("{}…", flat.chars().take(55).collect::<String>())
+    }
+}
+fn curve(mut shape: Shape, start: [f32; 2], end: [f32; 2], ink: Color, thick: f32) -> Shape {
+    let dx = end[0] - start[0];
+    let c1 = [start[0] + dx * 0.48, start[1]];
+    let c2 = [end[0] - dx * 0.30, end[1]];
+    let at = |t: f32| {
+        let u = 1.0 - t;
+        [
+            u * u * u * start[0]
+                + 3.0 * u * u * t * c1[0]
+                + 3.0 * u * t * t * c2[0]
+                + t * t * t * end[0],
+            u * u * u * start[1]
+                + 3.0 * u * u * t * c1[1]
+                + 3.0 * u * t * t * c2[1]
+                + t * t * t * end[1],
+        ]
+    };
+    for i in 0..36 {
+        let t = i as f32 / 36.0;
+        shape = shape.line(
+            at(t),
+            at((i + 1) as f32 / 36.0),
+            thick * (1.0 - t * 0.65),
+            LineCap::Round,
+            ink,
+        );
+    }
+    shape
+}
+fn tree(s: &State, cx: &Cx<State>) -> El {
+    let width = cx
+        .layout_size("map")
+        .map_or(920.0, |size| size[0])
+        .max(700.0);
+    let count = |role| {
+        s.session.thoughts.iter().filter(|t| t.role == role).count()
+            + usize::from(!s.draft.text.trim().is_empty() && classify(&s.draft.text) == role)
+    };
+    let upper = (count(Role::Observation).max(count(Role::Question)).max(2) as f32 * 72.0 + 70.0)
+        .max(210.0);
+    let lower =
+        (count(Role::Tension).max(count(Role::Possibility)).max(2) as f32 * 72.0 + 70.0).max(210.0);
+    let height = upper + lower + 60.0;
+    let center = [width / 2.0, upper + 25.0];
+    let leaf_w = (width * 0.27).min(255.0);
+    let mut drawing = Shape::new();
+    let mut labels = Vec::new();
+    for (role, left, top) in [
+        (Role::Observation, true, true),
+        (Role::Question, false, true),
+        (Role::Tension, true, false),
+        (Role::Possibility, false, false),
+    ] {
+        let ink = color(role);
+        let first_y = if top { 55.0 } else { upper + 105.0 };
+        let n = count(role).max(1);
+        let fork_y = first_y + ((n - 1) as f32 * 72.0) / 2.0 + 54.0;
+        let fork_x = if left {
+            leaf_w + 55.0
+        } else {
+            width - leaf_w - 55.0
+        };
+        let start = [
+            center[0] + if left { -64.0 } else { 64.0 },
+            center[1] + if top { -24.0 } else { 24.0 },
+        ];
+        drawing = curve(drawing, start, [fork_x, fork_y], ink, 9.0);
+        let leaf_x = if left { 12.0 } else { width - leaf_w - 12.0 };
+        let heading_x = if left { leaf_x + 10.0 } else { leaf_x };
+        labels.push(
+            row()
+                .absolute(heading_x, first_y - 45.0)
+                .gap(8.0)
+                .center_y()
+                .child(canvas(illustration(role)).size(38.0, 34.0))
+                .child(label(branch_name(role), 22.0, ink).font(TextStyle::new(22.0, 600.0))),
+        );
+        let mut entries: Vec<(Option<u64>, String)> = s
+            .session
+            .thoughts
+            .iter()
+            .filter(|t| t.role == role)
+            .map(|t| (Some(t.id), t.text.clone()))
+            .collect();
+        if !s.draft.text.trim().is_empty() && classify(&s.draft.text) == role {
+            entries.push((None, s.draft.text.clone()));
+        }
+        if entries.is_empty() {
+            labels.push(
+                label("Let a thought take root…", 13.0, MUTED)
+                    .w(leaf_w)
+                    .absolute(leaf_x, first_y + 12.0),
+            );
+            drawing = curve(
+                drawing,
+                [fork_x, fork_y],
+                [
+                    if left {
+                        leaf_x + 15.0
+                    } else {
+                        leaf_x + leaf_w - 15.0
+                    },
+                    first_y + 54.0,
+                ],
+                ink.alpha(0.4),
+                2.5,
+            );
+        }
+        for (index, (id, words)) in entries.into_iter().enumerate() {
+            let y = first_y + index as f32 * 72.0;
+            let end = [
+                if left {
+                    leaf_x + leaf_w - 5.0
+                } else {
+                    leaf_x + 5.0
+                },
+                y + 54.0,
+            ];
+            drawing = curve(drawing, [fork_x, fork_y], end, ink, 3.5);
+            drawing = drawing.line(
+                [leaf_x + 8.0, y + 54.0],
+                [leaf_x + leaf_w - 8.0, y + 54.0],
+                1.6,
+                LineCap::Round,
+                ink,
+            );
+            let selected = id.is_some() && id == s.selected;
+            let mut node = col()
+                .key(id.map_or_else(|| "draft-preview".into(), |id| format!("thought-{id}")))
+                .absolute(leaf_x, y)
+                .w(leaf_w)
+                .h(53.0)
+                .px(8.0)
+                .py(3.0)
+                .gap(2.0)
+                .radius(8.0)
+                .fill(if selected {
+                    ink.alpha(0.10)
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(ink.alpha(0.08))
                 .motion(SPRING)
-                .on_press(move |s: &mut State| s.selected = Some(id))
-                .child(label(thought.text.clone(), 15.0, INK).wrap_anywhere())
+                .role("button")
+                .focusable(id.is_some())
+                .child(
+                    label(
+                        short_label(&words),
+                        14.0,
+                        if id.is_some() { INK } else { MUTED },
+                    )
+                    .wrap_anywhere(),
+                )
                 .child(label(
-                    format!(
-                        "{:02}  ·  {}",
-                        id,
-                        if thought.pinned {
-                            "placed by you"
-                        } else if s.session.interpretation.is_some() {
-                            "suggested by local model"
-                        } else {
-                            "suggested by local rules"
-                        }
+                    id.map_or_else(
+                        || "Growing · Enter to keep".into(),
+                        |id| {
+                            format!(
+                                "{:02}{}",
+                                id,
+                                if s.session.thoughts.iter().any(|t| t.id == id && t.pinned) {
+                                    " · pinned"
+                                } else {
+                                    ""
+                                }
+                            )
+                        },
                     ),
                     10.0,
-                    MUTED,
-                )),
-        );
-        if let Some(interpretation) = &s.session.interpretation {
-            for link in interpretation.relationships.iter().filter(|r| r.from == id) {
-                let target = link.to;
-                notes = notes.child(button(
-                    &format!("↳ {} → {:02} ?", link.label, target),
-                    &format!("link-{id}-{target}"),
-                    move |s| s.selected = Some(target),
+                    ink,
                 ));
+            if let Some(id) = id {
+                node = node.on_press(move |s: &mut State| s.selected = Some(id));
             }
+            labels.push(node);
         }
     }
-    if !s.draft.text.trim().is_empty() && classify(&s.draft.text) == role {
-        notes = notes.child(
-            col()
-                .key("draft-preview")
-                .padding(10.0)
-                .radius(6.0)
-                .border(1.0, LINE)
-                .gap(4.0)
-                .child(label(s.draft.text.clone(), 15.0, MUTED).wrap_anywhere())
-                .child(label("Taking shape · Enter to keep", 10.0, accent)),
-        );
+    let halo = Path::new()
+        .move_to([center[0] - 88.0, center[1] - 42.0])
+        .cubic_to(
+            [center[0] - 105.0, center[1] - 100.0],
+            [center[0] + 95.0, center[1] - 100.0],
+            [center[0] + 90.0, center[1] - 20.0],
+        )
+        .cubic_to(
+            [center[0] + 111.0, center[1] + 84.0],
+            [center[0] - 106.0, center[1] + 95.0],
+            [center[0] - 88.0, center[1] - 42.0],
+        )
+        .close();
+    drawing = drawing
+        .fill_path(&halo, WHITE)
+        .stroke_path(&halo, 2.5, LineCap::Round, GOLD);
+    let mut sheet = el()
+        .key("tree-sheet")
+        .w(width)
+        .h(height)
+        .child(canvas(drawing).size(width, height));
+    for node in labels {
+        sheet = sheet.child(node);
     }
-    if s.session.thoughts.iter().all(|t| t.role != role)
-        && (s.draft.text.trim().is_empty() || classify(&s.draft.text) != role)
-    {
-        let hint = match role {
-            Role::Observation => "What keeps happening?",
-            Role::Question => "What don't you understand yet?",
-            Role::Tension => "Which needs pull in different directions?",
-            Role::Possibility => "What might be worth trying?",
-        };
-        notes = notes.child(label(hint, 14.0, MUTED).padding(10.0));
-    }
+    sheet = sheet.child(
+        col()
+            .key("central-idea")
+            .absolute(center[0] - 78.0, center[1] - 65.0)
+            .w(156.0)
+            .h(136.0)
+            .center()
+            .gap(7.0)
+            .child(canvas(illustration(Role::Observation)).size(40.0, 34.0))
+            .child(
+                label(short_label(&s.session.title), 18.0, INK).font(TextStyle::new(18.0, 600.0)),
+            )
+            .child(label("THE CENTRAL IDEA", 9.0, GOLD)),
+    );
     col()
-        .key(format!("island-{role:?}"))
+        .key("map")
         .w(0.0)
         .grow(1.0)
         .min_w(0.0)
+        .min_h(0.0)
         .h_full()
-        .gap(10.0)
-        .child(
-            row()
-                .gap(12.0)
-                .center_y()
-                .child(canvas(illustration(role)).size(58.0, 52.0))
-                .child(
-                    col()
-                        .gap(6.0)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .child(label(name(role), 10.0, accent))
-                        .child(label(role.label(), 21.0, INK)),
-                ),
-        )
-        .child(el().w_full().h(1.0).fill(LINE))
-        .child(
-            notes
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                })
-                .grow(1.0)
-                .min_h(0.0),
-        )
-}
-fn connector() -> El {
-    let p = Path::new()
-        .move_to([3.0, 12.0])
-        .cubic_to([20.0, 0.0], [38.0, 25.0], [59.0, 12.0]);
-    canvas(
-        Shape::new()
-            .stroke_path(&p, 1.1, LineCap::Round, MUTED)
-            .stroke(vec![[52.0, 9.0], [59.0, 12.0], [55.0, 18.0]], 1.1, MUTED)
-            .view_box(64.0, 26.0),
-    )
-    .size(42.0, 24.0)
+        .child(sheet)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
 }
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let wide = cx.layout_size("root").is_none_or(|size| size[0] >= 1080.0);
@@ -456,42 +576,15 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(button("Undo", "undo", State::undo));
     let title = col()
         .gap(8.0)
-        .child(label(s.session.title.clone(), 29.0, INK))
+        .child(label("Let your thoughts branch out.", 20.0, INK))
         .child(label(
             format!(
-                "{} thoughts  /  four lenses  /  no need for a tidy conclusion",
+                "{} thoughts  /  one living tree  /  follow a branch",
                 s.session.thoughts.len()
             ),
             12.0,
             MUTED,
         ));
-    let map = col()
-        .key("map")
-        .grow(1.0)
-        .min_h(0.0)
-        .gap(24.0)
-        .child(
-            row()
-                .h(0.0)
-                .grow(1.0)
-                .min_h(0.0)
-                .gap(22.0)
-                .min_h(220.0)
-                .child(island(s, Role::Observation))
-                .child(col().h_full().center().child(connector()))
-                .child(island(s, Role::Question)),
-        )
-        .child(
-            row()
-                .h(0.0)
-                .grow(1.0)
-                .min_h(0.0)
-                .gap(22.0)
-                .min_h(220.0)
-                .child(island(s, Role::Tension))
-                .child(col().h_full().center().child(connector()))
-                .child(island(s, Role::Possibility)),
-        );
     let main = if s.story {
         col().key("story").grow(1.0).min_h(0.0).gap(20.0).padding(26.0)
             .child(label("THE THREAD SO FAR", 11.0, GREEN))
@@ -499,9 +592,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .child(label(if s.session.interpretation.is_some() { "A model interpretation. Bracketed numbers refer to your original thoughts; relationships remain hypotheses." } else { "A reading order assembled from your words, not an inferred causal explanation." }, 12.0, MUTED))
             .scroll(ScrollSpec { stick_bottom: false })
     } else {
-        map.scroll(ScrollSpec {
-            stick_bottom: false,
-        })
+        tree(s, cx)
     };
     let mut workspace = row().h(0.0).grow(1.0).min_h(0.0).gap(28.0).child(main);
     if wide {
@@ -627,10 +718,22 @@ fn inspector(s: &State) -> El {
                 );
         }
     }
-    panel.child(el().grow(1.0)).child(label("An open reading", 15.0, GREEN))
-        .child(label("The arrows suggest a reading order. They do not claim that one thought causes another.", 12.0, MUTED))
-        .child(label("Local rules suggest a lens. You have the final say.", 12.0, MUTED))
-        .scroll(ScrollSpec { stick_bottom: false })
+    panel
+        .child(el().grow(1.0))
+        .child(label("An open reading", 15.0, GREEN))
+        .child(label(
+            "Each color is a lens. Follow a curved branch from the central idea to your own words.",
+            12.0,
+            MUTED,
+        ))
+        .child(label(
+            "Local rules suggest a lens. You have the final say.",
+            12.0,
+            MUTED,
+        ))
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
 }
 fn compact_inspector(s: &State) -> El {
     let mut r = row().gap(10.0).center_y();
@@ -648,12 +751,24 @@ fn compact_inspector(s: &State) -> El {
             .child(button("Remove", "remove", State::remove_selected));
     } else {
         r = r.child(label(
-            "Select a thought to move it. Arrows show reading order, not causation.",
+            "Select a branch to inspect its full thought or change its home.",
             11.0,
             MUTED,
         ));
     }
-    r
+    if let Some(t) = s.session.thoughts.iter().find(|t| Some(t.id) == s.selected) {
+        col().gap(6.0).child(r).child(
+            label(t.text.clone(), 13.0, INK)
+                .wrap_anywhere()
+                .selectable(true)
+                .max_h(64.0)
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                }),
+        )
+    } else {
+        r
+    }
 }
 pub fn on_key(s: &mut State, event: &KeyEvent, _: &mut Tx) -> bool {
     match event.key {

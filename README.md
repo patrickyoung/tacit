@@ -18,7 +18,7 @@ cargo run
 
 Type a thought and watch its tentative placement update immediately. Press **Enter** to keep it; **Shift+Enter** adds a newline. Select a thought to inspect its original words, move it to the next lens, or remove it. **Undo** reverses the last capture, move, or removal. **Read the thread** switches to a narrative view. Tab navigates controls. Cmd+S (Ctrl+S on Linux) retries saving, and Escape clears selection.
 
-The map uses four stable narrative lenses: observations, questions, tensions, and possibilities. Moving a thought pins its classification so the organizer cannot override it. Long regions scroll; smaller windows move the inspector controls beneath the map. The curved arrows between regions indicate reading order, not causal claims.
+The map is a colorful radial tree: an illustrated central idea, tapered curved branches, and shorter thought labels. Select a thought to read its complete original wording. Four stable narrative lenses organize the branches: observations, questions, tensions, and possibilities. Moving a thought pins its classification so the organizer cannot override it. Long regions scroll; smaller windows move the inspector controls beneath the map. Colored branches indicate classification, not causal claims.
 
 ## Local semantic organization
 
@@ -68,4 +68,4 @@ Headless runs do not read or write your real notebook or contact Ollama. Tests e
 - `src/ui.rs`: Rune canvas, vector illustrations, input, inspector, and narrative view.
 - `design/living-map.html`: the earlier conceptual exploration, independent of the Rust app.
 
-This is a first working vertical slice. The canvas uses four fixed regions, not an infinite spatial graph. Freeform thematic clusters, custom illustrations per subject, drag positioning, relationship rejection, session browsing, and SVG/PDF export remain future work. The local-model integration is tested with fixtures; model quality and live inference still need validation with an installed model.
+This is a first working vertical slice. The tree uses four stable primary branches and scrolls as it grows; it is not yet an infinite spatial graph. Freeform thematic clusters, custom illustrations per subject, drag positioning, relationship rejection, session browsing, and SVG/PDF export remain future work. The local-model integration is tested with fixtures; model quality and live inference still need validation with an installed model.
