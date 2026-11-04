@@ -20,6 +20,24 @@ Type a thought and watch its tentative placement update immediately. Press **Ent
 
 The map is a colorful radial tree: an illustrated central idea, tapered curved branches, and shorter thought labels. Select a thought to read its complete original wording. Four stable narrative lenses organize the branches: observations, questions, tensions, and possibilities. Moving a thought pins its classification so the organizer cannot override it. Long regions scroll; smaller windows move the inspector controls beneath the map. Colored branches indicate classification, not causal claims.
 
+## Voice with Hex
+
+Open your installed Hex desktop app with its microphone permission granted and a model ready. Tacit connects automatically on launch; no microphone is opened until you click **Listen**.
+
+1. Click **Listen** and speak. The red recording indicator and elapsed timer stay visible.
+2. Click **Stop & transcribe**. Hex returns the raw transcript directly to Tacit without changing the clipboard or pasting elsewhere.
+3. Review the text in the composer and press **Enter** to keep it. Speech appends to any existing typed draft.
+
+**Cancel** or **Escape** while recording discards that recording and preserves your draft. While Hex is transcribing, Tacit remains usable. A capture is owned by Tacit; it refuses to start while Hex is recording elsewhere. Authentication and ownership tokens stay in memory and are never written into the notebook or logs. The background worker sends lease heartbeats and attempts to cancel an unfinished capture on shutdown; Hex expires abandoned recordings after ten seconds without renewal.
+
+Use **Reconnect Hex** after starting/restarting Hex or resolving an error. A read-only diagnostic is available:
+
+```sh
+cargo run -- --check-hex
+```
+
+This first integration uses Hex's desktop capture API (macOS and Linux), which returns the transcript after Stop. It does **not** stream partial words yet. Windows desktop capture is currently unsupported by Hex and is reported as unavailable. Headless snapshots and automated tests never connect to your installed Hex or start its microphone.
+
 ## Local semantic organization
 
 Without configuration, Tacit works entirely offline using simple, explicitly labeled classification rules. This fallback is not semantic AI.
@@ -65,6 +83,7 @@ Headless runs do not read or write your real notebook or contact Ollama. Tests e
 - `src/model.rs`: original thoughts, narrative roles, validated model interpretations.
 - `src/storage.rs`: session loading, atomic saves, exclusive session lock.
 - `src/organizer.rs`: background Ollama worker and response validation.
+- `src/voice.rs`: authenticated Hex discovery, owned recording lifecycle, and lease management.
 - `src/ui.rs`: Rune canvas, vector illustrations, input, inspector, and narrative view.
 - `design/living-map.html`: the earlier conceptual exploration, independent of the Rust app.
 

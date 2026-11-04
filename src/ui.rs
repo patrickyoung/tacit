@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use tacit::{
     model::{Role, Session, classify},
     storage,
+    voice::{self, Command as VoiceCommand, Event as VoiceEvent},
 };
 
 const PAPER: Color = Color {
@@ -64,6 +65,17 @@ const RED: Color = Color {
 };
 const SPRING: Spring = Spring::new(0.45, 0.15);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceState {
+    Checking,
+    Ready,
+    Starting,
+    Recording,
+    Finishing,
+    Cancelling,
+    Unavailable,
+}
+
 pub struct State {
     pub session: Session,
     pub draft: TextEdit,
@@ -82,6 +94,11 @@ pub struct State {
     organizer_status: String,
     previewed_draft: String,
     revealed_selection: Option<u64>,
+    voice_worker: Option<voice::Worker>,
+    voice_state: VoiceState,
+    voice_status: String,
+    voice_started: f64,
+    voice_seconds: u64,
 }
 impl State {
     pub fn load() -> Self {
@@ -139,12 +156,90 @@ impl State {
             organizer_status: "Offline · local rules".into(),
             previewed_draft: String::new(),
             revealed_selection: None,
+            voice_worker: None,
+            voice_state: VoiceState::Unavailable,
+            voice_status: "Hex is not connected".into(),
+            voice_started: 0.0,
+            voice_seconds: 0,
         }
     }
     pub fn demo() -> Self {
         Self {
             session: Session::demo(),
             ..Self::empty()
+        }
+    }
+    fn voice_command(&mut self, command: VoiceCommand) {
+        if self.read_only {
+            return;
+        }
+        let allowed = match command {
+            VoiceCommand::Check => matches!(
+                self.voice_state,
+                VoiceState::Ready | VoiceState::Unavailable
+            ),
+            VoiceCommand::Start => self.voice_state == VoiceState::Ready,
+            VoiceCommand::Finish | VoiceCommand::Cancel => {
+                self.voice_state == VoiceState::Recording
+            }
+        };
+        if !allowed {
+            return;
+        }
+        if self
+            .voice_worker
+            .as_ref()
+            .is_none_or(|w| w.send.send(command).is_err())
+        {
+            self.voice_state = VoiceState::Unavailable;
+            self.voice_status = "Hex connection is unavailable; restart Tacit.".into();
+            return;
+        }
+        (self.voice_state, self.voice_status) = match command {
+            VoiceCommand::Check => (VoiceState::Checking, "Connecting to Hex…".into()),
+            VoiceCommand::Start => (VoiceState::Starting, "Opening the microphone…".into()),
+            VoiceCommand::Finish => (
+                VoiceState::Finishing,
+                "Microphone stopping · transcribing with Hex…".into(),
+            ),
+            VoiceCommand::Cancel => (VoiceState::Cancelling, "Discarding recording…".into()),
+        };
+    }
+    fn receive_voice(&mut self, event: VoiceEvent, now: f64) {
+        match event {
+            VoiceEvent::Ready => {
+                self.voice_state = VoiceState::Ready;
+                self.voice_status = "Hex ready · speech stays local".into();
+            }
+            VoiceEvent::Recording => {
+                self.voice_state = VoiceState::Recording;
+                self.voice_started = now;
+                self.voice_seconds = 0;
+                self.voice_status = "Listening with Hex".into();
+            }
+            VoiceEvent::Transcript(words) => {
+                self.voice_state = VoiceState::Ready;
+                if words.trim().is_empty() {
+                    self.voice_status = "No speech heard. Try again.".into();
+                } else {
+                    let mut text = self.draft.text.clone();
+                    if !text.is_empty() && !text.ends_with(char::is_whitespace) {
+                        text.push('\n');
+                    }
+                    text.push_str(words.trim());
+                    self.draft = TextEdit::new(text);
+                    self.voice_status =
+                        "Speech added to your draft · review, then Enter to keep".into();
+                }
+            }
+            VoiceEvent::Cancelled => {
+                self.voice_state = VoiceState::Ready;
+                self.voice_status = "Recording discarded".into();
+            }
+            VoiceEvent::Error(message) => {
+                self.voice_state = VoiceState::Unavailable;
+                self.voice_status = message;
+            }
         }
     }
     fn checkpoint(&mut self) {
@@ -601,8 +696,54 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .child(inspector(s));
     }
     let draft_role = classify(&s.draft.text);
+    let mut voice_controls = row().gap(8.0).center_y().child(
+        label(
+            if s.voice_state == VoiceState::Recording {
+                format!(
+                    "● Listening  {:02}:{:02}",
+                    s.voice_seconds / 60,
+                    s.voice_seconds % 60
+                )
+            } else {
+                s.voice_status.clone()
+            },
+            12.0,
+            if s.voice_state == VoiceState::Recording {
+                RED
+            } else {
+                MUTED
+            },
+        )
+        .grow(1.0)
+        .min_w(0.0),
+    );
+    voice_controls = match s.voice_state {
+        VoiceState::Ready => voice_controls.child(
+            button("Listen", "voice-start", |s| {
+                s.voice_command(VoiceCommand::Start)
+            })
+            .fill(PAPER),
+        ),
+        VoiceState::Recording => voice_controls
+            .child(button("Cancel", "voice-cancel", |s| {
+                s.voice_command(VoiceCommand::Cancel)
+            }))
+            .child(
+                button("Stop & transcribe", "voice-stop", |s| {
+                    s.voice_command(VoiceCommand::Finish)
+                })
+                .fill(PAPER),
+            ),
+        VoiceState::Unavailable => {
+            voice_controls.child(button("Reconnect Hex", "voice-check", |s| {
+                s.voice_command(VoiceCommand::Check)
+            }))
+        }
+        _ => voice_controls,
+    };
     let composer = col()
         .key("composer")
+        .child(voice_controls)
         .gap(8.0)
         .padding(14.0)
         .fill(WHITE)
@@ -777,6 +918,9 @@ pub fn on_key(s: &mut State, event: &KeyEvent, _: &mut Tx) -> bool {
             true
         }
         Key::Escape => {
+            if s.voice_state == VoiceState::Recording {
+                s.voice_command(VoiceCommand::Cancel);
+            }
             s.selected = None;
             true
         }
@@ -788,6 +932,9 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
     if s.read_only || rune::is_headless() {
         return;
     }
+    let voice_wake = wake.clone();
+    s.voice_worker = Some(voice::Worker::start(move || voice_wake()));
+    s.voice_command(VoiceCommand::Check);
     if let Ok(model) = std::env::var("TACIT_MODEL")
         && !model.trim().is_empty()
     {
@@ -797,6 +944,22 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
 }
 pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     let mut changed = false;
+    while let Some(event) = s
+        .voice_worker
+        .as_ref()
+        .and_then(|w| w.receive.try_recv().ok())
+    {
+        s.receive_voice(event, now);
+        changed = true;
+    }
+    if s.voice_state == VoiceState::Recording {
+        let elapsed = (now - s.voice_started).max(0.0) as u64;
+        if elapsed != s.voice_seconds {
+            s.voice_seconds = elapsed;
+            changed = true;
+        }
+        tx.wake_after(std::time::Duration::from_millis(500));
+    }
     if s.previewed_draft != s.draft.text {
         s.previewed_draft.clone_from(&s.draft.text);
         if !s.draft.text.trim().is_empty() {
@@ -869,6 +1032,8 @@ mod tests {
         rt
     }
     fn click(rt: &mut Runtime<State>, key: &str) {
+        // Let newly inserted controls finish their entry animation before hit testing.
+        rt.frame(1.0);
         let (x, y) = rt.find(key).unwrap_or_else(|| panic!("missing {key}"));
         rt.pointer_down(x, y);
         rt.pointer_up(x, y);
@@ -954,5 +1119,47 @@ mod tests {
         assert!(poll(&mut state, 2.0, &mut Tx::default()));
         assert_eq!(state.session, before);
         assert!(state.organizer_status.contains("test timeout"));
+    }
+    #[test]
+    fn voice_result_preserves_a_typed_draft_and_waits_for_review() {
+        let mut state = State::demo();
+        state.draft = TextEdit::new("My typed thought.");
+        let before = state.session.clone();
+        state.receive_voice(VoiceEvent::Transcript("My spoken thought.".into()), 0.0);
+        assert_eq!(state.draft.text, "My typed thought.\nMy spoken thought.");
+        assert_eq!(state.session, before);
+        assert_eq!(state.voice_state, VoiceState::Ready);
+        state.capture();
+        assert_eq!(state.session.thoughts.len(), before.thoughts.len() + 1);
+    }
+    #[test]
+    fn voice_controls_record_stop_and_cancel_without_duplicate_commands() {
+        use std::sync::mpsc;
+        let mut rt = runtime((1280.0, 860.0));
+        let (send, commands) = mpsc::channel();
+        let (events, receive) = mpsc::channel();
+        rt.state.voice_worker = Some(voice::Worker { send, receive });
+        events.send(VoiceEvent::Ready).unwrap();
+        rt.frame(0.0);
+        click(&mut rt, "voice-start");
+        assert_eq!(commands.try_recv().unwrap(), VoiceCommand::Start);
+        rt.state.voice_command(VoiceCommand::Start);
+        assert!(commands.try_recv().is_err());
+        events.send(VoiceEvent::Recording).unwrap();
+        rt.frame(0.0);
+        click(&mut rt, "voice-stop");
+        assert_eq!(commands.try_recv().unwrap(), VoiceCommand::Finish);
+        events
+            .send(VoiceEvent::Transcript("A thought".into()))
+            .unwrap();
+        rt.frame(0.0);
+        click(&mut rt, "voice-start");
+        let _ = commands.try_recv();
+        events.send(VoiceEvent::Recording).unwrap();
+        rt.frame(0.0);
+        click(&mut rt, "voice-cancel");
+        assert_eq!(commands.try_recv().unwrap(), VoiceCommand::Cancel);
+        events.send(VoiceEvent::Cancelled).unwrap();
+        assert_eq!(rt.state.draft.text, "A thought");
     }
 }
