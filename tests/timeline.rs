@@ -139,6 +139,7 @@ fn invalid_event_is_atomic_and_pins_survive_organization() {
             .thoughts
             .iter()
             .map(|t| tacit::model::Assignment {
+                concept: t.concept.clone(),
                 id: t.id,
                 role: Role::Observation,
                 category: None,
@@ -341,4 +342,66 @@ fn strict_replay_rejects_missing_or_incompatible_presentation_instead_of_inventi
     )
     .unwrap();
     assert!(j.validate_replay().is_err());
+}
+
+#[test]
+fn concepts_replay_with_original_words_and_split_invalidates_old_label() {
+    use tacit::model::{Assignment, Interpretation};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.json");
+    let mut j = Journal::open(&path, Session::default()).unwrap();
+    let original = "Meetings take all day. Hosting costs doubled.";
+    j.append(
+        1,
+        Event::SessionChanged {
+            change: SessionEvent::capture(&j.projection.session, original),
+        },
+    )
+    .unwrap();
+    j.append(
+        2,
+        Event::SessionChanged {
+            change: SessionEvent::Organized {
+                interpretation: Interpretation {
+                    title: "Operating pressures".into(),
+                    narrative: "Time and cost pressures [1].".into(),
+                    categories: vec![],
+                    relationships: vec![],
+                    assignments: vec![Assignment {
+                        id: 1,
+                        role: Role::Observation,
+                        category: None,
+                        concept: Some("Time and cost pressures".into()),
+                    }],
+                },
+                pass: "review".into(),
+            },
+        },
+    )
+    .unwrap();
+    j.append(
+        3,
+        Event::SessionChanged {
+            change: SessionEvent::Split {
+                source_id: 1,
+                original: original.into(),
+                chunks: vec![
+                    "Meetings take all day. ".into(),
+                    "Hosting costs doubled.".into(),
+                ],
+            },
+        },
+    )
+    .unwrap();
+    drop(j);
+    let j = Journal::read(&path).unwrap();
+    let before = j.at(2).unwrap();
+    assert_eq!(
+        before.session.thoughts[0].map_label(),
+        "Time and cost pressures"
+    );
+    assert_eq!(before.session.thoughts[0].text, original);
+    let after = j.at(3).unwrap();
+    assert_eq!(after.session.thoughts.len(), 2);
+    assert!(after.session.thoughts.iter().all(|t| t.concept.is_none()));
 }

@@ -30,12 +30,31 @@ impl Role {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Thought {
+    /// Concise interpretation for the map; `text` always retains the original words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept: Option<String>,
     pub id: u64,
     pub text: String,
     pub role: Role,
     pub pinned: bool,
     #[serde(default)]
     pub category: Option<String>,
+}
+impl Thought {
+    pub fn map_label(&self) -> &str {
+        self.concept.as_deref().unwrap_or(&self.text)
+    }
+}
+pub fn validate_concept(concept: &str) -> Result<(), String> {
+    if concept.trim().is_empty()
+        || concept != concept.trim()
+        || concept.chars().count() > 58
+        || concept.split_whitespace().count() > 8
+        || concept.contains(['\n', '\r'])
+    {
+        return Err("Concept must be a short phrase (up to eight words and 58 characters)".into());
+    }
+    Ok(())
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Session {
@@ -73,6 +92,7 @@ impl Session {
         self.next_id += 1;
         self.interpretation = None;
         self.thoughts.push(Thought {
+            concept: None,
             id,
             text: text.into(),
             role: classify(text),
@@ -171,6 +191,9 @@ impl Session {
         }
         let mut ids = std::collections::HashSet::new();
         for thought in &self.thoughts {
+            if let Some(concept) = &thought.concept {
+                validate_concept(concept)?;
+            }
             if thought.id == 0 || !ids.insert(thought.id) || thought.id >= self.next_id {
                 return Err("Invalid or duplicate thought ID".into());
             }
@@ -224,6 +247,8 @@ pub struct Category {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Assignment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concept: Option<String>,
     pub id: u64,
     #[serde(default)]
     pub category: Option<String>,
@@ -287,6 +312,9 @@ impl Interpretation {
         let ids: std::collections::HashSet<_> = session.thoughts.iter().map(|t| t.id).collect();
         let mut assigned = std::collections::HashSet::new();
         for a in &self.assignments {
+            if let Some(concept) = &a.concept {
+                validate_concept(concept)?;
+            }
             if (!self.categories.is_empty() && a.category.is_none())
                 || a.category
                     .as_ref()
@@ -320,6 +348,9 @@ impl Interpretation {
         self.validate(session)?;
         for a in &self.assignments {
             if let Some(t) = session.thoughts.iter_mut().find(|t| t.id == a.id) {
+                if let Some(concept) = &a.concept {
+                    t.concept = Some(concept.clone());
+                }
                 if !t.pinned {
                     t.role = a.role;
                 }

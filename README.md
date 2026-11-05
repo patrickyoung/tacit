@@ -218,3 +218,17 @@ Run the opt-in live evaluation with synthetic discussions (uses configured OpenR
 ```sh
 cargo run --example facilitation_eval
 ```
+
+## Concept phrases and original words
+
+Thoughts now carry a separate `concept` phrase. Cloud organization distills each source into a meaningful 2–6 word label (at most eight words and 58 characters), retaining qualifications, uncertainty, and negation. The fast pass names new concepts and upgrades older thoughts without labels; the stronger reviewer refines those concepts and groups related meanings into thematic branches. Good labels remain stable across incremental updates.
+
+The map displays concept phrases. Select a node to see **Concept** followed by **Original words** in the right-hand inspector; narrower windows show both below the map. Full text, WAV recordings, and WebVTT are unchanged. Until a concept is available, a node uses the existing shortened source preview. Offline organization can supply concepts too, but older/local responses without them remain compatible.
+
+Concepts are interpretations, not replacement transcripts. They are validated, saved in session events, and included in replay and other renderers. Splitting a thought invalidates its old concept so each resulting idea can be distilled independently. Branch depth remains unchanged: this adds concise concept nodes within thematic clusters, not nested subbranches.
+
+Optional live-model validation with synthetic content:
+
+```sh
+cargo run --example concept_eval
+```

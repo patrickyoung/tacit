@@ -195,6 +195,7 @@ pub fn apply(session: &Session, instruction: &str, edits: &[Edit]) -> Result<Ses
                 .thoughts
                 .iter()
                 .map(|t| crate::model::Assignment {
+                    concept: t.concept.clone(),
                     id: t.id,
                     role: t.role,
                     category: t.category.clone(),

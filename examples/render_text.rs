@@ -25,8 +25,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "[{}] {}: {}",
             thought.id,
             content.session.placement(thought),
-            thought.text
+            thought.map_label()
         );
+        if thought.concept.is_some() {
+            println!("    Original: {}", thought.text);
+        }
     }
     if let Some(interpretation) = &content.session.interpretation {
         println!("\n{}", interpretation.narrative);

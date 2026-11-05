@@ -1690,7 +1690,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             .thoughts
             .iter()
             .filter(|t| matches(t, group))
-            .map(|t| (Some(t.id), t.text.clone()))
+            .map(|t| (Some(t.id), t.map_label().to_owned()))
             .collect();
         if !s.draft.text.trim().is_empty() && group == draft_group {
             entries.push((None, s.draft.text.clone()));
@@ -2506,6 +2506,16 @@ fn inspector(s: &State) -> El {
         .find(|t| Some(t.id) == s.selected)
     {
         panel = panel
+            .child(label("CONCEPT", 10.0, color(t.role)))
+            .child(
+                label(
+                    t.concept.as_deref().unwrap_or("Concept not yet distilled"),
+                    22.0,
+                    INK,
+                )
+                .key("selected-concept")
+                .selectable(true),
+            )
             .child(label(
                 format!("ORIGINAL WORDS · {:02}", t.id),
                 10.0,
@@ -2513,6 +2523,7 @@ fn inspector(s: &State) -> El {
             ))
             .child(
                 label(t.text.clone(), 18.0, INK)
+                    .key("selected-original")
                     .wrap_anywhere()
                     .selectable(true),
             )
@@ -2635,15 +2646,28 @@ fn compact_inspector(s: &State) -> El {
         .iter()
         .find(|t| Some(t.id) == s.selected)
     {
-        col().gap(6.0).child(r).child(
-            label(t.text.clone(), 13.0, INK)
-                .wrap_anywhere()
-                .selectable(true)
-                .max_h(64.0)
-                .scroll(ScrollSpec {
-                    stick_bottom: false,
-                }),
-        )
+        col()
+            .gap(6.0)
+            .child(r)
+            .child(
+                label(
+                    t.concept.as_deref().unwrap_or("Concept not yet distilled"),
+                    15.0,
+                    INK,
+                )
+                .key("selected-concept")
+                .selectable(true),
+            )
+            .child(
+                label(t.text.clone(), 13.0, INK)
+                    .key("selected-original")
+                    .wrap_anywhere()
+                    .selectable(true)
+                    .max_h(64.0)
+                    .scroll(ScrollSpec {
+                        stick_bottom: false,
+                    }),
+            )
     } else {
         r
     }
@@ -3087,6 +3111,23 @@ mod tests {
         rt.frame(1.0);
     }
     #[test]
+    fn selected_concept_and_original_are_available_in_both_layouts() {
+        for size in [(1280.0, 860.0), (820.0, 640.0)] {
+            let mut rt = runtime(size);
+            let original = rt.state.projection.session.thoughts[0].text.clone();
+            rt.state.projection.session.thoughts[0].concept = Some("Meeting overload".into());
+            rt.frame(1.0);
+            click(&mut rt, "thought-1");
+            assert!(rt.find("selected-concept").is_some());
+            assert!(rt.find("selected-original").is_some());
+            assert_eq!(
+                rt.state.projection.session.thoughts[0].map_label(),
+                "Meeting overload"
+            );
+            assert_eq!(rt.state.projection.session.thoughts[0].text, original);
+        }
+    }
+    #[test]
     fn direction_speech_never_becomes_a_thought_and_keeps_the_brainstorm_draft() {
         let mut s = State::empty();
         s.direction_mode = true;
@@ -3372,6 +3413,7 @@ mod tests {
                 .thoughts
                 .iter()
                 .map(|t| tacit::model::Assignment {
+                    concept: t.concept.clone(),
                     id: t.id,
                     category: None,
                     role: Role::Question,

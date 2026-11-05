@@ -85,6 +85,7 @@ impl SessionEvent {
                 {
                     return Err("Split must preserve all original words".into());
                 }
+                next.thoughts[index].concept = None;
                 next.thoughts[index].text = chunks[0].trim().into();
                 next.thoughts[index].role = classify(&chunks[0]);
                 next.thoughts[index].category = None;
@@ -108,6 +109,7 @@ impl SessionEvent {
     pub fn capture(session: &Session, text: &str) -> Self {
         Self::Captured {
             thought: Thought {
+                concept: None,
                 id: session.next_id,
                 text: text.trim().into(),
                 role: classify(text.trim()),

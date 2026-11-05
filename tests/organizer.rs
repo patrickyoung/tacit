@@ -11,6 +11,7 @@ fn proposal(s: &Session) -> Interpretation {
             .thoughts
             .iter()
             .map(|t| Assignment {
+                concept: t.concept.clone(),
                 id: t.id,
                 category: None,
                 role: Role::Observation,
@@ -110,4 +111,45 @@ fn old_notebooks_load_without_themes() {
     let s: Session = serde_json::from_value(raw).unwrap();
     s.validate().unwrap();
     assert!(s.categories.is_empty());
+}
+
+#[test]
+fn concepts_distill_without_rewriting_sources_and_reject_bad_labels() {
+    let mut s = Session::demo();
+    let words: Vec<_> = s.thoughts.iter().map(|t| t.text.clone()).collect();
+    s.move_thought(1);
+    let pinned_role = s.thoughts[0].role;
+    let mut p = proposal(&s);
+    for a in &mut p.assignments {
+        a.concept = Some(format!("Concept {}", a.id));
+    }
+    p.assignments[0].concept = Some("Meeting overload".into());
+    p.clone().apply(&mut s).unwrap();
+    assert_eq!(s.thoughts[0].map_label(), "Meeting overload");
+    assert_eq!(s.thoughts[0].role, pinned_role);
+    assert_eq!(
+        s.thoughts
+            .iter()
+            .map(|t| t.text.clone())
+            .collect::<Vec<_>>(),
+        words
+    );
+    let before = s.clone();
+    for invalid in [
+        "",
+        "   ",
+        "one two three four five six seven eight nine",
+        "a\nb",
+    ] {
+        p.assignments[0].concept = Some(invalid.into());
+        assert!(p.clone().apply(&mut s).is_err());
+        assert_eq!(s, before);
+    }
+    let mut old = serde_json::to_value(&s).unwrap();
+    for t in old["thoughts"].as_array_mut().unwrap() {
+        t.as_object_mut().unwrap().remove("concept");
+    }
+    old["interpretation"] = serde_json::Value::Null;
+    let old: Session = serde_json::from_value(old).unwrap();
+    assert_eq!(old.thoughts[0].map_label(), old.thoughts[0].text);
 }
