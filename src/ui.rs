@@ -1,12 +1,13 @@
 use rune::{
-    Color, Cx, El, Key, KeyEvent, LineCap, Path, ScrollSpec, Shape, Spring, TextEdit, TextStyle,
-    Tx, canvas, col, el, row, text, text_input,
+    Color, Cx, El, Key, KeyEvent, LineCap, Path, ScrollSpec, Shape, TextEdit, TextStyle, Tx,
+    canvas, col, el, row, text, text_input,
 };
 use std::path::PathBuf;
 use tacit::{
     art::{self, Garden, Style},
     generated_art::{self, Gallery},
     model::{Role, Session, classify},
+    session_event::SessionEvent,
     storage,
     voice::{self, Command as VoiceCommand, Event as VoiceEvent},
 };
@@ -65,7 +66,6 @@ const RED: Color = Color {
     b: 0.1,
     a: 1.0,
 };
-const SPRING: Spring = Spring::new(0.45, 0.15);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VoiceState {
@@ -78,13 +78,48 @@ enum VoiceState {
     Unavailable,
 }
 
+struct Replay {
+    at_ms: u64,
+    playing: bool,
+    last_tick: Option<(f64, u64)>,
+    last_projected: Option<u64>,
+}
 pub struct State {
-    pub session: Session,
+    pub projection: tacit::timeline::Projection,
+    library_base: Option<PathBuf>,
+    session_entries: Vec<tacit::sessions::Entry>,
+    session_name: String,
+    session_name_edit: TextEdit,
+    sessions_open: bool,
+    wake: Option<rune::Waker>,
+    journal: Option<tacit::timeline::Journal>,
+    archive_only: bool,
+    replay: Option<Replay>,
+    pixel_replay: bool,
+    pixel_image: Option<(String, rune::Image)>,
+    last_pixels: Option<([u8; 32], tacit::timeline::PixelFrame)>,
+    video_export: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    replay_audio: Option<(String, rune::Player)>,
+    replay_images: std::collections::HashMap<String, rune::Image>,
+    image_cache: rune::ImageCache,
+    art_assets: std::collections::HashMap<rune::ImageId, String>,
+    map_scroll: rune::Live<[f32; 2]>,
+    story_scroll: rune::Live<[f32; 2]>,
+    inspector_scroll: rune::Live<[f32; 2]>,
+    viewport: [f32; 2],
+    map_viewport: [f32; 2],
+    reduced_motion: bool,
+    active_recording: Option<String>,
     art: Garden,
     gallery: Gallery,
     art_style: Style,
     art_active: bool,
     pub draft: TextEdit,
+    direction_mode: bool,
+    direction_draft: TextEdit,
+    director: Option<tacit::direction::Worker>,
+    directing: bool,
+    direction_status: String,
     selected: Option<u64>,
     history: Vec<Session>,
     path: Option<PathBuf>,
@@ -119,49 +154,262 @@ pub struct State {
 }
 impl State {
     pub fn load() -> Self {
+        if let Some(index) = rune::extra_args()
+            .iter()
+            .position(|a| a == "--capture-demo")
+        {
+            let Some(path) = rune::extra_args().get(index + 1) else {
+                return Self {
+                    read_only: true,
+                    status: "--capture-demo needs a new session path".into(),
+                    ..Self::empty()
+                };
+            };
+            let path = std::path::PathBuf::from(path);
+            let mut state = Self::demo();
+            if tacit::timeline::root_for(&path).exists() {
+                state.read_only = true;
+                state.status = "Capture fixture path already exists".into();
+                return state;
+            }
+            match tacit::timeline::Journal::open(&path, state.projection.session.clone()) {
+                Ok(journal) => {
+                    state.projection = journal.projection.clone();
+                    state.journal = Some(journal);
+                }
+                Err(error) => {
+                    state.read_only = true;
+                    state.status = error.to_string();
+                }
+            }
+            return state;
+        }
         if rune::extra_args().iter().any(|a| a == "--demo") {
             return Self::demo();
+        }
+        let args = rune::extra_args();
+        if let Some(index) = args.iter().position(|a| a == "--replay") {
+            let loaded = args
+                .get(index + 1)
+                .ok_or_else(|| std::io::Error::other("--replay needs a session path"))
+                .and_then(|path| tacit::timeline::Journal::read(std::path::Path::new(path)));
+            return match loaded {
+                Ok(journal) => {
+                    if let Err(error) = journal.validate_replay() {
+                        return Self {
+                            read_only: true,
+                            status: format!("Cannot replay exactly: {error}"),
+                            ..Self::empty()
+                        };
+                    }
+                    let at_ms = args
+                        .iter()
+                        .position(|a| a == "--replay-at")
+                        .and_then(|i| args.get(i + 1))
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(0)
+                        .min(journal.duration())
+                        .max(journal.first_frame_ms().unwrap());
+                    let scene = journal
+                        .replay_scene_at(at_ms)
+                        .expect("validated presentation");
+                    let mut s = Self {
+                        journal: Some(journal),
+                        read_only: true,
+                        archive_only: true,
+                        pixel_replay: args.iter().any(|a| a == "--replay-pixels"),
+                        replay: Some(Replay {
+                            at_ms,
+                            playing: false,
+                            last_tick: None,
+                            last_projected: None,
+                        }),
+                        status: "Saved session · read-only replay".into(),
+                        ..Self::empty()
+                    };
+                    s.restore_scene(scene, at_ms as f64 / 1000.0);
+                    s
+                }
+                Err(e) => Self {
+                    read_only: true,
+                    status: format!("Cannot replay: {e}"),
+                    ..Self::empty()
+                },
+            };
         }
         if rune::is_headless() {
             return Self::empty();
         }
         let path = storage::default_path();
-        let lease = match storage::lock(&path) {
-            Ok(lease) => lease,
-            Err(e) => {
-                return Self {
-                    status: e.to_string(),
-                    read_only: true,
-                    ..Self::empty()
-                };
+        match Self::open_session(path.clone()) {
+            Ok(mut state) => {
+                state.library_base = Some(path);
+                state.refresh_sessions();
+                state
             }
-        };
-        match storage::load(&path) {
-            Ok(session) => Self {
-                session,
-                path: Some(path),
-                _lease: Some(lease),
-                status: "Saved on this device".into(),
-                ..Self::empty()
-            },
             Err(e) => Self {
-                status: format!(
-                    "Could not open {}: {e}. File left untouched.",
-                    path.display()
-                ),
+                library_base: Some(path),
+                status: format!("Could not open session: {e}. Archive retained."),
                 read_only: true,
                 ..Self::empty()
             },
         }
     }
+    fn open_session(path: PathBuf) -> std::io::Result<Self> {
+        let lease = storage::lock(&path)?;
+        let legacy = if tacit::timeline::root_for(&path)
+            .join("events.jsonl")
+            .exists()
+        {
+            Session::default()
+        } else {
+            storage::load(&path)?
+        };
+        let journal = tacit::timeline::Journal::open(&path, legacy)?;
+        let scene = journal.projection.scene();
+        let now = journal.now_ms() as f64 / 1000.0;
+        let mut state = Self {
+            journal: Some(journal),
+            path: Some(path),
+            _lease: Some(lease),
+            status: "Saved on this device".into(),
+            ..Self::empty()
+        };
+        state.restore_scene(scene, now);
+        Ok(state)
+    }
+    fn refresh_sessions(&mut self) {
+        let Some(base) = &self.library_base else {
+            return;
+        };
+        match tacit::sessions::list(base) {
+            Ok(entries) => {
+                if let Some(entry) = entries.iter().find(|e| Some(&e.path) == self.path.as_ref()) {
+                    self.session_name = entry.name.clone();
+                }
+                self.session_entries = entries;
+            }
+            Err(e) => self.status = format!("Cannot list sessions: {e}"),
+        }
+    }
+    fn can_switch_session(&mut self) -> bool {
+        if matches!(
+            self.voice_state,
+            VoiceState::Starting
+                | VoiceState::Recording
+                | VoiceState::Finishing
+                | VoiceState::Cancelling
+        ) || !self.pending_recordings.is_empty()
+            || self.video_export.is_some()
+            || self.directing
+        {
+            self.status =
+                "Finish recording, transcription, or video export before switching sessions".into();
+            return false;
+        }
+        true
+    }
+    fn switch_session(&mut self, path: PathBuf) {
+        if self.path.as_ref() == Some(&path) {
+            self.sessions_open = false;
+            return;
+        }
+        if !self.can_switch_session() {
+            return;
+        }
+        // Open and lock the destination before releasing the current session.
+        let mut next = match Self::open_session(path) {
+            Ok(next) => next,
+            Err(e) => {
+                self.status = format!("Cannot open session: {e}");
+                return;
+            }
+        };
+        if self.replay.is_none() && !self.read_only {
+            self.sessions_open = false;
+            self.record_presentation("switch session");
+            if self.read_only {
+                return;
+            }
+        }
+        if let Some(journal) = &mut self.journal
+            && let Err(e) = journal.end_pixels()
+        {
+            self.status = format!("Cannot close capture: {e}");
+            return;
+        }
+        next.library_base = self.library_base.clone();
+        next.refresh_sessions();
+        if let Some(wake) = self.wake.clone() {
+            setup(&mut next, wake);
+        }
+        // Dropping the old workers also isolates late AI results from the new session.
+        *self = next;
+    }
+    fn create_session(&mut self) {
+        if !self.can_switch_session() {
+            return;
+        }
+        let Some(base) = &self.library_base else {
+            return;
+        };
+        match tacit::sessions::create(base, &self.session_name_edit.text) {
+            Ok(entry) => self.switch_session(entry.path),
+            Err(e) => self.status = format!("Cannot create session: {e}"),
+        }
+    }
+    fn rename_session(&mut self) {
+        let (Some(base), Some(path)) = (&self.library_base, &self.path) else {
+            return;
+        };
+        if self.read_only {
+            return;
+        }
+        match tacit::sessions::rename(base, path, &self.session_name_edit.text) {
+            Ok(()) => {
+                self.refresh_sessions();
+                self.status = "Session renamed".into();
+            }
+            Err(e) => self.status = format!("Cannot rename session: {e}"),
+        }
+    }
     fn empty() -> Self {
         Self {
-            session: Session::default(),
+            projection: Default::default(),
+            library_base: None,
+            session_entries: vec![],
+            session_name: String::new(),
+            session_name_edit: TextEdit::new(""),
+            sessions_open: false,
+            wake: None,
+            journal: None,
+            archive_only: false,
+            replay: None,
+            pixel_replay: false,
+            pixel_image: None,
+            video_export: None,
+            last_pixels: None,
+            replay_audio: None,
+            replay_images: Default::default(),
+            art_assets: Default::default(),
+            image_cache: rune::ImageCache::new(std::sync::Arc::new(|| {})),
+            map_scroll: rune::Live::new([0.0; 2]),
+            story_scroll: rune::Live::new([0.0; 2]),
+            inspector_scroll: rune::Live::new([0.0; 2]),
+            viewport: [1280.0, 860.0],
+            map_viewport: [0.0; 2],
+            reduced_motion: false,
+            active_recording: None,
             art: Garden::default(),
             gallery: Gallery::default(),
             art_style: Style::default(),
             art_active: false,
             draft: TextEdit::new(""),
+            direction_mode: false,
+            direction_draft: TextEdit::new(""),
+            director: None,
+            directing: false,
+            direction_status: "Give instructions to reshape this map".into(),
             selected: None,
             history: vec![],
             path: None,
@@ -197,7 +445,7 @@ impl State {
     }
     pub fn themed_demo() -> Self {
         let mut s = Self::demo();
-        s.session.categories = [
+        s.projection.session.categories = [
             ("time", "Time to think"),
             ("decisions", "Clear ownership"),
             ("belonging", "Being included"),
@@ -210,7 +458,7 @@ impl State {
             name: name.into(),
         })
         .collect();
-        for (thought, category) in s.session.thoughts.iter_mut().zip([
+        for (thought, category) in s.projection.session.thoughts.iter_mut().zip([
             "time",
             "decisions",
             "belonging",
@@ -221,12 +469,12 @@ impl State {
             thought.category = Some(category.into());
         }
         s.organizer_status = "✦ Whole map refined · your words preserved".into();
-        s.art = Garden::settled(&s.session);
+        s.art = Garden::settled(&s.projection.session);
         s
     }
     pub fn generated_demo() -> Self {
         let mut s = Self::themed_demo();
-        s.gallery.load_demo(&s.session);
+        s.gallery.load_demo(&s.projection.session);
         s
     }
     pub fn art_demo() -> Self {
@@ -237,12 +485,15 @@ impl State {
     pub fn demo() -> Self {
         Self {
             art: Garden::settled(&Session::demo()),
-            session: Session::demo(),
+            projection: tacit::timeline::Projection {
+                session: Session::demo(),
+                ..Default::default()
+            },
             ..Self::empty()
         }
     }
     fn voice_command(&mut self, command: VoiceCommand) {
-        if self.read_only {
+        if self.read_only && !matches!(command, VoiceCommand::Finish | VoiceCommand::Cancel) {
             return;
         }
         let allowed = match command {
@@ -250,7 +501,11 @@ impl State {
                 self.voice_state,
                 VoiceState::Ready | VoiceState::Unavailable
             ),
-            VoiceCommand::Start => self.voice_state == VoiceState::Ready,
+            VoiceCommand::Start => self.voice_state == VoiceState::Ready && !self.directing,
+            VoiceCommand::Retry(_) => matches!(
+                self.voice_state,
+                VoiceState::Ready | VoiceState::Unavailable
+            ),
             VoiceCommand::Finish | VoiceCommand::Cancel => {
                 self.voice_state == VoiceState::Recording
             }
@@ -261,7 +516,7 @@ impl State {
         if self
             .voice_worker
             .as_ref()
-            .is_none_or(|w| w.send.send(command).is_err())
+            .is_none_or(|w| w.send.send(command.clone()).is_err())
         {
             self.voice_state = VoiceState::Unavailable;
             self.voice_status = "Hex connection is unavailable; restart Tacit.".into();
@@ -275,10 +530,128 @@ impl State {
                 "Microphone stopping · transcribing with Hex…".into(),
             ),
             VoiceCommand::Cancel => (VoiceState::Cancelling, "Discarding recording…".into()),
+            VoiceCommand::Retry(_) => (VoiceState::Finishing, "Transcribing saved audio…".into()),
         };
     }
     fn receive_voice(&mut self, event: VoiceEvent, now: f64) {
         match event {
+            VoiceEvent::Started { id, started } => {
+                self.active_recording = Some(id.clone());
+                let start_ms = self.journal.as_ref().map_or(0, |j| {
+                    j.now_ms()
+                        .saturating_sub(started.elapsed().as_millis() as u64)
+                });
+                let mut events = vec![tacit::timeline::Event::RecordingStarted {
+                    id: id.clone(),
+                    start_ms,
+                }];
+                if self.direction_mode {
+                    events.push(tacit::timeline::Event::RecordingDirected { id });
+                }
+                self.timeline_event(tacit::timeline::Event::Transaction { events });
+            }
+            VoiceEvent::AudioSaved(recording) => {
+                let result = (|| -> std::io::Result<()> {
+                    let Some(journal) = &mut self.journal else {
+                        return Ok(());
+                    };
+                    let asset = journal.import(&recording.path, "wav")?;
+                    let audio = tacit::timeline::Audio {
+                        id: recording.id.clone(),
+                        asset,
+                        start_ms: journal
+                            .entries
+                            .iter()
+                            .flat_map(|e| e.event.leaves())
+                            .find_map(|e| match e {
+                                tacit::timeline::Event::RecordingStarted { id, start_ms }
+                                    if id == &recording.id =>
+                                {
+                                    Some(*start_ms)
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| {
+                                journal
+                                    .now_ms()
+                                    .saturating_sub(recording.started.elapsed().as_millis() as u64)
+                            }),
+                        duration_ms: recording.duration_ms(),
+                        sample_rate: recording.sample_rate,
+                        samples: recording.samples,
+                    };
+                    journal.append(
+                        journal.now_ms(),
+                        tacit::timeline::Event::AudioSaved { audio },
+                    )?;
+                    journal.export_vtt()?;
+                    self.projection = journal.projection.clone();
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    self.read_only = true;
+                    self.status = format!("Audio archive failed: {error}");
+                }
+            }
+            VoiceEvent::TimedTranscript { id, text, cues } => {
+                if self.read_only {
+                    return;
+                }
+                let mut events = vec![tacit::timeline::Event::Transcript {
+                    recording: id.clone(),
+                    cues,
+                    text: text.clone(),
+                }];
+                if self.projection.direction_recordings.contains(&id) {
+                    if self
+                        .dispatch(tacit::timeline::Event::Transaction { events })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let Some(j) = &self.journal
+                        && let Err(error) = j.export_vtt()
+                    {
+                        self.status = format!("WebVTT export failed: {error}");
+                    }
+                    self.voice_state = VoiceState::Ready;
+                    self.direction_mode = true;
+                    self.direction_draft = TextEdit::new(&text);
+                    self.submit_direction();
+                    return;
+                }
+                let thought_id = self.projection.session.next_id;
+                let has_words = !text.trim().is_empty();
+                if has_words {
+                    events.push(tacit::timeline::Event::SessionChanged {
+                        change: SessionEvent::capture(&self.projection.session, &text),
+                    });
+                    events.push(tacit::timeline::Event::TranscriptLinked {
+                        recording: id,
+                        thought_id,
+                    });
+                    self.checkpoint();
+                }
+                if self
+                    .dispatch(tacit::timeline::Event::Transaction { events })
+                    .is_err()
+                {
+                    return;
+                }
+                if let Some(j) = &self.journal
+                    && let Err(error) = j.export_vtt()
+                {
+                    self.status = format!("WebVTT export failed: {error}");
+                }
+                self.voice_state = VoiceState::Ready;
+                if has_words {
+                    self.selected = Some(thought_id);
+                    self.save();
+                    self.schedule_recording_split(thought_id, &text);
+                } else {
+                    self.voice_status = "No speech heard. Try again.".into();
+                }
+            }
             VoiceEvent::Ready => {
                 self.voice_state = VoiceState::Ready;
                 self.voice_status = "Hex ready · transcription stays local".into();
@@ -290,6 +663,12 @@ impl State {
                 self.voice_status = "Listening with Hex".into();
             }
             VoiceEvent::Transcript(words) => {
+                if self.direction_mode && !self.read_only {
+                    self.voice_state = VoiceState::Ready;
+                    self.direction_draft = TextEdit::new(&words);
+                    self.submit_direction();
+                    return;
+                }
                 self.voice_state = VoiceState::Ready;
                 if words.trim().is_empty() {
                     self.voice_status = "No speech heard. Try again.".into();
@@ -298,42 +677,153 @@ impl State {
                         return;
                     }
                     self.checkpoint();
-                    let id = self.session.add(&words).unwrap();
+                    let id = self.projection.session.next_id;
+                    if self
+                        .dispatch_session(SessionEvent::capture(&self.projection.session, &words))
+                        .is_err()
+                    {
+                        return;
+                    }
                     self.selected = Some(id);
                     self.save();
-                    let request = tacit::recording::Request {
-                        id,
-                        text: words.trim().to_owned(),
-                        context: self.session.clone(),
-                    };
-                    if self
-                        .recording_worker
-                        .as_ref()
-                        .is_some_and(|w| w.send.send(request).is_ok())
-                    {
-                        self.pending_recordings.insert(id);
-                        self.voice_status = "Recording saved · separating ideas in context…".into();
-                    } else {
-                        self.voice_status =
-                            "Full recording kept · automatic splitting needs OpenRouter".into();
-                    }
+                    self.schedule_recording_split(id, &words);
                 }
             }
             VoiceEvent::Cancelled => {
+                if let Some(id) = self.active_recording.take() {
+                    self.timeline_event(tacit::timeline::Event::RecordingCancelled { id });
+                }
                 self.voice_state = VoiceState::Ready;
                 self.voice_status = "Recording discarded".into();
             }
             VoiceEvent::Error(message) => {
+                self.timeline_event(tacit::timeline::Event::Failure {
+                    operation: "recording/transcription".into(),
+                    message: message.clone(),
+                });
                 self.voice_state = VoiceState::Unavailable;
                 self.voice_status = message;
             }
+        }
+    }
+    fn toggle_direction(&mut self) {
+        if self.replay.is_some() || self.read_only {
+            return;
+        }
+        if matches!(
+            self.voice_state,
+            VoiceState::Starting
+                | VoiceState::Recording
+                | VoiceState::Finishing
+                | VoiceState::Cancelling
+        ) {
+            self.direction_status = "Finish this recording before changing input mode".into();
+            self.voice_status = self.direction_status.clone();
+            return;
+        }
+        self.direction_mode = !self.direction_mode;
+    }
+    fn submit_direction(&mut self) {
+        if self.read_only || self.replay.is_some() || self.directing {
+            return;
+        }
+        let instruction = self.direction_draft.text.trim().to_owned();
+        if instruction.is_empty() {
+            return;
+        }
+        if !self.pending_recordings.is_empty() {
+            self.direction_status =
+                "Wait for recorded thoughts to finish splitting, then apply this direction".into();
+            return;
+        }
+        let request = tacit::direction::Request {
+            session: self.projection.session.clone(),
+            instruction,
+        };
+        if self
+            .director
+            .as_ref()
+            .is_some_and(|w| w.send.send(request).is_ok())
+        {
+            self.directing = true;
+            self.direction_status = "Considering your direction…".into();
+        } else {
+            self.direction_status =
+                "Map direction needs OpenRouter; your instruction is kept here".into();
+        }
+    }
+    fn receive_direction(&mut self, response: tacit::direction::Response, now: f64) {
+        self.directing = false;
+        if self.read_only || self.replay.is_some() {
+            return;
+        }
+        if tacit::timeline::content_hash(&self.projection.session)
+            .ok()
+            .as_ref()
+            != Some(&response.fingerprint)
+        {
+            self.direction_status = "The map changed while planning. Apply the instruction again to use the latest map.".into();
+            return;
+        }
+        match response.result {
+            Ok(plan) => {
+                if !plan.edits.is_empty() {
+                    let change = SessionEvent::Directed {
+                        instruction: response.instruction.clone(),
+                        edits: plan.edits,
+                    };
+                    if let Err(error) = change.reduce(&self.projection.session) {
+                        self.direction_status = error;
+                        return;
+                    }
+                    self.checkpoint();
+                    if let Err(error) = self.dispatch_session(change) {
+                        self.direction_status = error;
+                        return;
+                    }
+                    // Explicit edits remain stable until new brainstorming content arrives.
+                    self.requested = Some(self.revision);
+                    self.review_requested = Some(self.revision);
+                    self.review_applied = Some(self.revision);
+                    self.busy = false;
+                    self.settled_at = now;
+                    self.settling = 0.0;
+                    if self.direction_draft.text.trim() == response.instruction {
+                        self.direction_draft = TextEdit::new("");
+                    }
+                    self.save();
+                }
+                self.direction_status = plan.explanation;
+            }
+            Err(error) => self.direction_status = error,
+        }
+    }
+    fn schedule_recording_split(&mut self, id: u64, words: &str) {
+        let mut context = self.projection.session.clone();
+        context.thoughts.retain(|t| t.id != id);
+        context.interpretation = None;
+        let request = tacit::recording::Request {
+            id,
+            text: words.trim().to_owned(),
+            context,
+        };
+        if self
+            .recording_worker
+            .as_ref()
+            .is_some_and(|w| w.send.send(request).is_ok())
+        {
+            self.pending_recordings.insert(id);
+            self.voice_status = "Recording saved · separating ideas in context…".into();
+        } else {
+            self.voice_status = "Full recording kept · automatic splitting needs OpenRouter".into();
         }
     }
     fn receive_recording(&mut self, response: tacit::recording::Response) {
         if !self.pending_recordings.remove(&response.id) || self.read_only {
             return;
         }
-        let Some(index) = self
+        let Some(_index) = self
+            .projection
             .session
             .thoughts
             .iter()
@@ -349,15 +839,16 @@ impl State {
             {
                 self.checkpoint();
                 let count = chunks.len();
-                self.session.thoughts[index].text = chunks[0].trim().into();
-                self.session.thoughts[index].role = classify(&chunks[0]);
-                self.session.thoughts[index].category = None;
-                for (offset, chunk) in chunks.iter().enumerate().skip(1) {
-                    self.session.add(chunk);
-                    let thought = self.session.thoughts.pop().unwrap();
-                    self.session.thoughts.insert(index + offset, thought);
+                if self
+                    .dispatch_session(SessionEvent::Split {
+                        source_id: response.id,
+                        original: response.text.clone(),
+                        chunks: chunks.clone(),
+                    })
+                    .is_err()
+                {
+                    return;
                 }
-                self.session.interpretation = None;
                 self.voice_status = format!("Recording → {count} thoughts · organizing in context");
                 self.save();
             }
@@ -365,27 +856,516 @@ impl State {
             _ => self.voice_status = "Invalid split · full recording kept".into(),
         }
     }
+    /// Persist first, then publish the reducer's projection to the renderer.
+    fn dispatch(&mut self, event: tacit::timeline::Event) -> Result<(), String> {
+        if self.replay.is_some() || self.read_only {
+            return Err("Session is read-only".into());
+        }
+        let result = if let Some(journal) = &mut self.journal {
+            journal
+                .append(journal.now_ms(), event)
+                .map(|()| journal.projection.clone())
+        } else {
+            let mut next = self.projection.clone();
+            next.apply(&event).map(|()| next)
+        };
+        match result {
+            Ok(next) => {
+                self.projection = next;
+                Ok(())
+            }
+            Err(error) => {
+                let message =
+                    format!("Timeline write failed: {error}. Editing stopped to protect replay.");
+                self.read_only = true;
+                self.status = message.clone();
+                Err(message)
+            }
+        }
+    }
+    fn dispatch_session(&mut self, change: SessionEvent) -> Result<(), String> {
+        // Invalid/stale model output is rejected without disabling a healthy journal.
+        change.reduce(&self.projection.session)?;
+        self.dispatch(tacit::timeline::Event::SessionChanged { change })
+    }
+    fn timeline_event(&mut self, event: tacit::timeline::Event) {
+        let _ = self.dispatch(event);
+    }
+
+    fn record_presentation(&mut self, _reason: &str) {
+        if self.sessions_open || self.replay.is_some() || self.read_only || self.journal.is_none() {
+            return;
+        }
+        let result = (|| -> std::io::Result<()> {
+            let journal = self.journal.as_mut().unwrap();
+            let mut artwork = Vec::new();
+            for layer in &self.gallery.layers {
+                let asset = if let Some(asset) = self.art_assets.get(&layer.image.id()) {
+                    asset.clone()
+                } else {
+                    let bytes = layer.encoded.as_ref().ok_or_else(|| {
+                        std::io::Error::other("Illustration source bytes unavailable")
+                    })?;
+                    let asset = journal.import_bytes(bytes, "png")?;
+                    self.art_assets.insert(layer.image.id(), asset.clone());
+                    asset
+                };
+                artwork.push(tacit::timeline::Artwork {
+                    key: layer.key.clone(),
+                    fingerprint: layer.fingerprint.clone(),
+                    slot: layer.slot,
+                    asset,
+                    born: layer.born,
+                    retired: layer.retired,
+                });
+            }
+            let mut garden = self.art.clone();
+            garden.now = 0.0;
+            let scene = tacit::timeline::Scene {
+                session: self.projection.session.clone(),
+                render_time: Some(self.art.now),
+                session_title: self.session_name.clone(),
+                direction_mode: self.direction_mode,
+                direction_draft: self.direction_draft.text.clone(),
+                direction_status: self.direction_status.clone(),
+                draft: self.draft.text.clone(),
+                selected: self.selected,
+                style: self.art_style,
+                story: self.story,
+                garden,
+                artwork,
+                busy: self.busy,
+                settled_at: self.settled_at,
+                organizer_status: self.organizer_status.clone(),
+                voice_status: self.voice_status.clone(),
+                art_status: self.gallery.status.clone(),
+                map_scroll: self.map_scroll.get(),
+                story_scroll: self.story_scroll.get(),
+                inspector_scroll: self.inspector_scroll.get(),
+                viewport: self.viewport,
+                map_viewport: self.map_viewport,
+                reduced_motion: self.reduced_motion,
+            };
+            journal.present_scene(journal.now_ms(), scene)?;
+            // Presentation commits cannot change session content.
+            self.projection = journal.projection.clone();
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.read_only = true;
+            self.status =
+                format!("Timeline write failed: {error}. Editing stopped to protect replay.");
+            if let Some(journal) = &self.journal {
+                self.projection = journal.projection.clone();
+            }
+        }
+    }
+    fn restore_scene(&mut self, scene: tacit::timeline::Scene, now: f64) {
+        self.session_name = scene.session_title.clone();
+        self.direction_mode = scene.direction_mode;
+        self.direction_draft = TextEdit::new(&scene.direction_draft);
+        self.direction_status = scene.direction_status.clone();
+        let render_now = if self.replay.is_some() {
+            scene.render_time.unwrap_or(now)
+        } else {
+            now
+        };
+        if let Some(journal) = &self.journal {
+            self.projection = if self.replay.is_some() {
+                journal
+                    .at((now * 1000.0).round() as u64)
+                    .expect("validated timeline")
+            } else {
+                journal.projection.clone()
+            };
+        } else {
+            self.projection.session = scene.session.clone();
+        }
+        if self.replay.is_some() {
+            self.projection.session = scene.session;
+        }
+        self.viewport = scene.viewport;
+        self.map_viewport = scene.map_viewport;
+        let pixel_gap = self.projection.pixel_capture_active == Some(false)
+            && self
+                .journal
+                .as_ref()
+                .is_some_and(|j| (now * 1000.0).round() < j.duration() as f64);
+        if self.replay.is_some() && self.pixel_replay && !pixel_gap {
+            if let Some(frame) = &self.projection.pixel_frame {
+                if self
+                    .pixel_image
+                    .as_ref()
+                    .is_none_or(|(asset, _)| asset != &frame.asset)
+                {
+                    let loaded = (|| -> std::io::Result<rune::Image> {
+                        let path = self.journal.as_ref().unwrap().asset(&frame.asset)?;
+                        let image = self.image_cache.load(std::fs::read(path)?);
+                        image
+                            .wait()
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        Ok(image)
+                    })();
+                    match loaded {
+                        Ok(image) => self.pixel_image = Some((frame.asset.clone(), image)),
+                        Err(error) => {
+                            self.pixel_image = None;
+                            self.status = format!("Original frame unavailable: {error}");
+                            if let Some(r) = &mut self.replay {
+                                r.playing = false;
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.pixel_image = None;
+            }
+        }
+        if self.pixel_replay && pixel_gap {
+            self.pixel_image = None;
+        }
+        self.draft = TextEdit::new(scene.draft);
+        self.selected = scene.selected;
+        self.art_style = scene.style;
+        self.story = scene.story;
+        self.art = scene.garden;
+        self.art.now = render_now;
+        self.gallery.now = render_now;
+        self.reduced_motion = scene.reduced_motion;
+        self.busy = scene.busy;
+        self.settled_at = scene.settled_at;
+        self.settling = ((render_now - self.settled_at) / 0.85).clamp(0.0, 1.0) as f32;
+        self.pulse = ((render_now * 3.0).sin() as f32 + 1.0) / 2.0;
+        self.organizer_status = scene.organizer_status;
+        self.voice_status = scene.voice_status;
+        self.gallery.status = scene.art_status;
+        self.gallery.layers = scene
+            .artwork
+            .into_iter()
+            .filter_map(|a| {
+                let image = if let Some(image) = self.replay_images.get(&a.asset) {
+                    image.clone()
+                } else {
+                    let path = self.journal.as_ref()?.asset(&a.asset).ok()?;
+                    let bytes = std::fs::read(path).ok()?;
+                    let image = self.image_cache.load(bytes);
+                    if rune::is_headless() {
+                        let _ = image.wait();
+                    }
+                    self.replay_images.insert(a.asset.clone(), image.clone());
+                    image
+                };
+                self.art_assets.insert(image.id(), a.asset.clone());
+                Some(generated_art::Layer {
+                    encoded: None,
+                    key: a.key,
+                    fingerprint: a.fingerprint,
+                    slot: a.slot,
+                    image,
+                    born: a.born,
+                    retired: a.retired,
+                })
+            })
+            .collect();
+    }
+    fn export_video(&mut self) {
+        if self.video_export.is_some() {
+            return;
+        }
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        let source = journal.root.clone();
+        let output = source.join(format!("original-{}.mkv", tacit::timeline::unix_ms()));
+        let (send, receive) = std::sync::mpsc::channel();
+        self.video_export = Some(receive);
+        self.status = "Exporting original pixels and audio as lossless video…".into();
+        std::thread::spawn(move || {
+            let result = tacit::timeline::Journal::read(&source)
+                .and_then(|journal| tacit::video_archive::export(&journal, &output))
+                .map(|()| output)
+                .map_err(|e| e.to_string());
+            let _ = send.send(result);
+        });
+    }
+    pub fn capturing_pixels(&self) -> bool {
+        self.journal.is_some() && !self.read_only && self.replay.is_none() && !self.sessions_open
+    }
+    pub fn capture_failed(&mut self, error: String) {
+        self.timeline_event(tacit::timeline::Event::Failure {
+            operation: "original video capture".into(),
+            message: error.clone(),
+        });
+        self.read_only = true;
+        self.status = format!("Original video capture failed: {error}. Editing stopped.");
+    }
+    pub fn record_pixels(
+        &mut self,
+        size: (u32, u32),
+        scale: f32,
+        pixels: &[u8],
+    ) -> Result<(), String> {
+        self.journal
+            .as_mut()
+            .ok_or("No archive for original pixels")?
+            .begin_pixels()
+            .map_err(|e| e.to_string())?;
+        self.record_presentation("displayed frame");
+        if self.read_only {
+            return Err(self.status.clone());
+        }
+        let raw_hash = *blake3::hash(pixels).as_bytes();
+        let asset = if let Some((previous, frame)) = &self.last_pixels
+            && previous == &raw_hash
+            && (frame.width, frame.height) == size
+        {
+            frame.asset.clone()
+        } else {
+            let bytes = tacit::video_archive::png_bytes(size.0, size.1, pixels)
+                .map_err(|e| e.to_string())?;
+            self.journal
+                .as_ref()
+                .ok_or("No archive for original pixels")?
+                .import_bytes(&bytes, "png")
+                .map_err(|e| e.to_string())?
+        };
+        let frame = tacit::timeline::PixelFrame {
+            asset,
+            width: size.0,
+            height: size.1,
+            scale,
+            content_hash: tacit::timeline::content_hash(&self.projection.session)
+                .map_err(|e| e.to_string())?,
+        };
+        self.dispatch(tacit::timeline::Event::Pixels {
+            frame: frame.clone(),
+        })?;
+        self.last_pixels = Some((raw_hash, frame));
+        Ok(())
+    }
+    fn prepare_replay(&mut self) -> std::io::Result<()> {
+        let journal = self
+            .journal
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("No session archive"))?;
+        journal.validate_replay()?;
+        if journal.entries.iter().flat_map(|e| e.event.leaves()).any(|e| matches!(e, tacit::timeline::Event::Failure { operation, .. } if operation == "original video capture")) {
+            self.status = "Original video is incomplete · available frames can be inspected".into();
+        }
+        for art in &journal.projection.artwork {
+            if !self.replay_images.contains_key(&art.asset) {
+                let bytes = std::fs::read(journal.asset(&art.asset)?)?;
+                let image = self.image_cache.load(bytes);
+                image.wait().map_err(|error| {
+                    std::io::Error::other(format!(
+                        "Cannot decode replay artwork {}: {error}",
+                        art.asset
+                    ))
+                })?;
+                self.replay_images.insert(art.asset.clone(), image);
+            }
+        }
+        Ok(())
+    }
+    fn toggle_replay(&mut self) {
+        if self.archive_only {
+            return;
+        }
+        if matches!(
+            self.voice_state,
+            VoiceState::Recording | VoiceState::Starting | VoiceState::Finishing
+        ) || !self.pending_recordings.is_empty()
+        {
+            return;
+        }
+        if self.replay.take().is_some() {
+            if let Some((_, player)) = self.replay_audio.take() {
+                player.pause();
+            }
+            let scene = self.journal.as_ref().map(|j| j.projection.scene());
+            if let Some(scene) = scene {
+                self.restore_scene(
+                    scene,
+                    self.journal.as_ref().unwrap().now_ms() as f64 / 1000.0,
+                );
+            }
+            self.read_only = false;
+            self.voice_state = VoiceState::Unavailable;
+            self.voice_status = "Replay ended · reconnect Hex to record".into();
+        } else if self.journal.is_some() && !self.read_only {
+            if let Err(error) = self.journal.as_mut().unwrap().end_pixels() {
+                self.capture_failed(error.to_string());
+                return;
+            }
+            self.record_presentation("replay boundary");
+            if self.read_only {
+                return;
+            }
+            if let Err(error) = self.prepare_replay() {
+                self.status = format!("Cannot replay: {error}");
+                return;
+            }
+            if let Some(worker) = &self.gallery.worker {
+                let _ = worker.send.send(vec![]);
+            }
+            self.replay = Some(Replay {
+                at_ms: self.journal.as_ref().unwrap().first_frame_ms().unwrap(),
+                playing: false,
+                last_tick: None,
+                last_projected: None,
+            });
+            self.read_only = true;
+        }
+    }
+    fn seek_replay(&mut self, delta: i64) {
+        let end = self.journal.as_ref().map_or(0, |j| j.duration());
+        if let Some(replay) = &mut self.replay {
+            replay.at_ms = replay.at_ms.saturating_add_signed(delta).min(end).max(
+                self.journal
+                    .as_ref()
+                    .and_then(|j| j.first_frame_ms())
+                    .unwrap_or(0),
+            );
+            replay.last_tick = None;
+        }
+        if let Some((_, player)) = self.replay_audio.take() {
+            player.pause();
+        }
+    }
+    fn next_replay_event(&mut self) {
+        if let (Some(journal), Some(replay)) = (&self.journal, &mut self.replay) {
+            replay.at_ms = journal
+                .entries
+                .iter()
+                .find(|e| e.at_ms > replay.at_ms)
+                .map_or(journal.duration(), |e| e.at_ms);
+            replay.last_tick = None;
+            if let Some((_, player)) = self.replay_audio.take() {
+                player.pause();
+            }
+        }
+    }
+    fn replay_caption(&self) -> String {
+        let (Some(j), Some(r)) = (&self.journal, &self.replay) else {
+            return String::new();
+        };
+        j.projection
+            .transcripts
+            .iter()
+            .find_map(|(id, cues, _)| {
+                let audio = j.projection.audio.iter().find(|a| &a.id == id)?;
+                let time = r.at_ms.checked_sub(audio.start_ms)?;
+                cues.iter()
+                    .find(|c| time >= c.start_ms && time < c.end_ms)
+                    .map(|c| c.text.clone())
+            })
+            .unwrap_or_else(|| "Session replay · original audio and saved model results".into())
+    }
+    fn recover_transcripts(&mut self) {
+        let Some(j) = &self.journal else {
+            return;
+        };
+        let pending:Vec<_>=j.entries.iter().enumerate().filter_map(|(index,e)| {
+            let tacit::timeline::Event::Transcript{recording,text,..}=&e.event else{return None;};
+            if j.projection.direction_recordings.contains(recording) || text.trim().is_empty() || j.entries.iter().any(|e|matches!(&e.event,tacit::timeline::Event::TranscriptLinked{recording:id,..} if id==recording)){return None;}
+            let mut before = tacit::timeline::Projection::default();
+            for entry in &j.entries[..index] { before.apply(&entry.event).ok()?; }
+            let expected = before.session.next_id;
+            Some((recording.clone(),text.clone(),expected))
+        }).collect();
+        for (recording, text, expected) in pending {
+            let id = if self
+                .projection
+                .session
+                .thoughts
+                .iter()
+                .any(|t| t.id == expected && t.text == text.trim())
+            {
+                Some(expected)
+            } else {
+                let direction_mode = self.direction_mode;
+                self.direction_mode = false; // This legacy transcript was captured as brainstorming.
+                self.receive_voice(
+                    VoiceEvent::Transcript(text),
+                    self.journal.as_ref().unwrap().now_ms() as f64 / 1000.0,
+                );
+                self.direction_mode = direction_mode;
+                self.selected
+            };
+            if let Some(thought_id) = id {
+                self.timeline_event(tacit::timeline::Event::TranscriptLinked {
+                    recording,
+                    thought_id,
+                });
+            }
+        }
+        if self.direction_draft.text.trim().is_empty()
+            && let Some(j) = &self.journal
+            && let Some((_, _, text)) = j.projection.transcripts.iter().rev().find(|(id, _, text)| {
+                j.projection.direction_recordings.contains(id) && !j.entries.iter().flat_map(|e| e.event.leaves()).any(|e| {
+                    matches!(e, tacit::timeline::Event::SessionChanged { change: SessionEvent::Directed { instruction, .. } } if instruction.trim() == text.trim())
+                })
+            }) {
+                self.direction_mode = true;
+                self.direction_draft = TextEdit::new(text);
+                self.direction_status = "Saved spoken direction recovered. Apply it when ready.".into();
+        }
+    }
+    fn retry_transcript(&mut self) {
+        let Some(j) = &self.journal else {
+            return;
+        };
+        let Some(audio) = j.projection.audio.iter().rev().find(|a| {
+            !j.projection
+                .transcripts
+                .iter()
+                .any(|(id, _, _)| id == &a.id)
+        }) else {
+            return;
+        };
+        // Retained originals have recording IDs as filenames, independent of the content-addressed copy.
+        let path = j.root.join("recordings").join(format!("{}.wav", audio.id));
+        self.voice_command(VoiceCommand::Retry(path));
+    }
     fn checkpoint(&mut self) {
         self.revision += 1;
-        self.history.push(self.session.clone());
+        self.history.push(self.projection.session.clone());
         if self.history.len() > 100 {
             self.history.remove(0);
         }
     }
     fn save(&mut self) {
+        self.record_presentation("map edit or model result");
+        if self.read_only {
+            return;
+        }
         if let Some(path) = &self.path {
-            self.status = match storage::save(path, &self.session) {
+            self.status = match storage::save(path, &self.projection.session) {
                 Ok(()) => "Saved on this device".into(),
                 Err(e) => format!("Not saved: {e}. Use Retry save."),
             };
         }
     }
     fn capture(&mut self) {
+        if self.direction_mode {
+            self.submit_direction();
+            return;
+        }
         if self.read_only || self.draft.text.trim().is_empty() {
             return;
         }
         self.checkpoint();
-        self.selected = self.session.add(&self.draft.text);
+        let id = self.projection.session.next_id;
+        if self
+            .dispatch_session(SessionEvent::capture(
+                &self.projection.session,
+                &self.draft.text,
+            ))
+            .is_err()
+        {
+            return;
+        }
+        self.selected = Some(id);
         self.draft = TextEdit::new("");
         self.save();
     }
@@ -395,7 +1375,12 @@ impl State {
         }
         if let Some(id) = self.selected {
             self.checkpoint();
-            self.session.move_thought(id);
+            let Ok(change) = SessionEvent::correct_placement(&self.projection.session, id) else {
+                return;
+            };
+            if self.dispatch_session(change).is_err() {
+                return;
+            }
             self.save();
         }
     }
@@ -405,16 +1390,28 @@ impl State {
         }
         if let Some(id) = self.selected.take() {
             self.checkpoint();
-            self.session.thoughts.retain(|t| t.id != id);
-            self.session.interpretation = None;
+            if self.dispatch_session(SessionEvent::Removed { id }).is_err() {
+                return;
+            }
             self.save();
         }
     }
     fn undo(&mut self) {
+        if self.read_only {
+            return;
+        }
         self.pending_recordings.clear();
         if let Some(previous) = self.history.pop() {
             self.revision += 1;
-            self.session = previous;
+            if self
+                .dispatch_session(SessionEvent::Restored {
+                    session: previous,
+                    reason: "undo".into(),
+                })
+                .is_err()
+            {
+                return;
+            }
             self.selected = None;
             self.save();
         }
@@ -578,38 +1575,47 @@ fn curve(mut shape: Shape, start: [f32; 2], end: [f32; 2], ink: Color, thick: f3
     shape
 }
 fn tree(s: &State, cx: &Cx<State>) -> El {
-    let width = cx
-        .layout_size("map")
-        .map_or(920.0, |size| size[0])
-        .max(700.0);
-    // Themes carry stable IDs; the original narrative lenses remain the offline fallback.
-    let mut groups: Vec<(Option<String>, String, Role)> = if s.session.categories.is_empty() {
-        Role::ALL
-            .into_iter()
-            .map(|r| (None, branch_name(r).into(), r))
-            .collect()
+    let width = if s.replay.is_some() && s.map_viewport[0] > 0.0 {
+        s.map_viewport[0]
     } else {
-        s.session
-            .categories
+        cx.layout_size("map").map_or(920.0, |size| size[0])
+    }
+    .max(700.0);
+    // Themes carry stable IDs; the original narrative lenses remain the offline fallback.
+    let mut groups: Vec<(Option<String>, String, Role)> =
+        if s.projection.session.categories.is_empty() {
+            Role::ALL
+                .into_iter()
+                .map(|r| (None, branch_name(r).into(), r))
+                .collect()
+        } else {
+            s.projection
+                .session
+                .categories
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (Some(c.id.clone()), c.name.clone(), Role::ALL[i % 4]))
+                .collect()
+        };
+    if !s.projection.session.categories.is_empty()
+        && (s
+            .projection
+            .session
+            .thoughts
             .iter()
-            .enumerate()
-            .map(|(i, c)| (Some(c.id.clone()), c.name.clone(), Role::ALL[i % 4]))
-            .collect()
-    };
-    if !s.session.categories.is_empty()
-        && (s.session.thoughts.iter().any(|t| t.category.is_none())
+            .any(|t| t.category.is_none())
             || !s.draft.text.trim().is_empty())
     {
         groups.push((None, "Taking root".into(), Role::Observation));
     }
     let matches = |t: &tacit::model::Thought, group: usize| {
-        if s.session.categories.is_empty() {
+        if s.projection.session.categories.is_empty() {
             t.role == groups[group].2
         } else {
             t.category == groups[group].0
         }
     };
-    let draft_group = if s.session.categories.is_empty() {
+    let draft_group = if s.projection.session.categories.is_empty() {
         Role::ALL
             .iter()
             .position(|r| *r == classify(&s.draft.text))
@@ -619,7 +1625,12 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
     };
     let counts: Vec<usize> = (0..groups.len())
         .map(|i| {
-            s.session.thoughts.iter().filter(|t| matches(t, i)).count()
+            s.projection
+                .session
+                .thoughts
+                .iter()
+                .filter(|t| matches(t, i))
+                .count()
                 + usize::from(!s.draft.text.trim().is_empty() && i == draft_group)
         })
         .collect();
@@ -674,6 +1685,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 ),
         );
         let mut entries: Vec<(Option<u64>, String)> = s
+            .projection
             .session
             .thoughts
             .iter()
@@ -739,7 +1751,6 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                     ink.alpha((1.0 - s.settling) * 0.13)
                 })
                 .hover(ink.alpha(0.08))
-                .motion(SPRING)
                 .role("button")
                 .focusable(id.is_some())
                 .child(
@@ -757,7 +1768,12 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                             format!(
                                 "{:02}{}",
                                 id,
-                                if s.session.thoughts.iter().any(|t| t.id == id && t.pinned) {
+                                if s.projection
+                                    .session
+                                    .thoughts
+                                    .iter()
+                                    .any(|t| t.id == id && t.pinned)
+                                {
                                     " · pinned"
                                 } else {
                                     ""
@@ -769,7 +1785,11 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                     ink,
                 ));
             if let Some(id) = id {
-                node = node.on_press(move |s: &mut State| s.selected = Some(id));
+                node = node.on_press(move |s: &mut State| {
+                    if s.replay.is_none() {
+                        s.selected = Some(id);
+                    }
+                });
             }
             labels.push(node);
         }
@@ -835,8 +1855,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 .key(format!("theme-art-{}", layer.serial))
                 .absolute(x, y)
                 .size(size, size)
-                .opacity(opacity * (1.0 - s.gallery.coverage(&layer.concept.key)))
-                .motion(Spring::new(1.2, 0.05)),
+                .opacity(opacity * (1.0 - s.gallery.coverage(&layer.concept.key))),
             );
         }
     }
@@ -868,7 +1887,6 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 .key(format!("generated-{}-{}", layer.key, layer.fingerprint))
                 .absolute(x, y)
                 .size(size, size)
-                .motion(Spring::new(1.2, 0.05))
                 .opacity(opacity * progress.min(0.4) / 0.4)
                 .child(
                     el().absolute(0.0, 0.0)
@@ -906,7 +1924,8 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             .gap(5.0)
             .child(canvas(illustration(Role::Observation)).size(32.0, 26.0))
             .child(
-                label(short_label(&s.session.title), 16.0, INK).font(TextStyle::new(16.0, 600.0)),
+                label(short_label(&s.projection.session.title), 16.0, INK)
+                    .font(TextStyle::new(16.0, 600.0)),
             )
             .child(
                 label(
@@ -925,8 +1944,19 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 }),
             ),
     );
-    col()
+    let map = col()
         .key("map")
+        .on_layout(|s: &mut State, rect| {
+            if s.replay.is_none() {
+                s.map_viewport = [rect[2], rect[3]];
+            }
+        })
+        .on_scroll_offset({
+            let offset = s.map_scroll.clone();
+            move |pos| {
+                offset.set(pos.offset);
+            }
+        })
         .w(0.0)
         .grow(1.0)
         .min_w(0.0)
@@ -935,16 +1965,221 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         .child(sheet)
         .scroll(ScrollSpec {
             stick_bottom: false,
-        })
+        });
+    if s.replay.is_some() && s.map_viewport.iter().all(|v| *v > 0.0) {
+        map.w(s.map_viewport[0])
+            .min_w(s.map_viewport[0])
+            .max_w(s.map_viewport[0])
+            .h(s.map_viewport[1])
+            .min_h(s.map_viewport[1])
+            .max_h(s.map_viewport[1])
+            .grow(0.0)
+    } else {
+        map
+    }
+}
+fn replay_controls(s: &State) -> El {
+    let replay = s.replay.as_ref().unwrap();
+    col()
+        .gap(8.0)
+        .child(
+            row()
+                .gap(8.0)
+                .child(button("−10s", "replay-back", |s| s.seek_replay(-10000)))
+                .child(button(
+                    if replay.playing { "Pause" } else { "Play" },
+                    "replay-play",
+                    |s| {
+                        let end = s.journal.as_ref().map_or(0, |j| j.duration());
+                        if let Some(r) = &mut s.replay {
+                            if r.at_ms >= end {
+                                r.at_ms = s
+                                    .journal
+                                    .as_ref()
+                                    .and_then(|j| j.first_frame_ms())
+                                    .unwrap_or(0);
+                            }
+                            r.playing = !r.playing;
+                            r.last_tick = None;
+                        }
+                    },
+                ))
+                .child(button("+10s", "replay-forward", |s| s.seek_replay(10000)))
+                .child(button(
+                    "Next event",
+                    "replay-next",
+                    State::next_replay_event,
+                ))
+                .child(label(
+                    format!(
+                        "{} / {}",
+                        tacit::timeline::timestamp(replay.at_ms),
+                        tacit::timeline::timestamp(s.journal.as_ref().map_or(0, |j| j.duration()))
+                    ),
+                    12.0,
+                    INK,
+                )),
+        )
+        .child(label(s.replay_caption(), 11.0, MUTED))
+        .child(
+            row()
+                .gap(8.0)
+                .child(button(
+                    if s.pixel_replay {
+                        "Scene replay"
+                    } else {
+                        "Original pixels"
+                    },
+                    "replay-renderer",
+                    |s| {
+                        s.pixel_replay = !s.pixel_replay;
+                        if let Some(replay) = &mut s.replay {
+                            replay.last_projected = None;
+                        }
+                    },
+                ))
+                .child(button(
+                    "Export lossless video",
+                    "export-video",
+                    State::export_video,
+                ))
+                .child(if s.archive_only {
+                    label("Saved archive", 11.0, MUTED)
+                } else {
+                    button("Back to live", "back-live", State::toggle_replay)
+                }),
+        )
+}
+fn sessions_button(s: &State) -> El {
+    if s.library_base.is_none() {
+        return el();
+    }
+    button("Sessions", "sessions", |s| {
+        if !s.read_only
+            && s.replay.is_none()
+            && let Some(journal) = &mut s.journal
+            && let Err(e) = journal.end_pixels()
+        {
+            s.status = format!("Cannot pause capture: {e}");
+            return;
+        }
+        s.refresh_sessions();
+        s.session_name_edit = TextEdit::new(&s.session_name);
+        s.sessions_open = !s.sessions_open;
+    })
+}
+fn sessions_view(s: &State) -> El {
+    let mut items = col().gap(8.0).grow(1.0).min_h(0.0).scroll(ScrollSpec {
+        stick_bottom: false,
+    });
+    for (index, entry) in s.session_entries.iter().enumerate() {
+        let path = entry.path.clone();
+        let current = s.path.as_ref() == Some(&path);
+        items = items.child(
+            button(
+                &format!(
+                    "{}{}",
+                    entry.name,
+                    if current { "  ·  current" } else { "" }
+                ),
+                &format!("session-{index}"),
+                move |s| s.switch_session(path.clone()),
+            )
+            .fill(if current { LINE } else { WHITE }),
+        );
+    }
+    col()
+        .w_full()
+        .h_full()
+        .padding(28.0)
+        .gap(18.0)
+        .fill(PAPER)
+        .child(
+            row()
+                .center_y()
+                .child(label("Your sessions", 28.0, INK).grow(1.0))
+                .child(button("Back", "sessions-back", |s| s.sessions_open = false)),
+        )
+        .child(label(
+            "Separate thoughts, recordings, artwork, and replay history for every session.",
+            14.0,
+            MUTED,
+        ))
+        .child(items)
+        .child(
+            text_input(&s.session_name_edit, TextStyle::new(16.0, 400.0))
+                .key("session-name")
+                .h(44.0)
+                .color(INK)
+                .placeholder("Session name", MUTED)
+                .on_edit(|s: &mut State| &mut s.session_name_edit),
+        )
+        .child(
+            row()
+                .gap(12.0)
+                .child(button(
+                    "New session",
+                    "session-create",
+                    State::create_session,
+                ))
+                .child(button(
+                    "Rename current",
+                    "session-rename",
+                    State::rename_session,
+                )),
+        )
+        .child(label(s.status.clone(), 12.0, MUTED))
 }
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
-    let wide = cx.layout_size("root").is_none_or(|size| size[0] >= 1080.0);
+    if s.sessions_open {
+        return sessions_view(s);
+    }
+    if s.replay.is_some() && s.pixel_replay {
+        let picture = if let Some((_, image)) = &s.pixel_image {
+            el().pixels_fit(image.pixels(), rune::SurfaceFit::Fit)
+                .w_full()
+                .h(0.0)
+                .grow(1.0)
+                .min_h(0.0)
+        } else {
+            label("No original pixels were captured at this time.", 18.0, INK).grow(1.0)
+        };
+        return col()
+            .w_full()
+            .h_full()
+            .fill(PAPER)
+            .child(picture)
+            .child(replay_controls(s).padding(12.0))
+            .child(sessions_button(s))
+            .child(label(s.status.clone(), 11.0, MUTED));
+    }
+    if s.replay.is_some() {
+        cx.reduced_motion(s.reduced_motion);
+    }
+    let reduced_motion = cx.is_reduced_motion();
+    let wide = if s.replay.is_some() {
+        s.viewport[0] >= 1080.0
+    } else {
+        cx.layout_size("root").is_none_or(|size| size[0] >= 1080.0)
+    };
     let header = row()
         .w_full()
         .center_y()
         .gap(16.0)
         .child(label("tacit", 32.0, INK).font(TextStyle::new(32.0, 500.0).tracking(-1.5)))
-        .child(label("A FIELD GUIDE TO YOUR THINKING", 10.0, MUTED).grow(1.0))
+        .child(
+            label(
+                if !s.session_name.is_empty() {
+                    &s.session_name
+                } else {
+                    "A FIELD GUIDE TO YOUR THINKING"
+                },
+                10.0,
+                MUTED,
+            )
+            .grow(1.0),
+        )
+        .child(sessions_button(s))
         .child(button(
             if s.story {
                 "Show map"
@@ -952,10 +2187,16 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 "Read the thread"
             },
             "toggle-story",
-            |s| s.story = !s.story,
+            |s| {
+                if s.replay.is_none() {
+                    s.story = !s.story;
+                }
+            },
         ))
         .child(button(s.art_style.label(), "art-style", |s| {
-            s.art_style = s.art_style.next()
+            if s.replay.is_none() {
+                s.art_style = s.art_style.next();
+            }
         }))
         .child(button("Undo", "undo", State::undo));
     let title = col()
@@ -964,16 +2205,16 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         .child(label(
             format!(
                 "{} thoughts  /  one living tree  /  follow a branch",
-                s.session.thoughts.len()
+                s.projection.session.thoughts.len()
             ),
             12.0,
             MUTED,
         ));
     let main = if s.story {
-        col().key("story").grow(1.0).min_h(0.0).gap(20.0).padding(26.0)
+        col().key("story").on_scroll_offset({let offset=s.story_scroll.clone();move |p|{offset.set(p.offset);}}).grow(1.0).min_h(0.0).gap(20.0).padding(26.0)
             .child(label("THE THREAD SO FAR", 11.0, GREEN))
-            .child(label(s.session.narrative(), 23.0, INK).selectable(true))
-            .child(label(if s.session.interpretation.is_some() { "A model interpretation. Bracketed numbers refer to your original thoughts; relationships remain hypotheses." } else { "A reading order assembled from your words, not an inferred causal explanation." }, 12.0, MUTED))
+            .child(label(s.projection.session.narrative(), 23.0, INK).selectable(true))
+            .child(label(if s.projection.session.interpretation.is_some() { "A model interpretation. Bracketed numbers refer to your original thoughts; relationships remain hypotheses." } else { "A reading order assembled from your words, not an inferred causal explanation." }, 12.0, MUTED))
             .scroll(ScrollSpec { stick_bottom: false })
     } else {
         tree(s, cx)
@@ -1018,9 +2259,15 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 s.voice_command(VoiceCommand::Cancel)
             }))
             .child(
-                button("Stop & transcribe", "voice-stop", |s| {
-                    s.voice_command(VoiceCommand::Finish)
-                })
+                button(
+                    if s.direction_mode {
+                        "Stop & direct"
+                    } else {
+                        "Stop & transcribe"
+                    },
+                    "voice-stop",
+                    |s| s.voice_command(VoiceCommand::Finish),
+                )
                 .fill(PAPER),
             ),
         VoiceState::Unavailable => {
@@ -1032,6 +2279,46 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     };
     let composer = col()
         .key("composer")
+        .child(
+            row()
+                .center_y()
+                .gap(12.0)
+                .child(button(
+                    if s.direction_mode {
+                        "Brainstorm"
+                    } else {
+                        "Brainstorm ✓"
+                    },
+                    "mode-brainstorm",
+                    |s| {
+                        if s.direction_mode {
+                            s.toggle_direction();
+                        }
+                    },
+                ))
+                .child(button(
+                    if s.direction_mode {
+                        "Direct the map ✓"
+                    } else {
+                        "Direct the map"
+                    },
+                    "mode-direct",
+                    |s| {
+                        if !s.direction_mode {
+                            s.toggle_direction();
+                        }
+                    },
+                ))
+                .child(label(
+                    if s.direction_mode {
+                        "Instructions change the map; they never become thoughts."
+                    } else {
+                        "Capture ideas · switch to Direct the map for editing instructions"
+                    },
+                    12.0,
+                    MUTED,
+                )),
+        )
         .child(voice_controls)
         .gap(8.0)
         .padding(14.0)
@@ -1043,22 +2330,59 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 .gap(12.0)
                 .center_y()
                 .child(
-                    text_input(&s.draft, TextStyle::new(16.0, 400.0))
-                        .key("thought-input")
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .h(44.0)
-                        .color(INK)
-                        .placeholder("A thought, a question, a loose thread…", MUTED)
-                        .on_edit(|s: &mut State| &mut s.draft)
-                        .on_submit(|s: &mut State, _| s.capture()),
+                    text_input(
+                        if s.direction_mode {
+                            &s.direction_draft
+                        } else {
+                            &s.draft
+                        },
+                        TextStyle::new(16.0, 400.0),
+                    )
+                    .key("thought-input")
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .h(44.0)
+                    .color(INK)
+                    .placeholder(
+                        if s.direction_mode {
+                            "Move the budget thoughts into Costs; put Decisions first…"
+                        } else {
+                            "A thought, a question, a loose thread…"
+                        },
+                        MUTED,
+                    )
+                    .on_edit(|s: &mut State| {
+                        if s.direction_mode {
+                            &mut s.direction_draft
+                        } else {
+                            &mut s.draft
+                        }
+                    })
+                    .on_submit(|s: &mut State, _| s.capture()),
                 )
-                .child(button("Keep thought ↗", "capture", State::capture).fill(PAPER)),
+                .child(
+                    button(
+                        if s.direction_mode {
+                            if s.directing {
+                                "Considering…"
+                            } else {
+                                "Apply direction ↗"
+                            }
+                        } else {
+                            "Keep thought ↗"
+                        },
+                        "capture",
+                        State::capture,
+                    )
+                    .fill(PAPER),
+                ),
         )
         .child(label(
-            if s.draft.text.trim().is_empty() {
+            if s.direction_mode {
+                s.direction_status.clone()
+            } else if s.draft.text.trim().is_empty() {
                 "Enter to keep  ·  Shift+Enter for a new line  ·  your words stay yours".into()
-            } else if !s.session.categories.is_empty() {
+            } else if !s.projection.session.categories.is_empty() {
                 "Taking root · keep this thought to find its theme".into()
             } else {
                 format!(
@@ -1071,6 +2395,12 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
         ));
     let mut root = col()
         .key("root")
+        .on_layout(move |s: &mut State, rect| {
+            if s.replay.is_none() {
+                s.viewport = [rect[2], rect[3]];
+                s.reduced_motion = reduced_motion;
+            }
+        })
         .w_full()
         .h_full()
         .padding(28.0)
@@ -1082,6 +2412,11 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     if !wide {
         root = root.child(compact_inspector(s));
     }
+    let composer = if s.replay.is_some() {
+        replay_controls(s)
+    } else {
+        composer
+    };
     root.child(composer).child(
         row()
             .w_full()
@@ -1109,17 +2444,67 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             } else {
                 el()
             })
-            .child(button("Retry save", "save", State::save)),
+            .child(if s.journal.is_some() && !s.archive_only {
+                button(
+                    if s.replay.is_some() {
+                        "Back to live"
+                    } else {
+                        "Replay"
+                    },
+                    "replay",
+                    State::toggle_replay,
+                )
+            } else {
+                el()
+            })
+            .child(
+                if s.replay.is_none()
+                    && s.journal.as_ref().is_some_and(|j| {
+                        j.projection.audio.iter().any(|a| {
+                            !j.projection
+                                .transcripts
+                                .iter()
+                                .any(|(id, _, _)| id == &a.id)
+                        })
+                    })
+                {
+                    button(
+                        "Retry transcript",
+                        "retry-transcript",
+                        State::retry_transcript,
+                    )
+                } else {
+                    el()
+                },
+            )
+            .child(if s.replay.is_none() {
+                button("Retry save", "save", State::save)
+            } else {
+                el()
+            }),
     )
 }
 fn inspector(s: &State) -> El {
     let mut panel = col()
+        .key("inspector")
+        .on_scroll_offset({
+            let offset = s.inspector_scroll.clone();
+            move |p| {
+                offset.set(p.offset);
+            }
+        })
         .w(230.0)
         .h_full()
         .gap(16.0)
         .child(label("IN THE MARGIN", 10.0, MUTED))
         .child(label("Follow the thought.", 22.0, INK));
-    if let Some(t) = s.session.thoughts.iter().find(|t| Some(t.id) == s.selected) {
+    if let Some(t) = s
+        .projection
+        .session
+        .thoughts
+        .iter()
+        .find(|t| Some(t.id) == s.selected)
+    {
         panel = panel
             .child(label(
                 format!("ORIGINAL WORDS · {:02}", t.id),
@@ -1131,9 +2516,17 @@ fn inspector(s: &State) -> El {
                     .wrap_anywhere()
                     .selectable(true),
             )
-            .child(label(s.session.placement(t), 12.0, MUTED))
-            .child(button("Move to next branch", "move", State::move_selected))
-            .child(button("Remove thought", "remove", State::remove_selected));
+            .child(label(s.projection.session.placement(t), 12.0, MUTED))
+            .child(if s.read_only {
+                el()
+            } else {
+                button("Move to next branch", "move", State::move_selected)
+            })
+            .child(if s.read_only {
+                el()
+            } else {
+                button("Remove thought", "remove", State::remove_selected)
+            });
     } else {
         panel = panel.child(label(
             "Select a thought to inspect its original words or change where it belongs.",
@@ -1142,6 +2535,7 @@ fn inspector(s: &State) -> El {
         ));
     }
     let selected_theme = s
+        .projection
         .session
         .thoughts
         .iter()
@@ -1159,7 +2553,7 @@ fn inspector(s: &State) -> El {
                 .size(230.0, 230.0),
         );
     }
-    if let Some(i) = &s.session.interpretation {
+    if let Some(i) = &s.projection.session.interpretation {
         panel = panel.child(label("POSSIBLE CONNECTIONS", 10.0, MUTED));
         for relation in &i.relationships {
             let from = relation.from;
@@ -1191,7 +2585,7 @@ fn inspector(s: &State) -> El {
             MUTED,
         ))
         .child(label(
-            if s.session.categories.is_empty() {
+            if s.projection.session.categories.is_empty() {
                 "Local rules suggest a starting point. You have the final say."
             } else {
                 "Themes are suggestions. Move a thought to pin its place."
@@ -1205,11 +2599,21 @@ fn inspector(s: &State) -> El {
 }
 fn compact_inspector(s: &State) -> El {
     let mut r = row().gap(10.0).center_y();
-    if let Some(t) = s.session.thoughts.iter().find(|t| Some(t.id) == s.selected) {
+    if let Some(t) = s
+        .projection
+        .session
+        .thoughts
+        .iter()
+        .find(|t| Some(t.id) == s.selected)
+    {
         r = r
             .child(
                 label(
-                    format!("Selected {:02} · {}", t.id, s.session.placement(t)),
+                    format!(
+                        "Selected {:02} · {}",
+                        t.id,
+                        s.projection.session.placement(t)
+                    ),
                     11.0,
                     MUTED,
                 )
@@ -1224,7 +2628,13 @@ fn compact_inspector(s: &State) -> El {
             MUTED,
         ));
     }
-    if let Some(t) = s.session.thoughts.iter().find(|t| Some(t.id) == s.selected) {
+    if let Some(t) = s
+        .projection
+        .session
+        .thoughts
+        .iter()
+        .find(|t| Some(t.id) == s.selected)
+    {
         col().gap(6.0).child(r).child(
             label(t.text.clone(), 13.0, INK)
                 .wrap_anywhere()
@@ -1245,6 +2655,13 @@ pub fn on_key(s: &mut State, event: &KeyEvent, _: &mut Tx) -> bool {
             true
         }
         Key::Escape => {
+            if s.sessions_open {
+                s.sessions_open = false;
+                return true;
+            }
+            if s.replay.is_some() {
+                return true;
+            }
             if s.voice_state == VoiceState::Recording {
                 s.voice_command(VoiceCommand::Cancel);
             }
@@ -1256,11 +2673,40 @@ pub fn on_key(s: &mut State, event: &KeyEvent, _: &mut Tx) -> bool {
 }
 
 pub fn setup(s: &mut State, wake: rune::Waker) {
+    s.wake = Some(wake.clone());
+    s.image_cache = rune::ImageCache::new(wake.clone());
+    if s.replay.is_some() {
+        s.replay_images.clear();
+        if let Err(error) = s.prepare_replay() {
+            s.status = format!("Cannot replay exactly: {error}");
+            s.replay = None;
+            s.read_only = true;
+            return;
+        }
+    }
+    if let Some(j) = &s.journal {
+        let at = s.replay.as_ref().map_or(j.now_ms(), |r| r.at_ms);
+        let scene = if s.replay.is_some() {
+            j.replay_scene_at(at).expect("validated presentation")
+        } else {
+            j.scene_at(at)
+        };
+        s.restore_scene(scene, at as f64 / 1000.0);
+    }
+    if s.replay.is_none() {
+        s.refresh_sessions();
+    }
     if s.read_only || rune::is_headless() {
         return;
     }
+    s.recover_transcripts();
     let voice_wake = wake.clone();
-    s.voice_worker = Some(voice::Worker::start(move || voice_wake()));
+    let audio_root = s
+        .journal
+        .as_ref()
+        .map(|j| j.root.join("recordings"))
+        .unwrap_or_else(|| tacit::timeline::root_for(&storage::default_path()).join("recordings"));
+    s.voice_worker = Some(voice::Worker::start(audio_root, move || voice_wake()));
     s.voice_command(VoiceCommand::Check);
     let backend = std::env::var("TACIT_ORGANIZER").unwrap_or_default();
     if backend == "offline" {
@@ -1283,6 +2729,10 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
                 s.gallery.status = "Art · ready to illustrate themes".into();
             }
             let recording_wake = wake.clone();
+            let direction_wake = wake.clone();
+            s.director = Some(tacit::direction::Worker::start(config.clone(), move || {
+                direction_wake()
+            }));
             s.recording_worker = Some(tacit::recording::Worker::start(config.clone(), move || {
                 recording_wake()
             }));
@@ -1304,9 +2754,146 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
         s.worker = Some(tacit::organizer::Worker::start(model, move || wake()));
     }
 }
-pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
-    let art_deadline = s.art.update(&s.session, now);
-    let image_changed = s.gallery.update(&s.session, s.art_style, s.busy, now, tx);
+pub fn poll(s: &mut State, frame_now: f64, tx: &mut Tx) -> bool {
+    let mut export_changed = false;
+    if let Some(receiver) = &s.video_export {
+        match receiver.try_recv() {
+            Ok(result) => {
+                s.status = result.map_or_else(
+                    |e| format!("Video export failed: {e}"),
+                    |p| format!("Original video saved: {}", p.display()),
+                );
+                s.video_export = None;
+                export_changed = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                s.status = "Video export stopped unexpectedly".into();
+                s.video_export = None;
+                export_changed = true;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                tx.wake_after(std::time::Duration::from_millis(100))
+            }
+        }
+    }
+    if s.replay.is_some() {
+        let replay = s.replay.as_mut().unwrap();
+        if replay.playing {
+            if let Some((start, at_ms)) = replay.last_tick {
+                replay.at_ms = at_ms.saturating_add(((frame_now - start).max(0.0) * 1000.0) as u64);
+            } else {
+                replay.last_tick = Some((frame_now, replay.at_ms));
+            }
+            if let (Some((id, player)), Some(journal)) = (&s.replay_audio, &s.journal)
+                && let Some(audio) = journal.projection.audio.iter().find(|a| &a.id == id)
+                && replay.at_ms >= audio.start_ms
+                && replay.at_ms < audio.start_ms + audio.duration_ms
+            {
+                match player.state() {
+                    rune::PlayerState::Playing => {
+                        replay.at_ms = audio.start_ms + (player.time() * 1000.0).round() as u64;
+                        replay.last_tick = Some((frame_now, replay.at_ms));
+                    }
+                    rune::PlayerState::Loading => {
+                        replay.at_ms = replay
+                            .last_projected
+                            .unwrap_or(audio.start_ms)
+                            .max(audio.start_ms);
+                        replay.last_tick = Some((frame_now, replay.at_ms));
+                    }
+                    rune::PlayerState::Failed(error) => {
+                        replay.playing = false;
+                        s.status = format!("Replay stopped: audio unavailable: {error}");
+                    }
+                    _ => {}
+                }
+            }
+            let end = s.journal.as_ref().map_or(0, |j| j.duration());
+            if replay.at_ms >= end {
+                replay.at_ms = end;
+                replay.playing = false;
+            }
+            tx.wake_after(std::time::Duration::from_millis(16));
+        }
+        if !replay.playing {
+            replay.last_tick = None;
+        }
+        let (at, playing) = (replay.at_ms, replay.playing);
+        let changed = replay.last_projected != Some(at);
+        replay.last_projected = Some(at);
+        let scene = if changed {
+            s.journal
+                .as_ref()
+                .map(|j| j.replay_scene_at(at).expect("validated presentation"))
+        } else {
+            None
+        };
+        if let Some(scene) = scene {
+            let scroll = scene.map_scroll;
+            let story_scroll = scene.story_scroll;
+            let inspector_scroll = scene.inspector_scroll;
+            s.restore_scene(scene, at as f64 / 1000.0);
+            tx.scroll_to_instant("map", scroll[0], scroll[1]);
+            tx.scroll_to_instant("story", story_scroll[0], story_scroll[1]);
+            tx.scroll_to_instant("inspector", inspector_scroll[0], inspector_scroll[1]);
+        }
+        let audio = s
+            .journal
+            .as_ref()
+            .and_then(|j| {
+                j.projection.audio.iter().find(|a| {
+                    at.saturating_add(1000) >= a.start_ms && at < a.start_ms + a.duration_ms
+                })
+            })
+            .cloned();
+        if let Some(audio) = audio {
+            if s.replay_audio
+                .as_ref()
+                .is_none_or(|(id, _)| id != &audio.id)
+            {
+                if let Some((_, p)) = s.replay_audio.take() {
+                    p.pause();
+                }
+                if let Some(path) = s.journal.as_ref().and_then(|j| j.asset(&audio.asset).ok()) {
+                    let player = rune::Player::audio(path);
+                    player.seek(at.saturating_sub(audio.start_ms) as f64 / 1000.0);
+                    s.replay_audio = Some((audio.id, player));
+                }
+            }
+            if let Some((_, p)) = &s.replay_audio {
+                if let rune::PlayerState::Failed(error) = p.state() {
+                    s.status = format!("Replay audio unavailable: {error}");
+                }
+                let desired = at.saturating_sub(audio.start_ms) as f64 / 1000.0;
+                if (p.time() - desired).abs() > 0.15 {
+                    p.seek(desired);
+                }
+                if playing && at >= audio.start_ms {
+                    if !p.is_playing() {
+                        p.play();
+                    }
+                } else {
+                    p.pause();
+                }
+            }
+        } else if let Some((_, p)) = s.replay_audio.take() {
+            p.pause();
+        }
+        return changed || playing || export_changed;
+    }
+    let now = s
+        .journal
+        .as_ref()
+        .map_or(frame_now, |j| j.now_ms() as f64 / 1000.0);
+    let changed = poll_live(s, now, tx);
+    s.record_presentation("scene changed");
+    changed || export_changed
+}
+fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
+    let art_deadline = s.art.update(&s.projection.session, now);
+    let image_changed = s
+        .gallery
+        .update(&s.projection.session, s.art_style, s.busy, now, tx);
     let mut changed = image_changed || s.art_active || art_deadline.is_some();
     s.art_active = art_deadline.is_some();
     if s.art_style != Style::Off
@@ -1353,7 +2940,11 @@ pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         s.receive_recording(response);
         changed = true;
     }
-    if !s.pending_recordings.is_empty() {
+    while let Some(response) = s.director.as_ref().and_then(|w| w.receive.try_recv().ok()) {
+        s.receive_direction(response, now);
+        changed = true;
+    }
+    if s.directing {
         return changed;
     }
     if s.worker.is_none() {
@@ -1372,7 +2963,12 @@ pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     while let Some(response) = s.reviewer.as_ref().and_then(|w| w.receive.try_recv().ok()) {
         if response.revision == s.revision {
             s.busy = false;
-            match response.result.and_then(|i| i.apply(&mut s.session)) {
+            match response.result.and_then(|interpretation| {
+                s.dispatch_session(SessionEvent::Organized {
+                    interpretation,
+                    pass: "review".into(),
+                })
+            }) {
                 Ok(()) => {
                     s.review_applied = Some(s.revision);
                     s.organizer_status = "✦ Whole map refined · your words preserved".into();
@@ -1389,7 +2985,12 @@ pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         if response.revision == s.revision && s.review_applied != Some(s.revision) {
             s.fast_finished = Some(s.revision);
             s.busy = false;
-            match response.result.and_then(|i| i.apply(&mut s.session)) {
+            match response.result.and_then(|interpretation| {
+                s.dispatch_session(SessionEvent::Organized {
+                    interpretation,
+                    pass: "fast".into(),
+                })
+            }) {
                 Ok(()) => {
                     s.organizer_status = if s.reviewer.is_some() {
                         "Quick themes ready · review follows after a pause"
@@ -1412,11 +3013,11 @@ pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         s.review_due = now + 3.0;
         s.busy = false;
     }
-    if s.requested != Some(s.revision) && !s.session.thoughts.is_empty() {
+    if s.requested != Some(s.revision) && !s.projection.session.thoughts.is_empty() {
         if now >= s.due {
             let request = tacit::organizer::Request {
                 revision: s.revision,
-                session: s.session.clone(),
+                session: s.projection.session.clone(),
             };
             if s.worker.as_ref().unwrap().send.send(request).is_ok() {
                 s.organizer_status = "Finding a home for your thoughts…".into();
@@ -1431,14 +3032,15 @@ pub fn poll(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     if let Some(reviewer) = &s.reviewer
+        && s.pending_recordings.is_empty()
         && s.review_requested != Some(s.revision)
         && s.fast_finished == Some(s.revision)
-        && !s.session.thoughts.is_empty()
+        && !s.projection.session.thoughts.is_empty()
     {
         if now >= s.review_due {
             let request = tacit::organizer::Request {
                 revision: s.revision,
-                session: s.session.clone(),
+                session: s.projection.session.clone(),
             };
             if reviewer.send.send(request).is_ok() {
                 s.organizer_status = "✦ Stepping back · refining the whole map…".into();
@@ -1485,6 +3087,231 @@ mod tests {
         rt.frame(1.0);
     }
     #[test]
+    fn direction_speech_never_becomes_a_thought_and_keeps_the_brainstorm_draft() {
+        let mut s = State::empty();
+        s.direction_mode = true;
+        s.draft = TextEdit::new("An unfinished idea");
+        s.receive_voice(VoiceEvent::Transcript("Put decisions first".into()), 1.0);
+        assert!(s.projection.session.thoughts.is_empty());
+        assert_eq!(s.draft.text, "An unfinished idea");
+        assert_eq!(s.direction_draft.text, "Put decisions first");
+        assert!(!s.directing); // No provider: retain instruction, never fall back to capture.
+        s.voice_state = VoiceState::Recording;
+        s.toggle_direction();
+        assert!(s.direction_mode);
+    }
+    #[test]
+    fn recorded_direction_intent_survives_mode_changes_and_is_not_transcript_linked() {
+        let mut s = State::empty();
+        s.projection.audio.push(tacit::timeline::Audio {
+            id: "instruction".into(),
+            asset: "audio.wav".into(),
+            start_ms: 0,
+            duration_ms: 1000,
+            sample_rate: 16000,
+            samples: 16000,
+        });
+        s.projection
+            .apply(&tacit::timeline::Event::RecordingDirected {
+                id: "instruction".into(),
+            })
+            .unwrap();
+        s.direction_mode = false;
+        s.receive_voice(
+            VoiceEvent::TimedTranscript {
+                id: "instruction".into(),
+                text: "Rename the map".into(),
+                cues: vec![tacit::timeline::Cue {
+                    start_ms: 0,
+                    end_ms: 1000,
+                    text: "Rename the map".into(),
+                }],
+            },
+            1.0,
+        );
+        assert!(s.projection.session.thoughts.is_empty());
+        assert!(s.projection.transcript_links.is_empty());
+        assert_eq!(s.projection.transcripts.len(), 1);
+        assert!(s.direction_mode);
+        assert_eq!(s.direction_draft.text, "Rename the map");
+    }
+    #[test]
+    fn directions_are_replayable_undoable_and_stale_plans_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = State::open_session(dir.path().join("session.json")).unwrap();
+        s.draft = TextEdit::new("A real idea");
+        s.capture();
+        let before = s.projection.session.clone();
+        let fingerprint = tacit::timeline::content_hash(&before).unwrap();
+        let response = || tacit::direction::Response {
+            fingerprint: fingerprint.clone(),
+            instruction: "Call this map Research".into(),
+            result: Ok(tacit::direction::Plan {
+                explanation: "Renamed the central theme to Research".into(),
+                edits: vec![tacit::direction::Edit::SetTitle {
+                    title: "Research".into(),
+                }],
+            }),
+        };
+        s.receive_direction(response(), 2.0);
+        assert_eq!(s.projection.session.title, "Research");
+        assert_eq!(s.projection.session.thoughts, before.thoughts);
+        let j = s.journal.as_ref().unwrap();
+        assert_eq!(j.at(j.duration()).unwrap().session, s.projection.session);
+        let changed = s.projection.session.clone();
+        s.receive_direction(response(), 3.0);
+        assert_eq!(s.projection.session, changed);
+        assert!(s.direction_status.contains("map changed"));
+        s.undo();
+        assert_eq!(s.projection.session, before);
+    }
+    #[test]
+    fn switching_sessions_preserves_drafts_and_keeps_histories_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("session.json");
+        let other = tacit::sessions::create(&base, "Second").unwrap();
+        let mut state = State::open_session(base.clone()).unwrap();
+        state.library_base = Some(base.clone());
+        state.draft = TextEdit::new("First thought");
+        state.capture();
+        state.draft = TextEdit::new("Unfinished draft");
+        state.switch_session(other.path.clone());
+        assert_eq!(state.path.as_ref(), Some(&other.path));
+        assert!(state.projection.session.thoughts.is_empty());
+        assert!(state.history.is_empty());
+        state.draft = TextEdit::new("Second thought");
+        state.capture();
+        state.switch_session(base.clone());
+        assert_eq!(state.draft.text, "Unfinished draft");
+        assert_eq!(state.projection.session.thoughts.len(), 1);
+        assert_eq!(state.projection.session.thoughts[0].text, "First thought");
+        state.voice_state = VoiceState::Recording;
+        state.switch_session(other.path.clone());
+        assert_eq!(state.path.as_ref(), Some(&base));
+        state.voice_state = VoiceState::Ready;
+        let _lock = storage::lock(&other.path).unwrap();
+        state.switch_session(other.path);
+        assert_eq!(state.path.as_ref(), Some(&base));
+        assert_eq!(state.draft.text, "Unfinished draft");
+    }
+    #[test]
+    fn failed_journal_write_never_publishes_a_live_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let journal = tacit::timeline::Journal::open(&path, Session::default()).unwrap();
+        drop(journal);
+        let mut state = State::empty();
+        // The OS rejects writes to this read-only file, exercising the real commit boundary.
+        state.journal = Some(tacit::timeline::Journal::read(&path).unwrap());
+        state.draft = TextEdit::new("Keep this draft if saving fails");
+        let before = state.projection.clone();
+        state.capture();
+        assert_eq!(state.projection, before);
+        assert_eq!(state.draft.text, "Keep this draft if saving fails");
+        assert!(state.read_only);
+        assert_eq!(
+            tacit::timeline::Journal::read(&path).unwrap().projection,
+            before
+        );
+    }
+    #[test]
+    fn live_capture_and_correction_render_the_committed_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::empty();
+        state.journal = Some(
+            tacit::timeline::Journal::open(&dir.path().join("session.json"), Session::default())
+                .unwrap(),
+        );
+        state.draft = TextEdit::new("An idea");
+        state.capture();
+        state.move_selected();
+        let journal = state.journal.as_ref().unwrap();
+        assert_eq!(state.projection, journal.projection);
+        assert_eq!(journal.at(journal.duration()).unwrap(), state.projection);
+        assert!(journal.entries.iter().any(|e| matches!(
+            &e.event,
+            tacit::timeline::Event::SessionChanged {
+                change: SessionEvent::Captured { .. }
+            }
+        )));
+        assert!(
+            !journal
+                .entries
+                .iter()
+                .any(|e| matches!(&e.event, tacit::timeline::Event::Scene { .. }))
+        );
+    }
+    #[test]
+    fn regenerated_art_with_the_same_prompt_retains_each_actual_image() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::empty();
+        state.journal = Some(
+            tacit::timeline::Journal::open(&dir.path().join("session.json"), Session::default())
+                .unwrap(),
+        );
+        let mut assets = Vec::new();
+        for encoded in [
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg==",
+        ] {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
+            let image = state.image_cache.load(bytes.clone());
+            image.wait().unwrap();
+            state.gallery.layers = vec![generated_art::Layer {
+                key: "theme-one".into(),
+                fingerprint: "same-prompt".into(),
+                slot: 0,
+                image,
+                encoded: Some(bytes.clone()),
+                born: 0.0,
+                retired: None,
+            }];
+            state.record_presentation("art arrived");
+            assert!(!state.read_only);
+            let j = state.journal.as_ref().unwrap();
+            let asset = j.projection.scene().artwork[0].asset.clone();
+            assert_eq!(std::fs::read(j.asset(&asset).unwrap()).unwrap(), bytes);
+            assets.push(asset);
+        }
+        assert_ne!(assets[0], assets[1]);
+        state.journal.as_ref().unwrap().validate_assets().unwrap();
+    }
+    #[test]
+    fn replay_uses_saved_projection_and_cannot_edit_live_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = runtime((1280.0, 860.0));
+        rt.state.journal = Some(
+            tacit::timeline::Journal::open(
+                &dir.path().join("session.json"),
+                rt.state.projection.session.clone(),
+            )
+            .unwrap(),
+        );
+        rt.state.draft = TextEdit::new("A saved idea");
+        rt.state.capture();
+        rt.state.art_style = Style::Marker;
+        rt.state.record_presentation("style");
+        let expected = rt.state.projection.session.clone();
+        rt.state.toggle_replay();
+        let count = rt.state.journal.as_ref().unwrap().entries.len();
+        rt.state.seek_replay(i64::MAX);
+        rt.frame(0.0);
+        assert_eq!(rt.state.projection.session, expected);
+        assert_eq!(rt.state.art_style, Style::Marker);
+        rt.state.undo();
+        rt.state.draft = TextEdit::new("must not be saved");
+        rt.state.capture();
+        rt.frame(0.1);
+        assert_eq!(rt.state.projection.session, expected);
+        assert_eq!(rt.state.journal.as_ref().unwrap().entries.len(), count);
+        rt.state.toggle_replay();
+        assert!(!rt.state.read_only);
+        assert_eq!(rt.state.projection.session, expected);
+    }
+    #[test]
     fn typing_previews_then_enter_captures_without_losing_original_words() {
         let mut rt = runtime((1280.0, 860.0));
         click(&mut rt, "thought-input");
@@ -1493,30 +3320,33 @@ mod tests {
             mods: Mods::default(),
         });
         rt.frame(0.0);
-        assert_eq!(rt.state.session.thoughts.len(), 6);
+        assert_eq!(rt.state.projection.session.thoughts.len(), 6);
         assert!(rt.find("draft-preview").is_some());
         rt.key(KeyEvent {
             key: Key::Enter,
             mods: Mods::default(),
         });
         rt.frame(1.0);
-        assert_eq!(rt.state.session.thoughts.len(), 7);
-        assert_eq!(rt.state.session.thoughts[6].role, Role::Possibility);
+        assert_eq!(rt.state.projection.session.thoughts.len(), 7);
+        assert_eq!(
+            rt.state.projection.session.thoughts[6].role,
+            Role::Possibility
+        );
         assert!(rt.state.draft.text.is_empty());
         click(&mut rt, "undo");
-        assert_eq!(rt.state.session.thoughts.len(), 6);
+        assert_eq!(rt.state.projection.session.thoughts.len(), 6);
     }
     #[test]
     fn selection_correction_delete_and_undo_work_at_minimum_size() {
         let mut rt = runtime((820.0, 640.0));
         click(&mut rt, "thought-1");
         click(&mut rt, "move");
-        assert_eq!(rt.state.session.thoughts[0].role, Role::Question);
-        assert!(rt.state.session.thoughts[0].pinned);
+        assert_eq!(rt.state.projection.session.thoughts[0].role, Role::Question);
+        assert!(rt.state.projection.session.thoughts[0].pinned);
         click(&mut rt, "remove");
-        assert_eq!(rt.state.session.thoughts.len(), 5);
+        assert_eq!(rt.state.projection.session.thoughts.len(), 5);
         click(&mut rt, "undo");
-        assert_eq!(rt.state.session.thoughts.len(), 6);
+        assert_eq!(rt.state.projection.session.thoughts.len(), 6);
         click(&mut rt, "toggle-story");
         assert!(rt.find("story").is_some());
     }
@@ -1533,7 +3363,7 @@ mod tests {
         state.revision = 2;
         state.observed = 2;
         state.requested = Some(2);
-        let before = state.session.clone();
+        let before = state.projection.session.clone();
         let proposal = tacit::model::Interpretation {
             categories: vec![],
             title: "Outdated title".into(),
@@ -1556,7 +3386,7 @@ mod tests {
             })
             .unwrap();
         assert!(!poll(&mut state, 1.0, &mut Tx::default()));
-        assert_eq!(state.session, before);
+        assert_eq!(state.projection.session, before);
         response_tx
             .send(tacit::organizer::Response {
                 revision: 2,
@@ -1564,7 +3394,7 @@ mod tests {
             })
             .unwrap();
         assert!(poll(&mut state, 2.0, &mut Tx::default()));
-        assert_eq!(state.session, before);
+        assert_eq!(state.projection.session, before);
         assert!(state.organizer_status.contains("test timeout"));
     }
     #[test]
@@ -1601,7 +3431,7 @@ mod tests {
         poll(&mut s, 3.1, &mut tx);
         assert_eq!(review_requests.try_recv().unwrap().revision, 1);
         s.revision = 2;
-        let before = s.session.clone();
+        let before = s.projection.session.clone();
         review_response
             .send(tacit::organizer::Response {
                 revision: 1,
@@ -1609,7 +3439,7 @@ mod tests {
             })
             .unwrap();
         poll(&mut s, 3.2, &mut tx);
-        assert_eq!(s.session, before);
+        assert_eq!(s.projection.session, before);
         assert!(!s.organizer_status.contains("stale review"));
         poll(&mut s, 3.4, &mut tx);
         assert_eq!(fast_requests.try_recv().unwrap().revision, 2);
@@ -1617,7 +3447,7 @@ mod tests {
     #[test]
     fn background_art_style_cycles_without_changing_the_map() {
         let mut rt = runtime((820.0, 640.0));
-        let before = rt.state.session.clone();
+        let before = rt.state.projection.session.clone();
         let ids = rt
             .state
             .art
@@ -1628,7 +3458,7 @@ mod tests {
         for expected in [Style::Chalk, Style::Marker, Style::Off, Style::Pastel] {
             click(&mut rt, "art-style");
             assert!(rt.state.art_style == expected);
-            assert_eq!(rt.state.session, before);
+            assert_eq!(rt.state.projection.session, before);
         }
         rt.state.draft = TextEdit::new("Draft text does not trigger background redraws");
         rt.frame(10.0);
@@ -1652,7 +3482,7 @@ mod tests {
         );
         let id = state.selected.unwrap();
         state.pending_recordings.insert(id);
-        state.session.add("A later typed thought");
+        state.projection.session.add("A later typed thought");
         state.receive_recording(tacit::recording::Response {
             id,
             text: "Meetings help. Budgets hurt.".into(),
@@ -1660,6 +3490,7 @@ mod tests {
         });
         assert_eq!(
             state
+                .projection
                 .session
                 .thoughts
                 .iter()
@@ -1667,21 +3498,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Meetings help.", "Budgets hurt.", "A later typed thought"]
         );
-        state.session.validate().unwrap();
+        state.projection.session.validate().unwrap();
         state.undo();
         assert_eq!(
-            state.session.thoughts[0].text,
+            state.projection.session.thoughts[0].text,
             "Meetings help. Budgets hurt."
         );
         state.pending_recordings.insert(id);
         state.undo();
-        let before = state.session.clone();
+        let before = state.projection.session.clone();
         state.receive_recording(tacit::recording::Response {
             id,
             text: "Meetings help. Budgets hurt.".into(),
             result: Ok(vec!["Meetings help. ".into(), "Budgets hurt.".into()]),
         });
-        assert_eq!(state.session, before);
+        assert_eq!(state.projection.session, before);
     }
     #[test]
     fn invalid_split_or_removed_recording_never_loses_words() {
@@ -1694,7 +3525,10 @@ mod tests {
             text: "Full original words".into(),
             result: Ok(vec!["Made up text".into()]),
         });
-        assert_eq!(state.session.thoughts[0].text, "Full original words");
+        assert_eq!(
+            state.projection.session.thoughts[0].text,
+            "Full original words"
+        );
         state.pending_recordings.insert(id);
         state.remove_selected();
         state.receive_recording(tacit::recording::Response {
@@ -1702,19 +3536,25 @@ mod tests {
             text: "Full original words".into(),
             result: Ok(vec!["Full original words".into()]),
         });
-        assert!(state.session.thoughts.is_empty());
+        assert!(state.projection.session.thoughts.is_empty());
     }
     #[test]
     fn voice_result_preserves_typed_draft_and_saves_recording() {
         let mut state = State::demo();
         state.draft = TextEdit::new("My typed thought.");
-        let before = state.session.clone();
+        let before = state.projection.session.clone();
         state.receive_voice(VoiceEvent::Transcript("My spoken thought.".into()), 0.0);
         assert_eq!(state.draft.text, "My typed thought.");
-        assert_eq!(state.session.thoughts.len(), before.thoughts.len() + 1);
+        assert_eq!(
+            state.projection.session.thoughts.len(),
+            before.thoughts.len() + 1
+        );
         assert_eq!(state.voice_state, VoiceState::Ready);
         state.capture();
-        assert_eq!(state.session.thoughts.len(), before.thoughts.len() + 2);
+        assert_eq!(
+            state.projection.session.thoughts.len(),
+            before.thoughts.len() + 2
+        );
     }
     #[test]
     fn voice_controls_record_stop_and_cancel_without_duplicate_commands() {
@@ -1747,6 +3587,7 @@ mod tests {
         assert_eq!(rt.state.draft.text, "");
         assert!(
             rt.state
+                .projection
                 .session
                 .thoughts
                 .iter()

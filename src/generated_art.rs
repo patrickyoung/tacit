@@ -144,6 +144,7 @@ pub async fn generate(config: &CloudConfig, model: &str, brief: &Brief) -> Resul
     Ok(bytes)
 }
 pub struct Response {
+    pub encoded: Option<Vec<u8>>,
     pub brief: Brief,
     pub result: Result<Image, String>,
 }
@@ -170,10 +171,12 @@ impl Worker {
                     }
                     let brief = batch.remove(0);
                     let path = cache_dir().join(format!("{}.png", brief.fingerprint));
+                    let mut encoded = None;
                     let result = (|| -> Result<Image, String> {
                         if let Some(bytes) = read_cache(&path) {
-                            let image = cache.load(bytes);
+                            let image = cache.load(bytes.clone());
                             if image.wait().is_ok() {
+                                encoded = Some(bytes);
                                 return Ok(image);
                             }
                             let _ = std::fs::remove_file(&path);
@@ -187,9 +190,17 @@ impl Worker {
                             .wait()
                             .map_err(|_| "Generated image could not be decoded")?;
                         write_cache(&path, &bytes)?;
+                        encoded = Some(bytes);
                         Ok(image)
                     })();
-                    if responses.send(Response { brief, result }).is_err() {
+                    if responses
+                        .send(Response {
+                            brief,
+                            result,
+                            encoded,
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                     wake();
@@ -200,6 +211,7 @@ impl Worker {
     }
 }
 pub struct Layer {
+    pub encoded: Option<Vec<u8>>,
     pub key: String,
     pub fingerprint: String,
     pub slot: usize,
@@ -307,6 +319,7 @@ impl Gallery {
                             }
                         }
                         self.layers.push(Layer {
+                            encoded: response.encoded,
                             key: plan.key.clone(),
                             fingerprint: plan.fingerprint.clone(),
                             slot: plan.slot,
@@ -424,9 +437,10 @@ impl Gallery {
         for brief in briefs(session, Style::Pastel, &self.model) {
             if let Some(bytes) = read_cache(&cache_dir().join(format!("{}.png", brief.fingerprint)))
             {
-                let image = cache.load(bytes);
+                let image = cache.load(bytes.clone());
                 if image.wait().is_ok() {
                     self.layers.push(Layer {
+                        encoded: Some(bytes),
                         key: brief.key,
                         fingerprint: brief.fingerprint,
                         slot: brief.slot,
@@ -507,6 +521,7 @@ mod tests {
         let old = g.plans[0].clone();
         responses
             .send(Response {
+                encoded: None,
                 brief: old.clone(),
                 result: Ok(image.clone()),
             })
@@ -518,6 +533,7 @@ mod tests {
         assert!(g.layers[0].retired.is_none());
         responses
             .send(Response {
+                encoded: None,
                 brief: old,
                 result: Err("stale failure".into()),
             })
@@ -526,6 +542,7 @@ mod tests {
         assert!(!g.status.contains("stale failure"));
         responses
             .send(Response {
+                encoded: None,
                 brief: g.plans[0].clone(),
                 result: Ok(image),
             })

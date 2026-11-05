@@ -30,7 +30,7 @@ Generation uses your existing OpenRouter key and credits. The cache is keyed by 
 
 Set `TACIT_IMAGE_ART=off` to disable cloud image generation while keeping local artwork. `TACIT_IMAGE_MODEL` overrides the default; the selected model must support the Images API, transparent PNG output, medium quality and square aspect ratio. **Art · off** also stops queued work. A request already running may finish into the cache, but obsolete results cannot replace current art. Failed images preserve existing artwork; **Retry art** retries without changing your thoughts. No automatic retry loop runs.
 
-The visual vocabulary is no longer limited to the twelve fallback icons: generated scenes can combine concepts from the thoughts. Raster artwork reveals as a soft wash; the fallback vectors retain their stroke-by-stroke animation. Style selection is currently per app session.
+The visual vocabulary is no longer limited to the twelve fallback icons: generated scenes can combine concepts from the thoughts. Raster artwork reveals as a soft wash; the fallback vectors retain their stroke-by-stroke animation. Style selection is saved with the presentation track.
 
 To verify the complete image-generation path with one fictional demo theme (a paid request unless cached):
 
@@ -43,25 +43,75 @@ Normal headless snapshots never contact the network; the generated demo scene lo
 
 ## Voice with Hex
 
-Open your installed Hex desktop app with its microphone permission granted and a model ready. Tacit connects automatically on launch; no microphone is opened until you click **Listen**.
+Open Hex with a local model loaded and timed transcription streams enabled. Tacit records **one microphone** through Rune into a 16 kHz mono PCM WAV, then sends those exact samples to Hex locally. Recording currently requires macOS because Rune's native recorder backend is macOS-only. Hex's stream endpoint is cross-platform; a native recorder backend is still needed for other platforms.
 
-1. Click **Listen** and speak. The red recording indicator and elapsed timer stay visible.
-2. Click **Stop & transcribe**. Hex returns the raw transcript directly to Tacit without changing the clipboard or pasting elsewhere.
-3. The transcript is saved immediately. With OpenRouter configured, Tacit separates it into coherent thoughts, then categorizes them using the surrounding discussion. Your typed draft stays untouched.
+1. Click **Listen**. macOS may ask for microphone permission for Tacit or its launching terminal. The recording indicator and timer stay visible.
+2. Click **Stop & transcribe**. The WAV is retained before transcription starts. Hex supplies audio-window segment timestamps; Tacit exports them as WebVTT without inventing word timings.
+3. In Brainstorm mode, the complete transcript becomes a thought, then the stronger OpenRouter review model splits it into coherent ideas and categorizes them using discussion context. Your typed draft stays untouched. **Undo** can restore the unsplit thought; it does not erase historical audio or events.
 
-Splitting follows ideas and topic changes, keeping explanations and dependent references together. The model selects boundaries in the original words; it cannot rewrite, omit or reorder them. The fast classifier receives the discussion context, and the stronger review reconciles the whole map afterward. **Undo** can restore the unsplit recording; undoing while a split is pending cancels its application. If splitting fails or OpenRouter is unavailable, the full transcript remains on the map. Transcription stays local in Hex; semantic splitting and classification send text to OpenRouter. Splitting happens after Stop, not while the microphone is recording.
+**Cancel** or **Escape** discards an active recording. Once stopped, recordings remain part of the session archive, including when transcription fails. **Retry transcript** retries a retained recording without using the microphone. **Reconnect Hex** checks that the local transcription endpoint is available. This integration does not use Hex's dictation audio mirror because that mirror may drop chunks; the WAV owned by Tacit is the authoritative audio.
 
-**Cancel** or **Escape** while recording discards that recording and preserves your draft. While Hex is transcribing, Tacit remains usable. A capture is owned by Tacit; it refuses to start while Hex is recording elsewhere. Authentication and ownership tokens stay in memory and are never written into the notebook or logs. The background worker sends lease heartbeats and attempts to cancel an unfinished capture on shutdown; Hex expires abandoned recordings after ten seconds without renewal.
-
-Use **Reconnect Hex** after starting/restarting Hex or resolving an error. A read-only diagnostic is available:
+Transcription stays local in Hex. Semantic splitting, classification, and illustration still use OpenRouter when configured. Headless snapshots never open a microphone or automatically call either service. Diagnostic commands:
 
 ```sh
 cargo run -- --check-hex
-# Optional live check with a fictional multi-topic transcript (uses OpenRouter):
-cargo run -- --check-recording
+cargo run -- --check-audio /path/to/16000hz-mono-pcm16.wav
+cargo run -- --check-recording # fictional semantic splitting example; uses OpenRouter
 ```
 
-This first integration uses Hex's desktop capture API (macOS and Linux), which returns the transcript after Stop. It does **not** stream partial words yet. Windows desktop capture is currently unsupported by Hex and is reported as unavailable. Headless snapshots and automated tests never connect to your installed Hex or start its microphone.
+## Saved sessions and replay
+
+Beside `session.json`, Tacit creates a private `session.tacit/` archive:
+
+- `events.jsonl`: versioned, ordered events with millisecond session timestamps, sequence numbers, and a BLAKE3 integrity chain. Content events capture thoughts, corrections, deletions, semantic splits, AI classifications/narrative/relationships, undo, transcript links, and available artwork. A separate, versioned presentation track stores Rune draft, selection, art style, vector drawing state, image transitions, scrolling, and viewport metadata. Recording, transcript, and failure events retain their original order.
+- `recordings/`: original captured WAVs, including stopped recordings whose transcription is pending or failed.
+- `media/`: content-addressed, durable audio and generated PNG assets plus per-recording `.vtt` files. These assets are independent of the bounded image-generation cache.
+- `transcript.vtt`: captions on the session timeline, including gaps between recordings. Per-recording VTT uses time relative to its WAV. Caption boundaries are Hex's actual transcription windows, not inferred boundaries for the semantic thought chunks.
+
+The event log is authoritative; `session.json` remains a compatibility snapshot. Existing notebooks are imported as the initial event without inventing past history. Live content follows **action → event → durable append → reducer projection → renderer**. Captures, corrections, deletion, splitting, model results, and undo cannot publish content before their event is saved; failed writes keep the previous projection. Replay uses the same pure reducer. Rune reads the shared projection for content and manages its own presentation controls and animations. Model results and images are replayed from saved data; no model calls occur during playback. Stroke reveals, image crossfades, and classification fades use recorded time; hidden Rune layout springs have been removed so seeking does not depend on prior animation frames.
+
+### Original pixels and exact replay
+
+Persistent sessions now capture the actual Tacit render texture before presenting it to the window. Each frame is stored as a lossless, content-addressed RGBA PNG with its timestamp, device-pixel dimensions, display scale, and content revision. This records Tacit's application pixels, including its controls and draft; it does not record other applications or the OS desktop. Headless demos only capture when explicitly launched with `--capture-demo NEW_PATH`.
+
+Replay offers **Scene replay** and **Original pixels**. Scene replay uses the recorded presentation's content revision and sampled animation clock; it does not show later content before the frame that displayed it. Related transcript/capture/link events and artwork/presentation events commit atomically. Recorded map dimensions prevent replay controls or a different window width from rearranging branches. Unsupported or missing presentation tracks fail strict replay instead of silently generating a new scene. Older archives remain usable, but their missing original pixels cannot be recovered retroactively.
+
+**Export lossless video** writes an `.mkv` with lossless FFV1 video and the original PCM audio, aligned on the same timeline. Video starts at its first captured frame; the `tacit_session_start_ms` container tag records its offset into the session/WebVTT timeline. Window resizing adds black padding without scaling or changing the original frame pixels. Capture stops/restarts are explicit; intervals when original capture is paused are black. An interrupted capture is reported, and export refuses to claim completeness for an archive with recorded capture failures. The PNG masters and event log remain authoritative. FFmpeg is required for export (`brew install ffmpeg` on macOS, or set `TACIT_FFMPEG`); recording and in-app original-pixel playback do not require it.
+
+```sh
+cargo run -- --replay /path/to/session.tacit --replay-pixels
+cargo run -- --export-video /path/to/session.tacit /path/to/original.mkv
+```
+
+The first capture implementation uses synchronous GPU readback and durable writes, prioritizing retaining every application frame over throughput. It adds rendering latency and retains potentially substantial media; no automatic pruning is performed. It records the frames Tacit presents, not a promised fixed frame rate. Frame timestamps have millisecond resolution. Scene replay remains renderer/version dependent; original-pixel playback and lossless video preserve the visual record independently of future renderer changes.
+
+The export uses the [Matroska FFV1 codec mapping](https://www.matroska.org/technical/codec_specs.html#v_ffv1) and [Matroska timestamp semantics](https://www.matroska.org/technical/notes.html).
+
+### Renderer contract
+
+`Journal::at(milliseconds)` returns the shared projection. `Projection::content()` exposes only renderer-independent data: the session (thoughts, categories, interpretations and relationships), semantic artwork references, audio, transcripts, and thought provenance. It contains no Rune drawing objects, layout positions, or animation state. Artwork assets are associated with theme IDs; each renderer decides their placement. Historical assets and provenance survive deletion or undo.
+
+`SessionEvent::reduce` is the pure content reducer. New renderers submit content events through the journal and render the resulting projection. They can use their own versioned `Presentation` events without changing content or having to interpret another renderer's presentation payload. Header compatibility checks the **timeline schema**, not the original renderer version. Version 1 scene archives remain readable through a legacy adapter; new live edits emit version 2 content and presentation events. Existing archives are not rewritten.
+
+A minimal second renderer demonstrates this contract without invoking Rune's UI or any AI services:
+
+```sh
+cargo run --example render_text -- /path/to/session.tacit 12500
+cargo run --example render_text -- /path/to/session.tacit 12500 --json
+```
+
+The JSON form is a portable content view, not a Rune scene dump. In-memory checkpoints accelerate seeking; rebuilding them from the event log produces the same state. Rune presentation reproduction requires its matching presentation version; other renderers remain free to choose a different layout.
+
+Click **Replay** for play/pause, ±10-second seeking, and **Next event** to skip quiet periods, with synchronized original audio. **Back to live** restores the latest scene. To open an archive read-only, including for a headless snapshot:
+
+```sh
+cargo run -- --replay /path/to/session.tacit
+cargo run -- --replay /path/to/session.tacit --replay-at 12500 --snap /tmp/replay.png --size 1280x860
+```
+
+Scene replay reproduces the saved scene and its timed effects with this renderer version. The separate original-pixels track preserves the application image; OS cursor/hover, window chrome, and font/GPU differences across machines or future renderer versions are not pixel-perfect replay guarantees. Viewport metadata is retained; use the original window size for matching layout. The scene's map scroll is recorded, while playback controls are separate from recorded content.
+
+Each committed event is flushed before becoming authoritative. A final partial line from an interrupted write is preserved separately and recovered on the next writable open; corruption in committed events, missing assets, or asset checksum failures are reported instead of silently substituted. Valid WAVs left by an interrupted recording are recovered on reopen and can be transcribed using **Retry transcript**. The log and media contain private thoughts and audio and are retained without automatic pruning; Unix archive folders are mode 700 and journal/exported asset files mode 600. Copy the entire `.tacit` directory to keep a replay self-contained. A session with no recordings still gets a valid empty WebVTT file.
 
 ## OpenRouter: quick themes, thoughtful review
 
@@ -111,6 +161,8 @@ cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build --release
+# Synthetic archive for offline playback QA; output directory must be new:
+cargo run --example replay_fixture -- /tmp/tacit-replay-fixture
 ```
 
 Rune is pinned to a specific Git revision, and Cargo.lock is included with the project sources. The build and headless renderer have been tested on macOS. Linux uses Rune's Wayland/X11 backend and needs the associated native development libraries (including Wayland and xkbcommon); Linux execution has not yet been verified here.
@@ -130,10 +182,39 @@ Headless runs do not read or write your real notebook or contact OpenRouter, Oll
 - `src/art.rs`: offline motifs, hand-drawn strokes, coalesced illustration transitions.
 - `src/generated_art.rs`: image model requests, stable scene briefs, bounded private cache, replacement transitions.
 - `src/model.rs`: original thoughts, narrative roles, validated model interpretations.
+- `src/capture.rs`: original render-texture capture and exact presentation.
+- `src/video_archive.rs`: lossless PNG masters, timestamped FFV1/PCM video export.
+- `src/timeline.rs`: durable event log, shared projection, media integrity, WebVTT, and recovery.
+- `src/session_event.rs`: portable content events and the pure reducer.
+- `src/presentation.rs`: Rune presentation and version 1 scene compatibility adapter.
 - `src/storage.rs`: session loading, atomic saves, exclusive session lock.
 - `src/organizer.rs`: independent OpenRouter fast/review workers, Ollama fallback, and response validation.
-- `src/voice.rs`: authenticated Hex discovery, owned recording lifecycle, and lease management.
+- `src/voice.rs`: Rune WAV capture, authenticated Hex transcription streams, and exact sample uploads.
 - `src/ui.rs`: Rune canvas, vector illustrations, input, inspector, and narrative view.
 - `design/living-map.html`: the earlier conceptual exploration, independent of the Rust app.
 
-This is a first working vertical slice. The tree uses up to eight thematic branches (four narrative lenses offline) and scrolls as it grows; it is not yet an infinite spatial graph. Nested subthemes, drag positioning, relationship rejection, session browsing, and SVG/PDF export remain future work. The local-model integration is tested with fixtures; model quality and live inference still need validation with an installed model.
+This is a first working vertical slice. The tree uses up to eight thematic branches (four narrative lenses offline) and scrolls as it grows; it is not yet an infinite spatial graph. Nested subthemes, drag positioning, relationship rejection, and SVG/PDF export remain future work. The local-model integration is tested with fixtures; model quality and live inference still need validation with an installed model.
+
+## Multiple sessions
+
+Use **Sessions** in the header to open your session library. Enter a name and choose **New session** to start an independent mindmap, or **Rename current** to rename the open session. Select a session to resume it. The original notebook remains available as **Original session**; names never become filesystem paths, and duplicate names are allowed.
+
+Each session has its own event log, audio, WebVTT, artwork, original frames, draft, and replay history. Switching saves the draft and closes the current capture cleanly. Recording, transcription/chunking, and video export must finish before switching. Late organization and image results stay isolated in the old workers. A session open in another process cannot be opened for editing.
+
+The library lives beside the existing notebook in `session.sessions/`, with one directory per session. `TACIT_SESSION` selects the original notebook and therefore its adjacent library. Startup opens that original notebook; use the picker to reopen another session. Library browsing pauses original-frame capture, with explicit capture boundaries; the library itself is outside the recorded mindmap scene.
+
+## Brainstorm and Direct the map
+
+The composer has two explicit modes, each with its own draft. **Brainstorm** captures ideas as thoughts. **Direct the map** treats typed text or speech as an editing instruction. Select the mode before pressing Listen; it cannot change during a recording. In direction mode, **Stop & direct** transcribes the instruction and asks the stronger model for a bounded edit plan.
+
+Try “Rename Costs to Infrastructure costs,” “Move the hosting thought into Costs,” “Merge Meeting overhead into Coordination,” or “Put Decisions before Costs.” Directions can create, rename, merge, and order branches, move or order existing thoughts, and rename the central theme. They cannot rewrite/delete original thoughts or set arbitrary pixel coordinates, fonts, or styles. Ambiguous and unsupported requests return an explanation without editing. Current tree slots determine the positions after branch reordering.
+
+Directions are validated and applied atomically through the shared reducer, support Undo, and are captured in the event log. Explicit thought moves are pinned. Stale plans never apply to changed content. The latest twenty applied instructions inform subsequent cloud classification; existing branch order survives normal organization. Spoken instructions keep their original audio and WebVTT but never enter the thought list or semantic splitting queue. Failed instructions stay in the direction draft for retry. Direction mode requires OpenRouter; it does not silently fall back to brainstorming.
+
+Segmentation now uses the stronger review model and a contextual editorial pass that distinguishes independent proposals, attaches examples/qualifications to their parent idea, follows topic switches and returns, and preserves every original word. The fast classifier still gives quick placement feedback; the whole-map reviewer now enables reasoning and audits conceptual coherence, competing options, unsupported relationships, and unnecessary movement. The full recording remains visible while stronger segmentation runs. Quality is model-dependent; the synthetic evaluation is a regression check, not a guarantee of expert judgment on every discussion.
+
+Run the opt-in live evaluation with synthetic discussions (uses configured OpenRouter credits):
+
+```sh
+cargo run --example facilitation_eval
+```

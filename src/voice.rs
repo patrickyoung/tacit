@@ -1,28 +1,49 @@
-//! Hex desktop capture. Authentication stays in this process; no clipboard or global hotkeys.
+//! Own the audio file first; Hex transcribes those exact samples locally.
+use crate::timeline::{self, Cue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
-    },
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, Sender},
     time::Duration,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Check,
     Start,
     Finish,
     Cancel,
+    Retry(PathBuf),
+}
+#[derive(Clone, Debug)]
+pub struct Recording {
+    pub id: String,
+    pub path: PathBuf,
+    pub started: std::time::Instant,
+    pub samples: u64,
+    pub sample_rate: u32,
+}
+impl Recording {
+    pub fn duration_ms(&self) -> u64 {
+        self.samples * 1000 / self.sample_rate as u64
+    }
 }
 #[derive(Debug)]
 pub enum Event {
     Ready,
     Recording,
+    Started {
+        id: String,
+        started: std::time::Instant,
+    },
+    AudioSaved(Recording),
     Transcript(String),
+    TimedTranscript {
+        id: String,
+        text: String,
+        cues: Vec<Cue>,
+    },
     Cancelled,
     Error(String),
 }
@@ -31,57 +52,119 @@ pub struct Worker {
     pub receive: Receiver<Event>,
 }
 impl Worker {
-    pub fn start(wake: impl Fn() + Send + 'static) -> Self {
+    pub fn start(root: PathBuf, wake: impl Fn() + Send + 'static) -> Self {
         let (send, commands) = mpsc::channel();
         let (events, receive) = mpsc::channel();
         std::thread::spawn(move || {
-            let mut capture: Option<Capture> = None;
+            let mut recorder: Option<(rune::Recorder, String)> = None;
+            let mut announced = false;
+            let mut started = std::time::Instant::now();
             loop {
-                if capture
-                    .as_ref()
-                    .is_some_and(|c| c.failed.load(Ordering::Acquire))
-                {
-                    drop(capture.take());
-                    if events.send(Event::Error("Lost connection to Hex; recording stopped or will expire within 10 seconds.".into())).is_err() { break; }
-                    wake();
-                }
-                let command = match commands.recv_timeout(Duration::from_millis(200)) {
-                    Ok(command) => command,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                };
-                let result = match command {
-                    Command::Check => Client::discover()
-                        .and_then(|c| c.check())
-                        .map(|()| Event::Ready),
-                    Command::Start if capture.is_none() => {
-                        Client::discover().and_then(|c| c.start()).map(|c| {
-                            capture = Some(c);
-                            Event::Recording
-                        })
+                let mut interrupted = false;
+                if let Some((rec, id)) = &recorder {
+                    match rec.state() {
+                        rune::RecorderState::Recording if !announced => {
+                            announced = true;
+                            started = std::time::Instant::now()
+                                .checked_sub(Duration::from_secs_f64(rec.elapsed().max(0.0)))
+                                .unwrap_or_else(std::time::Instant::now);
+                            let _ = events.send(Event::Started {
+                                id: id.clone(),
+                                started,
+                            });
+                            let _ = events.send(Event::Recording);
+                            wake();
+                        }
+                        rune::RecorderState::Failed(message) => {
+                            let _ = events.send(Event::Error(message));
+                            recorder = None;
+                            wake();
+                        }
+                        rune::RecorderState::Interrupted(_) => {
+                            interrupted = true;
+                        }
+                        _ => {}
                     }
-                    Command::Start => Err("Tacit is already recording.".into()),
-                    Command::Finish => match capture.take() {
-                        Some(mut c) => c.finish().map(Event::Transcript),
-                        None => Err("There is no Tacit recording to finish.".into()),
-                    },
-                    Command::Cancel => match capture.take() {
-                        Some(mut c) => c.cancel().map(|()| Event::Cancelled),
-                        None => Ok(Event::Cancelled),
-                    },
+                }
+                let command = if interrupted {
+                    Command::Finish
+                } else {
+                    match commands.recv_timeout(Duration::from_millis(50)) {
+                        Ok(c) => c,
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(_) => break,
+                    }
                 };
-                if events.send(result.unwrap_or_else(Event::Error)).is_err() {
-                    break;
+                let result: Result<(), String> = (|| {
+                    match command {
+                        Command::Check => {
+                            Client::discover()?.check()?;
+                            let _ = events.send(Event::Ready);
+                        }
+                        Command::Start => {
+                            if recorder.is_some() {
+                                return Err("Already recording".into());
+                            }
+                            timeline::private_dir(&root)
+                                .map_err(|_| "Cannot create audio folder")?;
+                            let id = format!(
+                                "recording-{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos()
+                            );
+                            let rec = rune::Recorder::to_file(root.join(format!("{id}.wav")))
+                                .sample_rate(16000)
+                                .channels(1);
+                            rec.start();
+                            recorder = Some((rec, id));
+                            announced = false;
+                        }
+                        Command::Finish => {
+                            let (rec, id) = recorder.take().ok_or("No recording to stop")?;
+                            let saved = rec.stop()?;
+                            let (samples, rate) = wav_info(&saved.path)?;
+                            let recording = Recording {
+                                id: id.clone(),
+                                path: saved.path.clone(),
+                                started,
+                                samples,
+                                sample_rate: rate,
+                            };
+                            let _ = events.send(Event::AudioSaved(recording));
+                            wake();
+                            let (text, cues) = Client::discover()?.transcribe(&saved.path)?;
+                            let _ = events.send(Event::TimedTranscript { id, text, cues });
+                        }
+                        Command::Cancel => {
+                            if let Some((rec, _)) = recorder.take() {
+                                rec.cancel();
+                            }
+                            let _ = events.send(Event::Cancelled);
+                        }
+                        Command::Retry(path) => {
+                            let id = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .ok_or("Invalid recording path")?
+                                .to_owned();
+                            let (text, cues) = Client::discover()?.transcribe(&path)?;
+                            let _ = events.send(Event::TimedTranscript { id, text, cues });
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(message) = result {
+                    let _ = events.send(Event::Error(message));
                 }
                 wake();
             }
-            // Dropping an owned capture cancels only that capture. If the process dies,
-            // Hex's 10-second lease provides the final backstop.
+            // Recorder's last handle stops and retains unfinished audio on shutdown.
         });
         Self { send, receive }
     }
 }
-
 #[derive(Deserialize)]
 struct Discovery {
     port: u16,
@@ -89,7 +172,6 @@ struct Discovery {
     #[serde(rename = "apiVersion")]
     api_version: String,
 }
-#[derive(Clone)]
 struct Client {
     base: String,
     token: String,
@@ -104,22 +186,31 @@ fn discovery_path() -> Result<PathBuf, String> {
     #[cfg(target_os = "windows")]
     let dir = PathBuf::from(std::env::var_os("APPDATA").ok_or("APPDATA is not set")?).join("hex");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let dir = match std::env::var_os("XDG_DATA_HOME") {
-        Some(d) => PathBuf::from(d).join("hex"),
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?)
-            .join(".local/share/hex"),
-    };
+    let dir = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share")
+        })
+        .join("hex");
     Ok(dir.join("local-api.json"))
+}
+fn agent(seconds: u64) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .proxy(None)
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(seconds)))
+        .build()
+        .into()
 }
 impl Client {
     fn discover() -> Result<Self, String> {
-        let bytes = std::fs::read(discovery_path()?).map_err(|_| {
-            "Open Hex and finish its microphone/model setup, then click Reconnect Hex.".to_string()
-        })?;
-        let d: Discovery = serde_json::from_slice(&bytes)
-            .map_err(|_| "Hex discovery data is invalid. Restart Hex.".to_string())?;
+        let d: Discovery = serde_json::from_slice(
+            &std::fs::read(discovery_path()?).map_err(|_| "Open Hex, then reconnect")?,
+        )
+        .map_err(|_| "Invalid Hex discovery file")?;
         if d.port == 0 || d.token.is_empty() || d.api_version != "2" {
-            return Err("Unsupported Hex API. Update Hex and reconnect.".into());
+            return Err("Unsupported Hex API".into());
         }
         Ok(Self {
             base: format!("http://127.0.0.1:{}", d.port),
@@ -131,159 +222,173 @@ impl Client {
         path: &str,
         body: Option<Value>,
         owner: Option<&str>,
-        timeout: u64,
     ) -> Result<Value, String> {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .proxy(None)
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(timeout)))
-            .build()
-            .into();
+        let agent = agent(125);
+        let url = format!("{}{path}", self.base);
         let auth = format!("Bearer {}", self.token);
-        let result = if let Some(body) = body {
-            let mut request = agent
-                .post(format!("{}{path}", self.base))
-                .header("Authorization", &auth);
+        let response = if let Some(body) = body {
+            let mut r = agent.post(&url).header("Authorization", &auth);
             if let Some(owner) = owner {
-                request = request.header("X-Hex-Dictation-Token", owner);
+                r = r.header("X-Hex-Stream-Token", owner);
             }
-            request.send_json(body)
+            r.send_json(body)
         } else {
-            agent
-                .get(format!("{}{path}", self.base))
-                .header("Authorization", &auth)
-                .call()
+            agent.get(&url).header("Authorization", &auth).call()
         };
-        let mut response = result.map_err(|_| {
-            "Hex did not respond. Check that it is running and reconnect.".to_string()
-        })?;
+        let mut response = response.map_err(|_| "Hex did not respond; audio remains saved")?;
         let status = response.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(format!(
+                "Hex transcription unavailable (HTTP {status}); audio remains saved"
+            ));
+        }
         if status == 204 {
             return Ok(Value::Null);
         }
-        let value: Value = response
+        response
             .body_mut()
             .with_config()
-            .limit(1024 * 1024)
+            .limit(8 * 1024 * 1024)
             .read_json()
-            .unwrap_or(Value::Null);
-        if !(200..300).contains(&status) {
-            let code = value
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("request-failed");
-            return Err(match code {
-                "dictation-busy"|"service-capture-busy" => "Hex is busy recording elsewhere. Finish that recording first.".into(),
-                "service-capture-unavailable" => "This Hex instance does not support desktop recording. Open the Hex desktop app.".into(),
-                "microphone-lost" => "The microphone disconnected. Check it in Hex and try again.".into(),
-                _ => format!("Hex request failed (HTTP {status}, {}).",code.chars().take(80).collect::<String>()),
-            });
-        }
-        Ok(value)
+            .map_err(|_| "Invalid Hex response".into())
     }
     fn check(&self) -> Result<(), String> {
-        let c = self.request("/capabilities", None, None, 4)?;
-        if c.get("serviceCapture").and_then(Value::as_bool) != Some(true) {
-            return Err("Hex desktop capture is unavailable on this instance.".into());
+        let c = self.request("/capabilities", None, None)?;
+        if c.get("streams").and_then(Value::as_bool) != Some(true) {
+            return Err("Update Hex: timed transcription streams are required".into());
         }
         Ok(())
     }
-    fn start(self) -> Result<Capture, String> {
-        self.check()?;
-        let result = self.request("/dictations", Some(json!({"source":"Tacit"})), None, 12)?;
-        let id = result
+    fn transcribe(&self, path: &Path) -> Result<(String, Vec<Cue>), String> {
+        let (samples, rate) = wav_info(path)?;
+        if rate != 16000 {
+            return Err("Transcription requires a 16 kHz recording".into());
+        }
+        let stream = self.request(
+            "/streams",
+            Some(json!({"sampleFormat":"s16le","sampleRate":16000})),
+            None,
+        )?;
+        let id = stream
             .get("id")
             .and_then(Value::as_u64)
-            .ok_or("Hex returned an invalid recording ID")?;
-        let owner = result
+            .ok_or("Invalid Hex stream ID")?;
+        let owner = stream
             .get("ownerToken")
             .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or("Hex returned no recording ownership token")?
-            .to_owned();
-        let stop = Arc::new(AtomicBool::new(false));
-        let failed = Arc::new(AtomicBool::new(false));
-        let (c, o, stop_flag, failed_flag) =
-            (self.clone(), owner.clone(), stop.clone(), failed.clone());
-        std::thread::spawn(move || {
-            // Short sleeps keep cancellation responsive without blocking the UI.
-            for tick in 1u64.. {
-                std::thread::sleep(Duration::from_millis(100));
-                if stop_flag.load(Ordering::Acquire) {
+            .ok_or("No Hex stream ownership token")?;
+        let result = (|| {
+            let mut wav = hound::WavReader::open(path).map_err(|_| "Cannot read saved audio")?;
+            let mut input = wav.samples::<i16>();
+            loop {
+                let mut bytes = Vec::with_capacity(16000);
+                for _ in 0..8000 {
+                    match input.next() {
+                        Some(Ok(sample)) => bytes.extend_from_slice(&sample.to_le_bytes()),
+                        Some(Err(_)) => return Err("Invalid saved audio samples".into()),
+                        None => break,
+                    }
+                }
+                if bytes.is_empty() {
                     break;
                 }
-                if tick % 30 == 0
-                    && c.request(
-                        &format!("/dictations/{id}/heartbeat"),
+                let started = std::time::Instant::now();
+                loop {
+                    let response = agent(10)
+                        .post(format!("{}/streams/{id}/audio", self.base))
+                        .header("Authorization", format!("Bearer {}", self.token))
+                        .header("X-Hex-Stream-Token", owner)
+                        .header("Content-Type", "application/octet-stream")
+                        .send(bytes.as_slice())
+                        .map_err(|_| "Audio upload to Hex failed")?;
+                    let status = response.status().as_u16();
+                    if status == 204 {
+                        break;
+                    }
+                    if status != 429 || started.elapsed() > Duration::from_secs(120) {
+                        return Err(format!(
+                            "Hex audio stream failed (HTTP {status}); audio remains saved"
+                        ));
+                    }
+                    self.request(
+                        &format!("/streams/{id}/heartbeat"),
                         Some(json!({})),
-                        Some(&o),
-                        4,
-                    )
-                    .is_err()
-                {
-                    failed_flag.store(true, Ordering::Release);
-                    break;
+                        Some(owner),
+                    )?;
+                    std::thread::sleep(Duration::from_millis(500));
                 }
             }
-        });
-        Ok(Capture {
-            client: self,
-            id,
-            owner,
-            stop,
-            failed,
-            ended: false,
-        })
-    }
-}
-struct Capture {
-    client: Client,
-    id: u64,
-    owner: String,
-    stop: Arc<AtomicBool>,
-    failed: Arc<AtomicBool>,
-    ended: bool,
-}
-impl Capture {
-    fn finish(&mut self) -> Result<String, String> {
-        let result = self.client.request(
-            &format!("/dictations/{}/finish", self.id),
-            Some(json!({})),
-            Some(&self.owner),
-            125,
-        )?;
-        let text = result
-            .get("transcript")
-            .and_then(Value::as_str)
-            .ok_or("Hex returned an invalid transcript")?
-            .to_owned();
-        self.ended = true;
-        self.stop.store(true, Ordering::Release);
-        Ok(text)
-    }
-    fn cancel(&mut self) -> Result<(), String> {
-        let result = self.client.request(
-            &format!("/dictations/{}/cancel", self.id),
-            Some(json!({})),
-            Some(&self.owner),
-            5,
-        );
-        self.ended = result.is_ok();
-        self.stop.store(true, Ordering::Release);
-        result.map(|_| ())
-    }
-}
-impl Drop for Capture {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if !self.ended {
-            let _ = self.cancel();
+            let result = self.request(
+                &format!("/streams/{id}/finish"),
+                Some(json!({})),
+                Some(owner),
+            )?;
+            parse_transcript(&result, samples * 1000 / rate as u64)
+        })();
+        if result.is_err() {
+            let _ = self.request(
+                &format!("/streams/{id}/cancel"),
+                Some(json!({})),
+                Some(owner),
+            );
         }
+        result
     }
 }
-
-/// Read-only health check for diagnostics; never opens the microphone.
+pub fn wav_info(path: &Path) -> Result<(u64, u32), String> {
+    let wav = hound::WavReader::open(path).map_err(|_| "Saved recording is not a valid WAV")?;
+    let spec = wav.spec();
+    if spec.channels != 1
+        || spec.bits_per_sample != 16
+        || spec.sample_format != hound::SampleFormat::Int
+        || spec.sample_rate == 0
+    {
+        return Err("Unsupported recording format".into());
+    }
+    Ok((wav.duration() as u64, spec.sample_rate))
+}
+fn parse_transcript(result: &Value, duration: u64) -> Result<(String, Vec<Cue>), String> {
+    let text = result
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or("Hex returned no transcript")?
+        .to_owned();
+    let mut cues = Vec::new();
+    for segment in result
+        .get("segments")
+        .and_then(Value::as_array)
+        .ok_or("Hex returned no segment timing")?
+    {
+        let text = segment
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or("Invalid segment text")?;
+        if text.trim().is_empty() {
+            continue;
+        }
+        let start_ms = segment
+            .get("startMs")
+            .and_then(Value::as_u64)
+            .ok_or("Invalid segment timing")?;
+        let end_ms = segment
+            .get("endMs")
+            .and_then(Value::as_u64)
+            .ok_or("Invalid segment timing")?;
+        cues.push(Cue {
+            start_ms,
+            end_ms,
+            text: text.into(),
+        });
+    }
+    timeline::validate_cues(&cues, duration).map_err(|e| e.to_string())?;
+    if !text.trim().is_empty() && cues.is_empty() {
+        return Err("Hex returned text without timing; audio remains saved".into());
+    }
+    Ok((text, cues))
+}
+pub fn transcribe_file(path: &Path) -> Result<(String, Vec<Cue>), String> {
+    Client::discover()?.transcribe(path)
+}
 pub fn check_installed() -> Result<(), String> {
     Client::discover()?.check()
 }
@@ -291,106 +396,92 @@ pub fn check_installed() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    fn server(replies: Vec<(&'static str, u16, Value)>) -> (Client, std::thread::JoinHandle<()>) {
-        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", server.local_addr().unwrap());
-        let thread = std::thread::spawn(move || {
-            for (expected, status, body) in replies {
-                let (mut socket, _) = server.accept().unwrap();
+    #[test]
+    fn uploads_exact_saved_pcm_and_uses_owned_stream_timestamps() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audio.wav");
+        let mut wav = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .unwrap();
+        for _ in 0..8000 {
+            wav.write_sample(321i16).unwrap();
+        }
+        wav.finalize().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for step in 0..3 {
+                let (mut socket, _) = listener.accept().unwrap();
                 socket
-                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
-                let mut bytes = Vec::new();
-                let mut buf = [0; 2048];
+                let mut data = Vec::new();
+                let mut buf = [0; 16384];
                 loop {
                     let n = socket.read(&mut buf).unwrap();
                     assert!(n > 0);
-                    bytes.extend_from_slice(&buf[..n]);
-                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
-                        let length: usize = headers
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(end) = data.windows(4).position(|b| b == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..end]).to_lowercase();
+                        let len: usize = headers
                             .lines()
                             .find_map(|l| {
                                 l.strip_prefix("content-length:")
                                     .map(|v| v.trim().parse().unwrap())
                             })
                             .unwrap_or(0);
-                        if bytes.len() >= end + 4 + length {
-                            assert!(headers.lines().next().unwrap().contains(expected));
-                            assert!(headers.contains("authorization: bearer test-auth"));
-                            if expected.contains("/7/") {
-                                assert!(headers.contains("x-hex-dictation-token: test-owner"));
-                            }
-                            break;
+                        if data.len() < end + 4 + len {
+                            continue;
                         }
+                        assert!(headers.contains("authorization: bearer fixture"));
+                        if step == 0 {
+                            assert!(headers.starts_with("post /streams "));
+                        } else {
+                            assert!(headers.contains("x-hex-stream-token: owned"));
+                        }
+                        if step == 1 {
+                            assert!(headers.starts_with("post /streams/7/audio "));
+                            assert_eq!(len, 16000);
+                            assert!(
+                                data[end + 4..]
+                                    .as_chunks::<2>()
+                                    .0
+                                    .iter()
+                                    .all(|b| *b == 321i16.to_le_bytes())
+                            );
+                        }
+                        break;
                     }
                 }
-                let body = if status == 204 {
-                    String::new()
-                } else {
-                    body.to_string()
-                };
-                write!(socket,"HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                let body=match step{0=>json!({"id":7,"ownerToken":"owned"}).to_string(),1=>String::new(),_=>json!({"text":"Hello","durationMs":500,"segments":[{"startMs":0,"endMs":500,"text":"Hello"}]}).to_string()};
+                let status = if step == 1 { 204 } else { 200 };
+                write!(socket,"HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
             }
         });
-        (
-            Client {
-                base,
-                token: "test-auth".into(),
-            },
-            thread,
-        )
-    }
-    fn opening() -> Vec<(&'static str, u16, Value)> {
-        vec![
-            ("get /capabilities", 200, json!({"serviceCapture":true})),
-            (
-                "post /dictations ",
-                201,
-                json!({"id":7,"ownerToken":"test-owner","sampleRate":16000}),
-            ),
-        ]
+        let (text, cues) = Client {
+            base,
+            token: "fixture".into(),
+        }
+        .transcribe(&path)
+        .unwrap();
+        assert_eq!(text, "Hello");
+        assert_eq!(cues[0].end_ms, 500);
+        server.join().unwrap();
     }
     #[test]
-    fn capture_returns_raw_text_and_does_not_cancel_a_finished_recording() {
-        let mut replies = opening();
-        replies.push((
-            "/7/finish",
-            200,
-            json!({"transcript":"What if we listened?","durationMs":1000}),
-        ));
-        let (client, thread) = server(replies);
-        let mut capture = client.start().unwrap();
-        assert_eq!(capture.finish().unwrap(), "What if we listened?");
-        assert!(capture.stop.load(Ordering::Acquire));
-        drop(capture);
-        thread.join().unwrap();
-    }
-    #[test]
-    fn dropping_a_recording_cancels_only_its_owned_session() {
-        let mut replies = opening();
-        replies.push(("/7/cancel", 204, Value::Null));
-        let (client, thread) = server(replies);
-        drop(client.start().unwrap());
-        thread.join().unwrap();
-    }
-    #[test]
-    fn busy_recording_is_preserved_and_error_is_actionable() {
-        let mut replies = opening();
-        replies[1] = ("post /dictations ", 409, json!({"code":"dictation-busy"}));
-        let (client, thread) = server(replies);
-        assert!(matches!(client.start(),Err(message) if message.contains("recording elsewhere")));
-        thread.join().unwrap();
-    }
-    #[test]
-    fn unsupported_capture_is_reported_before_any_recording_request() {
-        let (client, thread) = server(vec![(
-            "get /capabilities",
-            200,
-            json!({"serviceCapture":false}),
-        )]);
-        assert!(client.start().is_err());
-        thread.join().unwrap();
+    fn preserves_real_timing_and_rejects_invented_or_out_of_bounds_cues() {
+        let v = json!({"text":"Hello. Another topic.","segments":[{"startMs":250,"endMs":1200,"text":"Hello."},{"startMs":1400,"endMs":2100,"text":"Another topic."}]});
+        let (_, cues) = parse_transcript(&v, 2200).unwrap();
+        assert_eq!(cues[1].start_ms, 1400);
+        assert!(parse_transcript(&v, 2000).is_err());
+        assert!(parse_transcript(&json!({"text":"Hello","segments":[]}), 1000).is_err());
     }
 }

@@ -1,5 +1,46 @@
+mod capture;
 mod ui;
 fn main() {
+    let args: Vec<_> = std::env::args().collect();
+    if let Some(index) = args.iter().position(|a| a == "--export-video") {
+        let result = (|| -> std::io::Result<()> {
+            let path = args
+                .get(index + 1)
+                .ok_or_else(|| std::io::Error::other("--export-video needs SESSION OUTPUT.mkv"))?;
+            let output = args
+                .get(index + 2)
+                .ok_or_else(|| std::io::Error::other("--export-video needs SESSION OUTPUT.mkv"))?;
+            let journal = tacit::timeline::Journal::read(std::path::Path::new(path))?;
+            tacit::video_archive::export(&journal, std::path::Path::new(output))?;
+            println!("Original lossless video exported to {output}");
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(index) = args.iter().position(|a| a == "--check-audio") {
+        let result = (|| -> Result<(), String> {
+            let path = std::path::Path::new(
+                args.get(index + 1)
+                    .ok_or("--check-audio needs a 16 kHz mono WAV path")?,
+            );
+            let (text, cues) = tacit::voice::transcribe_file(path)?;
+            println!(
+                "Validated {} timed segments from saved audio ({} characters)",
+                cues.len(),
+                text.chars().count()
+            );
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().any(|a| a == "--check-recording") {
         let result = (|| -> Result<(), String> {
             let config = tacit::organizer::CloudConfig::from_env()?
@@ -39,7 +80,9 @@ fn main() {
     if std::env::args().any(|a| a == "--check-image") {
         let result = tacit::organizer::CloudConfig::from_env()
             .and_then(|c| c.ok_or("OpenRouter key is not configured".into()))
-            .and_then(|c| tacit::generated_art::check_demo(&c, &ui::State::themed_demo().session));
+            .and_then(|c| {
+                tacit::generated_art::check_demo(&c, &ui::State::themed_demo().projection.session)
+            });
         match result {
             Ok(path) => println!(
                 "Generated demo art validated and cached: {}",
@@ -95,22 +138,25 @@ fn main() {
         return;
     }
     rune::set_app_id("app.tacit.Desktop");
-    rune::run(rune::AppSpec {
-        min_size: Some((820.0, 640.0)),
-        scenes: &[
-            ("demo", |s| *s = ui::State::demo()),
-            ("themes", |s| *s = ui::State::themed_demo()),
-            ("art-draw", |s| *s = ui::State::art_demo()),
-            ("generated", |s| *s = ui::State::generated_demo()),
-        ],
-        on_key: Some(ui::on_key),
-        setup: Some(ui::setup),
-        poll: Some(ui::poll),
-        ..rune::AppSpec::new(
-            "Tacit — a thought taking shape",
-            (1280.0, 860.0),
-            ui::State::load,
-            ui::view,
-        )
-    });
+    rune::run_with(
+        rune::AppSpec {
+            min_size: Some((820.0, 640.0)),
+            scenes: &[
+                ("demo", |s| *s = ui::State::demo()),
+                ("themes", |s| *s = ui::State::themed_demo()),
+                ("art-draw", |s| *s = ui::State::art_demo()),
+                ("generated", |s| *s = ui::State::generated_demo()),
+            ],
+            on_key: Some(ui::on_key),
+            setup: Some(ui::setup),
+            poll: Some(ui::poll),
+            ..rune::AppSpec::new(
+                "Tacit — a thought taking shape",
+                (1280.0, 860.0),
+                ui::State::load,
+                ui::view,
+            )
+        },
+        capture::Capture::default(),
+    );
 }

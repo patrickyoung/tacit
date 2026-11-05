@@ -39,6 +39,8 @@ pub struct Thought {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directions: Vec<String>,
     pub version: u32,
     pub title: String,
     pub thoughts: Vec<Thought>,
@@ -51,6 +53,7 @@ pub struct Session {
 impl Default for Session {
     fn default() -> Self {
         Self {
+            directions: vec![],
             version: 1,
             title: "A thought taking shape".into(),
             thoughts: vec![],
@@ -215,7 +218,7 @@ pub struct Category {
     #[serde(default)]
     pub illustration: Option<String>,
     #[serde(default)]
-    pub motif: Option<crate::art::Motif>,
+    pub motif: Option<Motif>,
     pub id: String,
     pub name: String,
 }
@@ -342,5 +345,114 @@ impl Interpretation {
         session.title = self.title.clone();
         session.interpretation = Some(self);
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Motif {
+    Clock,
+    Compass,
+    People,
+    Sprout,
+    Bridge,
+    Mountain,
+    Book,
+    Bulb,
+    Waves,
+    Gears,
+    Shield,
+    Telescope,
+}
+impl Motif {
+    pub const NAMES: [&'static str; 12] = [
+        "clock",
+        "compass",
+        "people",
+        "sprout",
+        "bridge",
+        "mountain",
+        "book",
+        "bulb",
+        "waves",
+        "gears",
+        "shield",
+        "telescope",
+    ];
+    pub fn infer(name: &str, words: &str) -> Self {
+        let vocabulary = [
+            (
+                Self::Clock,
+                "time calendar schedule meeting deadline hour pace",
+            ),
+            (
+                Self::Compass,
+                "decision direction ownership purpose choice strategy priorities",
+            ),
+            (
+                Self::People,
+                "people team inclusion included belonging community together trust",
+            ),
+            (
+                Self::Sprout,
+                "grow growth nature learning garden health nurture",
+            ),
+            (
+                Self::Bridge,
+                "connect connection bridge collaboration communication access",
+            ),
+            (
+                Self::Mountain,
+                "challenge goal ambition obstacle climb achievement risk",
+            ),
+            (
+                Self::Book,
+                "knowledge research reading study story stories education",
+            ),
+            (
+                Self::Bulb,
+                "idea creativity innovation possibility invent experiment",
+            ),
+            (
+                Self::Waves,
+                "water ocean flow energy balance change emotion",
+            ),
+            (
+                Self::Gears,
+                "system process tools technology automation building work",
+            ),
+            (
+                Self::Shield,
+                "safety protect security privacy boundaries resilience",
+            ),
+            (
+                Self::Telescope,
+                "future vision explore discovery question curiosity focus",
+            ),
+        ];
+        let tokens = |s: &str| {
+            s.to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let names = tokens(name);
+        let words = tokens(words);
+        vocabulary
+            .into_iter()
+            .map(|(motif, keys)| {
+                let score = keys
+                    .split_whitespace()
+                    .map(|k| {
+                        4 * usize::from(names.iter().any(|w| w == k))
+                            + usize::from(words.iter().any(|w| w == k))
+                    })
+                    .sum::<usize>();
+                (motif, score)
+            })
+            .max_by_key(|(_, score)| *score)
+            .filter(|(_, score)| *score > 0)
+            .map_or(Self::Sprout, |(motif, _)| motif)
     }
 }

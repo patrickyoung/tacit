@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 ureq = { version = "3", default-features = false, features = ["json"] }
 
 rune = { git = "https://github.com/anomalyco/rune.git", rev = "801e61aac1c93c8e0eef3ee0d1f13f8560af4f37", default-features = false, features = ["metal-backend"] }
@@ -15,9 +15,20 @@ openrouter-rs = "0.24.0"
 tokio = { version = "1.54.1", features = ["rt", "time", "net"] }
 base64 = "0.23.1"
 blake3 = "1.8.7"
+hound = "3.5"
+png = "0.18"
+wgpu = { version = "~30.0.1", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
 
 [profile.dev.package."*"]
 debug = false
 
 [dev-dependencies]
 tempfile = "3"
+
+# Original-pixel capture must remain responsive in developer builds too.
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.blake3]
+opt-level = 3

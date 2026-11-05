@@ -4,115 +4,8 @@ use crate::model::{Role, Session};
 use rune::{Color, LineCap, Shape};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Motif {
-    Clock,
-    Compass,
-    People,
-    Sprout,
-    Bridge,
-    Mountain,
-    Book,
-    Bulb,
-    Waves,
-    Gears,
-    Shield,
-    Telescope,
-}
-impl Motif {
-    pub const NAMES: [&'static str; 12] = [
-        "clock",
-        "compass",
-        "people",
-        "sprout",
-        "bridge",
-        "mountain",
-        "book",
-        "bulb",
-        "waves",
-        "gears",
-        "shield",
-        "telescope",
-    ];
-    pub fn infer(name: &str, words: &str) -> Self {
-        let vocabulary = [
-            (
-                Self::Clock,
-                "time calendar schedule meeting deadline hour pace",
-            ),
-            (
-                Self::Compass,
-                "decision direction ownership purpose choice strategy priorities",
-            ),
-            (
-                Self::People,
-                "people team inclusion included belonging community together trust",
-            ),
-            (
-                Self::Sprout,
-                "grow growth nature learning garden health nurture",
-            ),
-            (
-                Self::Bridge,
-                "connect connection bridge collaboration communication access",
-            ),
-            (
-                Self::Mountain,
-                "challenge goal ambition obstacle climb achievement risk",
-            ),
-            (
-                Self::Book,
-                "knowledge research reading study story stories education",
-            ),
-            (
-                Self::Bulb,
-                "idea creativity innovation possibility invent experiment",
-            ),
-            (
-                Self::Waves,
-                "water ocean flow energy balance change emotion",
-            ),
-            (
-                Self::Gears,
-                "system process tools technology automation building work",
-            ),
-            (
-                Self::Shield,
-                "safety protect security privacy boundaries resilience",
-            ),
-            (
-                Self::Telescope,
-                "future vision explore discovery question curiosity focus",
-            ),
-        ];
-        let tokens = |s: &str| {
-            s.to_lowercase()
-                .split(|c: char| !c.is_alphanumeric())
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        };
-        let names = tokens(name);
-        let words = tokens(words);
-        vocabulary
-            .into_iter()
-            .map(|(motif, keys)| {
-                let score = keys
-                    .split_whitespace()
-                    .map(|k| {
-                        4 * usize::from(names.iter().any(|w| w == k))
-                            + usize::from(words.iter().any(|w| w == k))
-                    })
-                    .sum::<usize>();
-                (motif, score)
-            })
-            .max_by_key(|(_, score)| *score)
-            .filter(|(_, score)| *score > 0)
-            .map_or(Self::Sprout, |(motif, _)| motif)
-    }
-}
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub use crate::model::Motif;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Style {
     #[default]
     Pastel,
@@ -138,7 +31,7 @@ impl Style {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Concept {
     pub key: String,
     pub motif: Motif,
@@ -186,6 +79,7 @@ pub fn concepts(session: &Session) -> Vec<Concept> {
             .collect()
     }
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layer {
     pub concept: Concept,
     pub serial: u64,
@@ -204,7 +98,7 @@ impl Layer {
         self.retired.is_some()
     }
 }
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Garden {
     pub layers: Vec<Layer>,
     desired: Vec<Concept>,
