@@ -39,6 +39,12 @@ pub struct Audio {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    SpeechSegment {
+        recording: String,
+        segment: u64,
+        cue: Cue,
+        thought_id: u64,
+    },
     RecordingDirected {
         id: String,
     },
@@ -153,6 +159,12 @@ pub struct ThoughtSplit {
     pub thought_ids: Vec<u64>,
     pub byte_ends: Vec<usize>,
 }
+/// Finalized speech window and the original thought created from it; splits retain provenance.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpeechSegment {
+    pub cue: Cue,
+    pub thought_id: u64,
+}
 /// Renderer-independent, serializable view. Presentation tracks are intentionally excluded.
 #[derive(Serialize)]
 pub struct SessionView<'a> {
@@ -163,6 +175,8 @@ pub struct SessionView<'a> {
     pub transcript_links: &'a std::collections::BTreeMap<String, u64>,
     pub splits: &'a [ThoughtSplit],
     pub direction_recordings: &'a std::collections::BTreeSet<String>,
+    pub speech_segments:
+        &'a std::collections::BTreeMap<String, std::collections::BTreeMap<u64, SpeechSegment>>,
 }
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Projection {
@@ -178,6 +192,8 @@ pub struct Projection {
     pub transcript_links: std::collections::BTreeMap<String, u64>,
     pub splits: Vec<ThoughtSplit>,
     pub direction_recordings: std::collections::BTreeSet<String>,
+    pub speech_segments:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<u64, SpeechSegment>>,
 }
 impl Projection {
     pub fn content(&self) -> SessionView<'_> {
@@ -189,6 +205,7 @@ impl Projection {
             transcript_links: &self.transcript_links,
             splits: &self.splits,
             direction_recordings: &self.direction_recordings,
+            speech_segments: &self.speech_segments,
         }
     }
     fn retain_artwork(&mut self, artwork: SessionArtwork) {
@@ -198,6 +215,48 @@ impl Projection {
     }
     pub fn apply(&mut self, event: &Event) -> io::Result<()> {
         match event {
+            Event::SpeechSegment {
+                recording,
+                segment,
+                cue,
+                thought_id,
+            } => {
+                safe_asset(recording)?;
+                let item = SpeechSegment {
+                    cue: cue.clone(),
+                    thought_id: *thought_id,
+                };
+                if let Some(existing) = self
+                    .speech_segments
+                    .get(recording)
+                    .and_then(|s| s.get(segment))
+                {
+                    if existing == &item {
+                        return Ok(());
+                    }
+                    return Err(io::Error::other("Conflicting finalized speech segment"));
+                }
+                if cue.start_ms >= cue.end_ms
+                    || cue.text.trim().is_empty()
+                    || cue.text.len() > 96000
+                    || !self
+                        .session
+                        .thoughts
+                        .iter()
+                        .any(|t| t.id == *thought_id && t.text == cue.text.trim())
+                    || self.speech_segments.get(recording).is_some_and(|s| {
+                        s.values().any(|old| {
+                            old.cue.start_ms < cue.end_ms && cue.start_ms < old.cue.end_ms
+                        })
+                    })
+                {
+                    return Err(io::Error::other("Invalid finalized speech segment"));
+                }
+                self.speech_segments
+                    .entry(recording.clone())
+                    .or_default()
+                    .insert(*segment, item);
+            }
             Event::RecordingDirected { id } => {
                 self.direction_recordings.insert(id.clone());
             }
@@ -966,6 +1025,53 @@ mod tests {
         assert_eq!(j.entries.len(), count);
         j.validate_assets().unwrap();
     }
+    #[test]
+    fn live_sources_survive_journal_reopen_and_reject_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mut j = Journal::open(&path, Session::default()).unwrap();
+        let id = j.projection.session.next_id;
+        let cue = Cue {
+            start_ms: 100,
+            end_ms: 900,
+            text: "Plant a garden".into(),
+        };
+        let source = Event::SpeechSegment {
+            recording: "recording-live".into(),
+            segment: 0,
+            cue: cue.clone(),
+            thought_id: id,
+        };
+        let capture = Event::SessionChanged {
+            change: SessionEvent::capture(&j.projection.session, &cue.text),
+        };
+        j.append(
+            900,
+            Event::Transaction {
+                events: vec![capture, source.clone()],
+            },
+        )
+        .unwrap();
+        drop(j);
+        let mut j = Journal::open(&path, Session::default()).unwrap();
+        assert_eq!(
+            j.projection.speech_segments["recording-live"][&0].thought_id,
+            id
+        );
+        assert_eq!(j.projection.session.thoughts.len(), 1);
+        j.projection.apply(&source).unwrap();
+        let conflict = Event::SpeechSegment {
+            recording: "recording-live".into(),
+            segment: 0,
+            cue: Cue {
+                text: "Different".into(),
+                ..cue
+            },
+            thought_id: id,
+        };
+        assert!(j.projection.apply(&conflict).is_err());
+    }
+
     #[test]
     fn invalid_timings_and_path_traversal_are_rejected() {
         assert!(

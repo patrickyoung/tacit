@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!(
             "[{}] {}: {}",
             thought.id,
-            content.session.placement(thought),
+            content.session.placement_path(thought),
             thought.map_label()
         );
         if thought.concept.is_some() {

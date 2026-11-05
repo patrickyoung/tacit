@@ -250,6 +250,7 @@ fn undo_does_not_reuse_historical_thought_ids() {
 fn rune_can_adapt_content_authored_without_a_rune_presentation() {
     let mut session = Session::default();
     session.categories.push(tacit::model::Category {
+        parent: None,
         id: "learning".into(),
         name: "Learning".into(),
         motif: None,

@@ -43,13 +43,15 @@ Normal headless snapshots never contact the network; the generated demo scene lo
 
 ## Voice with Hex
 
-Open Hex with a local model loaded and timed transcription streams enabled. Tacit records **one microphone** through Rune into a 16 kHz mono PCM WAV, then sends those exact samples to Hex locally. Recording currently requires macOS because Rune's native recorder backend is macOS-only. Hex's stream endpoint is cross-platform; a native recorder backend is still needed for other platforms.
+Open Hex with a local model loaded and timed transcription streams enabled. Tacit records **one microphone** through Rune into a 16 kHz mono PCM WAV, streams those same samples to Hex locally while recording. Recording currently requires macOS because Rune's native recorder backend is macOS-only. Hex's stream endpoint is cross-platform; a native recorder backend is still needed for other platforms.
 
 1. Click **Listen**. macOS may ask for microphone permission for Tacit or its launching terminal. The recording indicator and timer stay visible.
-2. Click **Stop & transcribe**. The WAV is retained before transcription starts. Hex supplies audio-window segment timestamps; Tacit exports them as WebVTT without inventing word timings.
-3. In Brainstorm mode, the complete transcript becomes a thought, then the stronger OpenRouter review model splits it into coherent ideas and categorizes them using discussion context. Your typed draft stays untouched. **Undo** can restore the unsplit thought; it does not erase historical audio or events.
+2. Speak naturally. Provisional words appear as a live preview. Each finalized speech window becomes a source thought immediately; the fast organizer proposes concise concepts and placement, while contextual splitting and whole-map review refine the map as the discussion continues. Your typed draft stays untouched.
+3. Click **Finish recording** to drain the stream and save the complete transcript and WebVTT. Hex supplies audio-window timestamps, not word timings. Finalization happens at pauses or window boundaries (up to roughly 25 seconds), so concepts do not appear on every spoken word; partial previews depend on the Hex model/device.
 
-**Cancel** or **Escape** discards an active recording. Once stopped, recordings remain part of the session archive, including when transcription fails. **Retry transcript** retries a retained recording without using the microphone. **Reconnect Hex** checks that the local transcription endpoint is available. This integration does not use Hex's dictation audio mirror because that mirror may drop chunks; the WAV owned by Tacit is the authoritative audio.
+In Brainstorm mode, **Escape** finishes and keeps the recording because live concepts may already have been saved. In **Direct the map** mode, speech remains a preview until **Stop & direct**; **Cancel** or **Escape** discards that pending instruction. Finalized speech windows and their source links are durable events, so reconnecting does not duplicate thoughts and replay preserves incremental map changes.
+
+The original WAV is retained even if live transcription fails. Tacit falls back to transcribing saved audio at Stop. If that transcript differs from already committed live windows, Tacit retains the live concepts and archives the complete transcript without blindly duplicating it; a status message identifies the discrepancy. **Retry transcript** retries retained audio without opening the microphone. **Reconnect Hex** checks the endpoint. The WAV owned by Tacit remains authoritative; this integration does not use Hex's potentially lossy dictation audio mirror.
 
 Transcription stays local in Hex. Semantic splitting, classification, and illustration still use OpenRouter when configured. Headless snapshots never open a microphone or automatically call either service. Diagnostic commands:
 
@@ -173,6 +175,7 @@ Rune's headless tools use the same view and input runtime as the desktop app:
 cargo run -- --demo --snap /tmp/tacit.png --size 1280x860
 cargo run -- --demo --snap /tmp/tacit-small.png --size 820x640
 cargo run -- --scene themes --snap /tmp/tacit-themes.png --size 1280x860
+cargo run -- --scene hierarchy --snap /tmp/tacit-hierarchy.png --size 1680x1000
 ```
 
 Headless runs do not read or write your real notebook or contact OpenRouter, Ollama, or Hex. Tests exercise real text entry, selection, reclassification, deletion, undo, storage, locking, organizer validation, and stale-result handling.
@@ -225,10 +228,14 @@ Thoughts now carry a separate `concept` phrase. Cloud organization distills each
 
 The map displays concept phrases. Select a node to see **Concept** followed by **Original words** in the right-hand inspector; narrower windows show both below the map. Full text, WAV recordings, and WebVTT are unchanged. Until a concept is available, a node uses the existing shortened source preview. Offline organization can supply concepts too, but older/local responses without them remain compatible.
 
-Concepts are interpretations, not replacement transcripts. They are validated, saved in session events, and included in replay and other renderers. Splitting a thought invalidates its old concept so each resulting idea can be distilled independently. Branch depth remains unchanged: this adds concise concept nodes within thematic clusters, not nested subbranches.
+Concepts are interpretations, not replacement transcripts. They are validated, saved in session events, and included in replay and other renderers. Splitting a thought invalidates its old concept so each resulting idea can be distilled independently. Themes now support two further classification levels: **theme → subtheme → concept group → thoughts**. The organizer assigns concepts to the most specific useful group and avoids unnecessary nesting. Maps support up to eight root themes and 72 categories across three levels; existing flat maps load unchanged.
 
 Optional live-model validation with synthetic content:
 
 ```sh
 cargo run --example concept_eval
 ```
+
+Nested groups share their root branch color and extend outward through curved branches. Large maps scroll; selecting a thought shows its full classification path and original words. Theme illustrations draw on descendant concepts and remain anchored to root themes, keeping the background legible.
+
+In **Direct the map**, instructions such as “Put Decision owners under Governance” can create or move whole subtrees. Merging groups retains their children. Cycles, unknown parents, and excessive depth are rejected atomically. Pinned thoughts protect their complete ancestor path during automatic review; explicit directions can move them. Parent relationships are saved in ordinary session events and replay through the same reducer.

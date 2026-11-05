@@ -124,6 +124,40 @@ impl Session {
             .and_then(|id| self.categories.iter().find(|c| &c.id == id))
             .map_or(thought.role.label(), |c| c.name.as_str())
     }
+    /// Root-to-leaf path. Traversal is bounded even for unvalidated external input.
+    pub fn category_path(&self, id: Option<&str>) -> Vec<&Category> {
+        let mut path = Vec::new();
+        let mut cursor = id;
+        while let Some(id) = cursor {
+            let Some(c) = self.categories.iter().find(|c| c.id == id) else {
+                break;
+            };
+            if path.len() >= MAX_CATEGORY_DEPTH || path.iter().any(|old: &&Category| old.id == c.id)
+            {
+                break;
+            }
+            path.push(c);
+            cursor = c.parent.as_deref();
+        }
+        path.reverse();
+        path
+    }
+    pub fn within_category(&self, thought: &Thought, category: &str) -> bool {
+        self.category_path(thought.category.as_deref())
+            .iter()
+            .any(|c| c.id == category)
+    }
+    pub fn placement_path(&self, thought: &Thought) -> String {
+        let path = self.category_path(thought.category.as_deref());
+        if path.is_empty() {
+            thought.role.label().into()
+        } else {
+            path.iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" › ")
+        }
+    }
     pub fn narrative(&self) -> String {
         if let Some(i) = &self.interpretation {
             return i.narrative.clone();
@@ -165,23 +199,9 @@ impl Session {
         if self.version != 1 {
             return Err(format!("Unsupported session version {}", self.version));
         }
-        let mut category_ids = std::collections::HashSet::new();
-        if self.categories.len() > 8 {
-            return Err("Too many saved themes".into());
-        }
-        for c in &self.categories {
-            if c.id.is_empty()
-                || c.id.len() > 60
-                || c.name.trim().is_empty()
-                || c.name.chars().count() > 36
-                || c.illustration
-                    .as_ref()
-                    .is_some_and(|s| s.chars().count() > 400)
-                || !category_ids.insert(&c.id)
-            {
-                return Err("Invalid saved theme".into());
-            }
-        }
+        validate_categories(&self.categories)?;
+        let category_ids: std::collections::HashSet<_> =
+            self.categories.iter().map(|c| &c.id).collect();
         if self.thoughts.iter().any(|t| {
             t.category
                 .as_ref()
@@ -238,6 +258,9 @@ pub fn classify(text: &str) -> Role {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Category {
+    /// Parent theme ID; absent in legacy flat maps and for root themes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     #[serde(default)]
     pub illustration: Option<String>,
     #[serde(default)]
@@ -245,6 +268,53 @@ pub struct Category {
     pub id: String,
     pub name: String,
 }
+pub const MAX_CATEGORY_DEPTH: usize = 3;
+pub const MAX_CATEGORIES: usize = 72;
+pub fn validate_categories(categories: &[Category]) -> Result<(), String> {
+    use std::collections::HashSet;
+    if categories.len() > MAX_CATEGORIES
+        || categories.iter().filter(|c| c.parent.is_none()).count() > 8
+    {
+        return Err("Use at most eight root themes and 72 themes in total".into());
+    }
+    let mut ids = HashSet::new();
+    for c in categories {
+        if c.id.is_empty()
+            || c.id.len() > 60
+            || c.name.trim().is_empty()
+            || c.name.chars().count() > 36
+            || !ids.insert(&c.id)
+            || c.illustration
+                .as_ref()
+                .is_some_and(|s| s.chars().count() > 400)
+        {
+            return Err("Invalid or duplicate theme".into());
+        }
+    }
+    for c in categories {
+        let mut seen = HashSet::new();
+        let mut current = Some(c);
+        while let Some(node) = current {
+            if !seen.insert(&node.id) {
+                return Err("Theme hierarchy contains a cycle".into());
+            }
+            if seen.len() > MAX_CATEGORY_DEPTH {
+                return Err("Theme hierarchy supports three classification levels".into());
+            }
+            current = match &node.parent {
+                None => None,
+                Some(id) => Some(
+                    categories
+                        .iter()
+                        .find(|c| &c.id == id)
+                        .ok_or("Unknown parent theme")?,
+                ),
+            };
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Assignment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -278,34 +348,16 @@ impl Interpretation {
         {
             return Err("Organizer returned an invalid title or narrative".into());
         }
-        let mut category_ids = std::collections::HashSet::new();
-        if self.categories.len() > 8 {
-            return Err("Too many themes (maximum eight)".into());
-        }
-        for c in &self.categories {
-            if c.id.is_empty()
-                || c.id.len() > 60
-                || c.name.trim().is_empty()
-                || c.name.chars().count() > 36
-                || c.illustration
-                    .as_ref()
-                    .is_some_and(|s| s.chars().count() > 400)
-                || !category_ids.insert(&c.id)
-            {
-                return Err("Invalid or duplicate theme".into());
-            }
-        }
+        validate_categories(&self.categories)?;
+        let category_ids: std::collections::HashSet<_> =
+            self.categories.iter().map(|c| &c.id).collect();
+        // A pin protects the entire classification path, not just the leaf name.
         for t in session.thoughts.iter().filter(|t| t.pinned) {
-            if let Some(id) = &t.category {
-                let original = session.categories.iter().find(|c| &c.id == id);
-                if self
-                    .categories
-                    .iter()
-                    .find(|c| &c.id == id)
-                    .map(|c| &c.name)
-                    != original.map(|c| &c.name)
-                {
-                    return Err("Review changed a pinned theme".into());
+            for original in session.category_path(t.category.as_deref()) {
+                if !self.categories.iter().any(|c| {
+                    c.id == original.id && c.name == original.name && c.parent == original.parent
+                }) {
+                    return Err("Review changed a pinned theme path".into());
                 }
             }
         }

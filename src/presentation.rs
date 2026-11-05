@@ -32,6 +32,8 @@ pub struct Scene {
     pub direction_draft: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub direction_status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub live_text: String,
     pub draft: String,
     pub selected: Option<u64>,
     pub style: Style,
@@ -63,6 +65,7 @@ impl Default for Scene {
             direction_mode: false,
             direction_draft: String::new(),
             direction_status: String::new(),
+            live_text: String::new(),
             draft: String::new(),
             selected: None,
             style: Style::default(),

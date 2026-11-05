@@ -110,6 +110,7 @@ pub struct State {
     map_viewport: [f32; 2],
     reduced_motion: bool,
     active_recording: Option<String>,
+    live_text: String,
     art: Garden,
     gallery: Gallery,
     art_style: Style,
@@ -400,6 +401,7 @@ impl State {
             map_viewport: [0.0; 2],
             reduced_motion: false,
             active_recording: None,
+            live_text: String::new(),
             art: Garden::default(),
             gallery: Gallery::default(),
             art_style: Style::default(),
@@ -452,6 +454,7 @@ impl State {
         ]
         .into_iter()
         .map(|(id, name)| tacit::model::Category {
+            parent: None,
             motif: None,
             illustration: None,
             id: id.into(),
@@ -469,6 +472,30 @@ impl State {
             thought.category = Some(category.into());
         }
         s.organizer_status = "✦ Whole map refined · your words preserved".into();
+        s.art = Garden::settled(&s.projection.session);
+        s
+    }
+    pub fn hierarchy_demo() -> Self {
+        let mut s = Self::themed_demo();
+        for (id, name, parent) in [
+            ("meetings", "Meeting design", "time"),
+            ("focus", "Protected focus", "meetings"),
+            ("owners", "Decision owners", "decisions"),
+        ] {
+            s.projection
+                .session
+                .categories
+                .push(tacit::model::Category {
+                    id: id.into(),
+                    name: name.into(),
+                    parent: Some(parent.into()),
+                    motif: None,
+                    illustration: None,
+                });
+        }
+        s.projection.session.thoughts[0].category = Some("focus".into());
+        s.projection.session.thoughts[5].category = Some("meetings".into());
+        s.projection.session.thoughts[3].category = Some("owners".into());
         s.art = Garden::settled(&s.projection.session);
         s
     }
@@ -493,6 +520,11 @@ impl State {
         }
     }
     fn voice_command(&mut self, command: VoiceCommand) {
+        let command = if command == VoiceCommand::Cancel && !self.direction_mode {
+            VoiceCommand::Finish
+        } else {
+            command
+        };
         if self.read_only && !matches!(command, VoiceCommand::Finish | VoiceCommand::Cancel) {
             return;
         }
@@ -535,7 +567,42 @@ impl State {
     }
     fn receive_voice(&mut self, event: VoiceEvent, now: f64) {
         match event {
+            VoiceEvent::Partial { id, text } => {
+                if self.active_recording.as_ref() == Some(&id)
+                    && !self
+                        .projection
+                        .transcripts
+                        .iter()
+                        .any(|(key, _, _)| key == &id)
+                {
+                    self.live_text = text;
+                }
+            }
+            VoiceEvent::Segment { id, segment, cue } => {
+                if self.active_recording.as_ref() != Some(&id)
+                    || self.read_only
+                    || self
+                        .projection
+                        .transcripts
+                        .iter()
+                        .any(|(key, _, _)| key == &id)
+                {
+                    return;
+                }
+                if self.projection.direction_recordings.contains(&id) {
+                    self.live_text = cue.text;
+                } else {
+                    self.receive_speech_segment(&id, segment, cue);
+                }
+            }
+            VoiceEvent::LiveStatus { id, message } => {
+                if self.active_recording.as_ref() == Some(&id) {
+                    self.live_text = message.clone();
+                    self.voice_status = message;
+                }
+            }
             VoiceEvent::Started { id, started } => {
+                self.live_text.clear();
                 self.active_recording = Some(id.clone());
                 let start_ms = self.journal.as_ref().map_or(0, |j| {
                     j.now_ms()
@@ -597,6 +664,70 @@ impl State {
                 if self.read_only {
                     return;
                 }
+                if self
+                    .projection
+                    .transcripts
+                    .iter()
+                    .any(|(key, _, _)| key == &id)
+                {
+                    self.voice_state = VoiceState::Ready;
+                    self.active_recording = None;
+                    self.live_text.clear();
+                    return;
+                }
+                if self.projection.speech_segments.contains_key(&id)
+                    && !self.projection.direction_recordings.contains(&id)
+                {
+                    let existing = self.projection.speech_segments.get(&id).unwrap().clone();
+                    let consistent = existing.values().all(|segment| cues.contains(&segment.cue));
+                    if consistent {
+                        for cue in &cues {
+                            if !self
+                                .projection
+                                .speech_segments
+                                .get(&id)
+                                .is_some_and(|s| s.values().any(|old| &old.cue == cue))
+                            {
+                                let next = self
+                                    .projection
+                                    .speech_segments
+                                    .get(&id)
+                                    .and_then(|s| s.keys().max())
+                                    .copied()
+                                    .unwrap_or(0)
+                                    + 1;
+                                self.receive_speech_segment(&id, next, cue.clone());
+                            }
+                        }
+                    }
+                    if self
+                        .dispatch(tacit::timeline::Event::Transcript {
+                            recording: id.clone(),
+                            cues,
+                            text,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if let Some(j) = &self.journal
+                        && let Err(error) = j.export_vtt()
+                    {
+                        self.status = format!("WebVTT export failed: {error}");
+                    }
+                    self.active_recording = None;
+                    self.voice_state = VoiceState::Ready;
+                    self.live_text.clear();
+                    self.voice_status = if consistent {
+                        "Recording saved · live concepts retained".into()
+                    } else {
+                        "Final transcription differs from live windows. Full transcript and audio saved; live concepts retained without duplication.".into()
+                    };
+                    self.save();
+                    return;
+                }
+                self.active_recording = None;
+                self.live_text.clear();
                 let mut events = vec![tacit::timeline::Event::Transcript {
                     recording: id.clone(),
                     cues,
@@ -690,6 +821,7 @@ impl State {
                 }
             }
             VoiceEvent::Cancelled => {
+                self.live_text.clear();
                 if let Some(id) = self.active_recording.take() {
                     self.timeline_event(tacit::timeline::Event::RecordingCancelled { id });
                 }
@@ -705,6 +837,59 @@ impl State {
                 self.voice_status = message;
             }
         }
+    }
+    fn receive_speech_segment(&mut self, recording: &str, segment: u64, cue: tacit::timeline::Cue) {
+        if self.read_only || self.replay.is_some() {
+            return;
+        }
+        if let Some(existing) = self
+            .projection
+            .speech_segments
+            .get(recording)
+            .and_then(|s| s.get(&segment))
+        {
+            if existing.cue != cue {
+                self.voice_status =
+                    "Conflicting live segment ignored; final transcript will be saved".into();
+            }
+            return;
+        }
+        let thought_id = self.projection.session.next_id;
+        let text = cue.text.clone();
+        let events = vec![
+            tacit::timeline::Event::SessionChanged {
+                change: SessionEvent::capture(&self.projection.session, &text),
+            },
+            tacit::timeline::Event::SpeechSegment {
+                recording: recording.into(),
+                segment,
+                cue,
+                thought_id,
+            },
+        ];
+        // Reject malformed/replayed windows without disabling a healthy journal.
+        if self
+            .projection
+            .clone()
+            .apply(&tacit::timeline::Event::Transaction {
+                events: events.clone(),
+            })
+            .is_err()
+        {
+            self.voice_status = "Invalid live segment ignored; audio remains recorded".into();
+            return;
+        }
+        self.checkpoint();
+        if self
+            .dispatch(tacit::timeline::Event::Transaction { events })
+            .is_err()
+        {
+            return;
+        }
+        self.live_text.clear();
+        self.selected = Some(thought_id);
+        self.save();
+        self.schedule_recording_split(thought_id, &text);
     }
     fn toggle_direction(&mut self) {
         if self.replay.is_some() || self.read_only {
@@ -928,6 +1113,7 @@ impl State {
                 direction_mode: self.direction_mode,
                 direction_draft: self.direction_draft.text.clone(),
                 direction_status: self.direction_status.clone(),
+                live_text: self.live_text.clone(),
                 draft: self.draft.text.clone(),
                 selected: self.selected,
                 style: self.art_style,
@@ -962,6 +1148,7 @@ impl State {
     }
     fn restore_scene(&mut self, scene: tacit::timeline::Scene, now: f64) {
         self.session_name = scene.session_title.clone();
+        self.live_text = scene.live_text.clone();
         self.direction_mode = scene.direction_mode;
         self.direction_draft = TextEdit::new(&scene.direction_draft);
         self.direction_status = scene.direction_status.clone();
@@ -1267,7 +1454,7 @@ impl State {
         };
         let pending:Vec<_>=j.entries.iter().enumerate().filter_map(|(index,e)| {
             let tacit::timeline::Event::Transcript{recording,text,..}=&e.event else{return None;};
-            if j.projection.direction_recordings.contains(recording) || text.trim().is_empty() || j.entries.iter().any(|e|matches!(&e.event,tacit::timeline::Event::TranscriptLinked{recording:id,..} if id==recording)){return None;}
+            if j.projection.direction_recordings.contains(recording) || j.projection.speech_segments.contains_key(recording) || text.trim().is_empty() || j.entries.iter().any(|e|matches!(&e.event,tacit::timeline::Event::TranscriptLinked{recording:id,..} if id==recording)){return None;}
             let mut before = tacit::timeline::Projection::default();
             for entry in &j.entries[..index] { before.apply(&entry.event).ok()?; }
             let expected = before.session.next_id;
@@ -1574,13 +1761,71 @@ fn curve(mut shape: Shape, start: [f32; 2], end: [f32; 2], ink: Color, thick: f3
     }
     shape
 }
+struct TreeEntry {
+    id: Option<u64>,
+    words: String,
+    theme: Option<String>,
+    parent: Option<String>,
+    depth: usize,
+}
+fn theme_entries(session: &Session, theme: &str, depth: usize, entries: &mut Vec<TreeEntry>) {
+    for t in session
+        .thoughts
+        .iter()
+        .filter(|t| t.category.as_deref() == Some(theme))
+    {
+        entries.push(TreeEntry {
+            id: Some(t.id),
+            words: t.map_label().into(),
+            theme: None,
+            parent: Some(theme.into()),
+            depth,
+        });
+    }
+    if depth + 1 >= tacit::model::MAX_CATEGORY_DEPTH {
+        return;
+    }
+    for c in session
+        .categories
+        .iter()
+        .filter(|c| c.parent.as_deref() == Some(theme))
+    {
+        entries.push(TreeEntry {
+            id: None,
+            words: c.name.clone(),
+            theme: Some(c.id.clone()),
+            parent: Some(theme.into()),
+            depth: depth + 1,
+        });
+        theme_entries(session, &c.id, depth + 1, entries);
+    }
+}
 fn tree(s: &State, cx: &Cx<State>) -> El {
+    let depth = s
+        .projection
+        .session
+        .categories
+        .iter()
+        .map(|c| {
+            s.projection
+                .session
+                .category_path(Some(&c.id))
+                .len()
+                .saturating_sub(1)
+        })
+        .max()
+        .unwrap_or(0);
+    let indent = depth as f32 * 88.0;
     let width = if s.replay.is_some() && s.map_viewport[0] > 0.0 {
         s.map_viewport[0]
     } else {
         cx.layout_size("map").map_or(920.0, |size| size[0])
     }
-    .max(700.0);
+    .max(if depth > 0 {
+        920.0 + indent * 2.0
+    } else {
+        700.0
+    });
     // Themes carry stable IDs; the original narrative lenses remain the offline fallback.
     let mut groups: Vec<(Option<String>, String, Role)> =
         if s.projection.session.categories.is_empty() {
@@ -1593,6 +1838,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 .session
                 .categories
                 .iter()
+                .filter(|c| c.parent.is_none())
                 .enumerate()
                 .map(|(i, c)| (Some(c.id.clone()), c.name.clone(), Role::ALL[i % 4]))
                 .collect()
@@ -1623,17 +1869,40 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
     } else {
         groups.len() - 1
     };
-    let counts: Vec<usize> = (0..groups.len())
+    let entries: Vec<Vec<TreeEntry>> = (0..groups.len())
         .map(|i| {
-            s.projection
-                .session
-                .thoughts
-                .iter()
-                .filter(|t| matches(t, i))
-                .count()
-                + usize::from(!s.draft.text.trim().is_empty() && i == draft_group)
+            let mut entries = Vec::new();
+            if let Some(theme) = &groups[i].0 {
+                theme_entries(&s.projection.session, theme, 0, &mut entries);
+            } else {
+                entries.extend(
+                    s.projection
+                        .session
+                        .thoughts
+                        .iter()
+                        .filter(|t| matches(t, i))
+                        .map(|t| TreeEntry {
+                            id: Some(t.id),
+                            words: t.map_label().into(),
+                            theme: None,
+                            parent: None,
+                            depth: 0,
+                        }),
+                );
+            }
+            if !s.draft.text.trim().is_empty() && i == draft_group {
+                entries.push(TreeEntry {
+                    id: None,
+                    words: s.draft.text.clone(),
+                    theme: None,
+                    parent: groups[i].0.clone(),
+                    depth: 0,
+                });
+            }
+            entries
         })
         .collect();
+    let counts: Vec<usize> = entries.iter().map(Vec::len).collect();
     let mut offsets = Vec::new();
     let mut height = 0.0f32;
     for pair in counts.chunks(2) {
@@ -1654,16 +1923,20 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         let n = counts[group].max(1);
         let fork_y = first_y + ((n - 1) as f32 * 72.0) / 2.0 + 54.0;
         let fork_x = if left {
-            leaf_w + 55.0
+            leaf_w + 55.0 + indent
         } else {
-            width - leaf_w - 55.0
+            width - leaf_w - 55.0 - indent
         };
         let start = [
             center[0] + if left { -64.0 } else { 64.0 },
             center[1] + if top { -24.0 } else { 24.0 },
         ];
         drawing = curve(drawing, start, [fork_x, fork_y], ink, 9.0);
-        let leaf_x = if left { 12.0 } else { width - leaf_w - 12.0 };
+        let leaf_x = if left {
+            12.0 + indent
+        } else {
+            width - leaf_w - 12.0 - indent
+        };
         let heading_x = if left { leaf_x + 10.0 } else { leaf_x };
         labels.push(
             row()
@@ -1684,16 +1957,10 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                         .max_w(leaf_w - 44.0),
                 ),
         );
-        let mut entries: Vec<(Option<u64>, String)> = s
-            .projection
-            .session
-            .thoughts
-            .iter()
-            .filter(|t| matches(t, group))
-            .map(|t| (Some(t.id), t.map_label().to_owned()))
-            .collect();
-        if !s.draft.text.trim().is_empty() && group == draft_group {
-            entries.push((None, s.draft.text.clone()));
+        let entries = &entries[group];
+        let mut anchors = std::collections::HashMap::new();
+        if let Some(id) = &groups[group].0 {
+            anchors.insert(id.clone(), [fork_x, fork_y]);
         }
         if entries.is_empty() {
             labels.push(
@@ -1717,7 +1984,10 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 2.5,
             );
         }
-        for (index, (id, words)) in entries.into_iter().enumerate() {
+        for (index, entry) in entries.iter().enumerate() {
+            let id = entry.id;
+            let words = &entry.words;
+            let leaf_x = leaf_x + if left { -1.0 } else { 1.0 } * entry.depth as f32 * 88.0;
             let y = first_y + index as f32 * 72.0;
             let end = [
                 if left {
@@ -1727,7 +1997,55 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 },
                 y + 54.0,
             ];
-            drawing = curve(drawing, [fork_x, fork_y], end, ink, 3.5);
+            let parent = entry
+                .parent
+                .as_ref()
+                .and_then(|id| anchors.get(id))
+                .copied()
+                .unwrap_or([fork_x, fork_y]);
+            drawing = curve(
+                drawing,
+                parent,
+                end,
+                ink,
+                if entry.theme.is_some() {
+                    5.0 - entry.depth as f32
+                } else if depth == 0 {
+                    3.5
+                } else {
+                    2.5
+                },
+            );
+            if let Some(theme) = &entry.theme {
+                anchors.insert(theme.clone(), end);
+                drawing = drawing.line(
+                    [leaf_x + 8.0, y + 54.0],
+                    [leaf_x + leaf_w - 8.0, y + 54.0],
+                    2.0,
+                    LineCap::Round,
+                    ink,
+                );
+                labels.push(
+                    col()
+                        .key(format!("theme-heading-{theme}"))
+                        .absolute(leaf_x, y)
+                        .w(leaf_w)
+                        .h(53.0)
+                        .px(8.0)
+                        .gap(2.0)
+                        .child(label(words, 17.0, ink).font(TextStyle::new(17.0, 600.0)))
+                        .child(label(
+                            if entry.depth == 1 {
+                                "SUBTHEME"
+                            } else {
+                                "CONCEPT GROUP"
+                            },
+                            9.0,
+                            ink,
+                        )),
+                );
+                continue;
+            }
             drawing = drawing.line(
                 [leaf_x + 8.0, y + 54.0],
                 [leaf_x + leaf_w - 8.0, y + 54.0],
@@ -1755,7 +2073,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 .focusable(id.is_some())
                 .child(
                     label(
-                        short_label(&words),
+                        short_label(words),
                         14.0,
                         if id.is_some() { INK } else { MUTED },
                     )
@@ -1817,7 +2135,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         .absolute(0.0, 0.0)
         .size(width, height);
     if s.art_style != Style::Off {
-        let size = (width / 2.0 - leaf_w - 94.0).clamp(56.0, 124.0);
+        let size = (width / 2.0 - leaf_w - 94.0 - indent).clamp(56.0, 124.0);
         for layer in &s.art.layers {
             if cx.is_reduced_motion() && layer.retiring() {
                 continue;
@@ -1825,9 +2143,9 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             let slot = layer.concept.slot;
             let left = slot % 2 == 0;
             let x = if left {
-                leaf_w + 25.0
+                leaf_w + 25.0 + indent
             } else {
-                width - leaf_w - 25.0 - size
+                width - leaf_w - 25.0 - size - indent
             };
             let y = offsets.get(slot / 2).copied().unwrap_or(height - 180.0)
                 - if slot < 2 { 20.0 } else { 70.0 };
@@ -1860,16 +2178,16 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         }
     }
     if s.art_style != Style::Off {
-        let size = (width / 2.0 - leaf_w - 94.0).clamp(56.0, 140.0);
+        let size = (width / 2.0 - leaf_w - 94.0 - indent).clamp(56.0, 140.0);
         for layer in &s.gallery.layers {
             if cx.is_reduced_motion() && layer.retired.is_some() {
                 continue;
             }
             let slot = layer.slot;
             let x = if slot % 2 == 0 {
-                leaf_w + 25.0
+                leaf_w + 25.0 + indent
             } else {
-                width - leaf_w - 25.0 - size
+                width - leaf_w - 25.0 - size - indent
             };
             let y = offsets.get(slot / 2).copied().unwrap_or(height - 180.0)
                 - if slot < 2 { 20.0 } else { 70.0 };
@@ -2255,15 +2573,19 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             .fill(PAPER),
         ),
         VoiceState::Recording => voice_controls
-            .child(button("Cancel", "voice-cancel", |s| {
-                s.voice_command(VoiceCommand::Cancel)
-            }))
+            .child(if s.direction_mode {
+                button("Cancel", "voice-cancel", |s| {
+                    s.voice_command(VoiceCommand::Cancel)
+                })
+            } else {
+                el()
+            })
             .child(
                 button(
                     if s.direction_mode {
                         "Stop & direct"
                     } else {
-                        "Stop & transcribe"
+                        "Finish recording"
                     },
                     "voice-stop",
                     |s| s.voice_command(VoiceCommand::Finish),
@@ -2320,6 +2642,23 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
                 )),
         )
         .child(voice_controls)
+        .child(if s.live_text.is_empty() {
+            el()
+        } else {
+            col()
+                .gap(3.0)
+                .child(label(
+                    "LIVE TRANSCRIPT · provisional until the speech segment finishes",
+                    10.0,
+                    MUTED,
+                ))
+                .child(
+                    label(s.live_text.clone(), 14.0, INK)
+                        .key("live-transcript")
+                        .max_h(56.0)
+                        .scroll(ScrollSpec { stick_bottom: true }),
+                )
+        })
         .gap(8.0)
         .padding(14.0)
         .fill(WHITE)
@@ -2527,7 +2866,7 @@ fn inspector(s: &State) -> El {
                     .wrap_anywhere()
                     .selectable(true),
             )
-            .child(label(s.projection.session.placement(t), 12.0, MUTED))
+            .child(label(s.projection.session.placement_path(t), 12.0, MUTED))
             .child(if s.read_only {
                 el()
             } else {
@@ -2552,7 +2891,13 @@ fn inspector(s: &State) -> El {
         .iter()
         .find(|t| Some(t.id) == s.selected)
         .and_then(|t| t.category.as_ref())
-        .map(|id| format!("theme-{id}"));
+        .and_then(|id| {
+            s.projection
+                .session
+                .category_path(Some(id))
+                .first()
+                .map(|c| format!("theme-{}", c.id))
+        });
     if s.art_style != Style::Off
         && let Some(art) = s.gallery.layers.iter().rev().find(|l| {
             l.retired.is_none() && selected_theme.as_ref().is_none_or(|key| &l.key == key)
@@ -2623,7 +2968,7 @@ fn compact_inspector(s: &State) -> El {
                     format!(
                         "Selected {:02} · {}",
                         t.id,
-                        s.projection.session.placement(t)
+                        s.projection.session.placement_path(t)
                     ),
                     11.0,
                     MUTED,
@@ -2719,6 +3064,7 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
     }
     if s.replay.is_none() {
         s.refresh_sessions();
+        s.live_text.clear();
     }
     if s.read_only || rune::is_headless() {
         return;
@@ -3056,7 +3402,6 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         }
     }
     if let Some(reviewer) = &s.reviewer
-        && s.pending_recordings.is_empty()
         && s.review_requested != Some(s.revision)
         && s.fast_finished == Some(s.revision)
         && !s.projection.session.thoughts.is_empty()
@@ -3111,6 +3456,104 @@ mod tests {
         rt.frame(1.0);
     }
     #[test]
+    fn live_speech_is_incremental_idempotent_and_direction_safe() {
+        let mut s = State::empty();
+        let id = "recording-live".to_owned();
+        s.receive_voice(
+            VoiceEvent::Started {
+                id: id.clone(),
+                started: std::time::Instant::now(),
+            },
+            0.0,
+        );
+        s.receive_voice(
+            VoiceEvent::Partial {
+                id: id.clone(),
+                text: "An unfinished".into(),
+            },
+            0.1,
+        );
+        assert!(s.projection.session.thoughts.is_empty());
+        assert_eq!(s.live_text, "An unfinished");
+        let cue = tacit::timeline::Cue {
+            start_ms: 0,
+            end_ms: 2000,
+            text: "An idea about gardens.".into(),
+        };
+        s.receive_voice(
+            VoiceEvent::Segment {
+                id: id.clone(),
+                segment: 0,
+                cue: cue.clone(),
+            },
+            2.0,
+        );
+        assert_eq!(s.projection.session.thoughts.len(), 1);
+        assert!(s.live_text.is_empty());
+        let snapshot = serde_json::to_value(&s.projection.session).unwrap();
+        s.receive_voice(
+            VoiceEvent::Segment {
+                id: id.clone(),
+                segment: 0,
+                cue: cue.clone(),
+            },
+            2.1,
+        );
+        assert_eq!(
+            serde_json::to_value(&s.projection.session).unwrap(),
+            snapshot
+        );
+        // Provenance survives removal, so reconnection cannot resurrect the source.
+        s.projection.session.thoughts.clear();
+        s.receive_voice(
+            VoiceEvent::Segment {
+                id,
+                segment: 0,
+                cue: cue.clone(),
+            },
+            2.2,
+        );
+        assert!(s.projection.session.thoughts.is_empty());
+        s.direction_mode = true;
+        s.receive_voice(
+            VoiceEvent::Started {
+                id: "recording-direct".into(),
+                started: std::time::Instant::now(),
+            },
+            3.0,
+        );
+        s.receive_voice(
+            VoiceEvent::Segment {
+                id: "recording-direct".into(),
+                segment: 0,
+                cue,
+            },
+            4.0,
+        );
+        assert!(s.projection.session.thoughts.is_empty());
+        assert!(!s.directing);
+    }
+
+    #[test]
+    fn nested_groups_render_once_and_keep_their_parent_order() {
+        for size in [(1680.0, 1000.0), (820.0, 640.0)] {
+            let mut rt = runtime(size);
+            rt.state = State::hierarchy_demo();
+            rt.frame(1.0);
+            let root = rt.find("theme-heading-time").unwrap();
+            let sub = rt.find("theme-heading-meetings").unwrap();
+            let group = rt.find("theme-heading-focus").unwrap();
+            assert!(root.0 > sub.0 && sub.0 > group.0);
+            assert!(root.1 < sub.1 && sub.1 < group.1);
+            let mut entries = Vec::new();
+            theme_entries(&rt.state.projection.session, "time", 0, &mut entries);
+            assert_eq!(entries.iter().filter(|e| e.id == Some(1)).count(), 1);
+            assert_eq!(entries.iter().find(|e| e.id == Some(1)).unwrap().depth, 2);
+            assert!(rt.find("thought-1").is_some());
+        }
+    }
+
+    #[test]
     fn selected_concept_and_original_are_available_in_both_layouts() {
         for size in [(1280.0, 860.0), (820.0, 640.0)] {
             let mut rt = runtime(size);
@@ -3141,6 +3584,43 @@ mod tests {
         s.toggle_direction();
         assert!(s.direction_mode);
     }
+    #[test]
+    fn final_transcript_only_adds_missing_live_windows() {
+        let mut s = State::empty();
+        s.active_recording = Some("live".into());
+        s.projection.audio.push(tacit::timeline::Audio {
+            id: "live".into(),
+            asset: "audio.wav".into(),
+            start_ms: 0,
+            duration_ms: 2000,
+            sample_rate: 16000,
+            samples: 32000,
+        });
+        let first = tacit::timeline::Cue {
+            start_ms: 0,
+            end_ms: 1000,
+            text: "Plant gardens.".into(),
+        };
+        let second = tacit::timeline::Cue {
+            start_ms: 1000,
+            end_ms: 2000,
+            text: "Fund libraries.".into(),
+        };
+        s.receive_speech_segment("live", 0, first.clone());
+        let finish = || VoiceEvent::TimedTranscript {
+            id: "live".into(),
+            text: "Plant gardens. Fund libraries.".into(),
+            cues: vec![first.clone(), second.clone()],
+        };
+        s.receive_voice(finish(), 2.0);
+        assert_eq!(s.projection.session.thoughts.len(), 2);
+        assert_eq!(s.projection.transcripts.len(), 1);
+        assert_eq!(s.projection.speech_segments["live"].len(), 2);
+        s.receive_voice(finish(), 2.1);
+        assert_eq!(s.projection.session.thoughts.len(), 2);
+        assert_eq!(s.projection.transcripts.len(), 1);
+    }
+
     #[test]
     fn recorded_direction_intent_survives_mode_changes_and_is_not_transcript_linked() {
         let mut s = State::empty();
@@ -3623,6 +4103,10 @@ mod tests {
         let _ = commands.try_recv();
         events.send(VoiceEvent::Recording).unwrap();
         rt.frame(0.0);
+        rt.state.voice_command(VoiceCommand::Cancel);
+        assert_eq!(commands.try_recv().unwrap(), VoiceCommand::Finish);
+        rt.state.voice_state = VoiceState::Recording;
+        rt.state.direction_mode = true;
         click(&mut rt, "voice-cancel");
         assert_eq!(commands.try_recv().unwrap(), VoiceCommand::Cancel);
         events.send(VoiceEvent::Cancelled).unwrap();

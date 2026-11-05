@@ -34,7 +34,7 @@ fn main() -> Result<(), String> {
         }
         let mut s = Session::default();
         s.add("Our hosting costs doubled."); s.add("Who owns release decisions?");
-        s.categories = vec![Category {id:"costs".into(),name:"Costs".into(),motif:None,illustration:None},Category {id:"decisions".into(),name:"Decisions".into(),motif:None,illustration:None}];
+        s.categories = vec![Category { parent: None,id:"costs".into(),name:"Costs".into(),motif:None,illustration:None},Category { parent: None,id:"decisions".into(),name:"Decisions".into(),motif:None,illustration:None}];
         s.thoughts[0].category = Some("costs".into()); s.thoughts[1].category = Some("decisions".into());
         let instruction = "Rename Costs to Infrastructure costs and put Decisions before it. Keep all thoughts in their current branches.";
         let p = direction::plan(&config,&s,instruction).await?;

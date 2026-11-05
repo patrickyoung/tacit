@@ -61,12 +61,13 @@ pub fn concepts(session: &Session) -> Vec<Concept> {
         session
             .categories
             .iter()
+            .filter(|c| c.parent.is_none())
             .enumerate()
             .filter_map(|(slot, c)| {
                 let words = session
                     .thoughts
                     .iter()
-                    .filter(|t| t.category.as_ref() == Some(&c.id))
+                    .filter(|t| session.within_category(t, &c.id))
                     .map(|t| t.text.as_str())
                     .collect::<Vec<_>>()
                     .join(" ");

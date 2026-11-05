@@ -22,8 +22,8 @@ pub fn briefs(session: &Session, style: Style, model: &str) -> Vec<Brief> {
     if style == Style::Off {
         return vec![];
     }
-    session.categories.iter().enumerate().filter_map(|(slot,c)| {
-        let thoughts=session.thoughts.iter().filter(|t|t.category.as_ref()==Some(&c.id)).take(3).map(|t|t.text.chars().take(240).collect::<String>()).collect::<Vec<_>>();
+    session.categories.iter().filter(|c| c.parent.is_none()).enumerate().filter_map(|(slot,c)| {
+        let thoughts=session.thoughts.iter().filter(|t|session.within_category(t, &c.id)).take(3).map(|t|t.text.chars().take(240).collect::<String>()).collect::<Vec<_>>();
         if thoughts.is_empty(){return None;}
         let subject=c.illustration.clone().filter(|s|!s.trim().is_empty()).unwrap_or_else(||format!("{}: {}",c.name,thoughts.join("; ")));
         let medium=match style {Style::Pastel=>"Soft wax pastel and colored-pencil editorial illustration; dusty pigment, layered translucent strokes, expressive hand-drawn contours",Style::Chalk=>"Colorful chalk and dry pastel illustration on a transparent ground; broken powdery contours and tactile grain",Style::Marker=>"Bold hand-drawn marker illustration; expressive variable-width ink strokes, rich flat accents and playful confident shapes",Style::Off=>unreachable!()};
@@ -459,6 +459,7 @@ mod tests {
     fn session() -> Session {
         let mut s = Session::demo();
         s.categories = vec![crate::model::Category {
+            parent: None,
             id: "time".into(),
             name: "Time".into(),
             motif: None,

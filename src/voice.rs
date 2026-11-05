@@ -1,4 +1,5 @@
-//! Own the audio file first; Hex transcribes those exact samples locally.
+//! Own the audio file; stream those same samples to Hex while recording.
+mod live;
 use crate::timeline::{self, Cue};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -31,6 +32,19 @@ impl Recording {
 }
 #[derive(Debug)]
 pub enum Event {
+    Partial {
+        id: String,
+        text: String,
+    },
+    Segment {
+        id: String,
+        segment: u64,
+        cue: Cue,
+    },
+    LiveStatus {
+        id: String,
+        message: String,
+    },
     Ready,
     Recording,
     Started {
@@ -52,11 +66,13 @@ pub struct Worker {
     pub receive: Receiver<Event>,
 }
 impl Worker {
-    pub fn start(root: PathBuf, wake: impl Fn() + Send + 'static) -> Self {
+    pub fn start(root: PathBuf, wake: impl Fn() + Send + Sync + 'static) -> Self {
+        let wake: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(wake);
         let (send, commands) = mpsc::channel();
         let (events, receive) = mpsc::channel();
         std::thread::spawn(move || {
             let mut recorder: Option<(rune::Recorder, String)> = None;
+            let mut live: Option<live::Live> = None;
             let mut announced = false;
             let mut started = std::time::Instant::now();
             loop {
@@ -73,11 +89,20 @@ impl Worker {
                                 started,
                             });
                             let _ = events.send(Event::Recording);
+                            live = Some(live::Live::start(
+                                root.join(format!("{id}.wav")),
+                                id.clone(),
+                                events.clone(),
+                                wake.clone(),
+                            ));
                             wake();
                         }
                         rune::RecorderState::Failed(message) => {
                             let _ = events.send(Event::Error(message));
                             recorder = None;
+                            if let Some(stream) = live.take() {
+                                stream.cancel();
+                            }
                             wake();
                         }
                         rune::RecorderState::Interrupted(_) => {
@@ -134,10 +159,17 @@ impl Worker {
                             };
                             let _ = events.send(Event::AudioSaved(recording));
                             wake();
-                            let (text, cues) = Client::discover()?.transcribe(&saved.path)?;
+                            let result = live.take().map(|stream| stream.finish(samples));
+                            let (text, cues) = match result {
+                                Some(Ok(transcript)) => transcript,
+                                _ => Client::discover()?.transcribe(&saved.path)?,
+                            };
                             let _ = events.send(Event::TimedTranscript { id, text, cues });
                         }
                         Command::Cancel => {
+                            if let Some(stream) = live.take() {
+                                stream.cancel();
+                            }
                             if let Some((rec, _)) = recorder.take() {
                                 rec.cancel();
                             }
@@ -172,6 +204,7 @@ struct Discovery {
     #[serde(rename = "apiVersion")]
     api_version: String,
 }
+#[derive(Clone)]
 struct Client {
     base: String,
     token: String,
@@ -223,7 +256,7 @@ impl Client {
         body: Option<Value>,
         owner: Option<&str>,
     ) -> Result<Value, String> {
-        let agent = agent(125);
+        let agent = agent(if path.ends_with("/finish") { 125 } else { 5 });
         let url = format!("{}{path}", self.base);
         let auth = format!("Bearer {}", self.token);
         let response = if let Some(body) = body {

@@ -67,7 +67,7 @@ fn main() {
                 .block_on(config.organize(&session, false))?
                 .apply(&mut session)?;
             for thought in session.thoughts.iter().skip(6) {
-                println!("{}: {}", session.placement(thought), thought.text);
+                println!("{}: {}", session.placement_path(thought), thought.text);
             }
             Ok(())
         })();
@@ -144,6 +144,7 @@ fn main() {
             scenes: &[
                 ("demo", |s| *s = ui::State::demo()),
                 ("themes", |s| *s = ui::State::themed_demo()),
+                ("hierarchy", |s| *s = ui::State::hierarchy_demo()),
                 ("art-draw", |s| *s = ui::State::art_demo()),
                 ("generated", |s| *s = ui::State::generated_demo()),
             ],
