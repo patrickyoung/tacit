@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEvent {
+    Unpinned {
+        id: u64,
+    },
     Directed {
         instruction: String,
         edits: Vec<crate::direction::Edit>,
@@ -40,6 +43,14 @@ impl SessionEvent {
     pub fn reduce(&self, current: &Session) -> Result<Session, String> {
         let mut next = current.clone();
         match self {
+            Self::Unpinned { id } => {
+                next.thoughts
+                    .iter_mut()
+                    .find(|t| t.id == *id)
+                    .ok_or("Unknown thought")?
+                    .pinned = false;
+                next.interpretation = None;
+            }
             Self::Directed { instruction, edits } => {
                 next = crate::direction::apply(current, instruction, edits)?
             }
@@ -77,7 +88,12 @@ impl SessionEvent {
                 let index = next
                     .thoughts
                     .iter()
-                    .position(|t| t.id == *source_id && t.text == *original && !t.pinned)
+                    .position(|t| {
+                        t.id == *source_id
+                            && t.text == *original
+                            && !t.pinned
+                            && t.evidence.is_empty()
+                    })
                     .ok_or("Split source has changed")?;
                 if chunks.is_empty()
                     || chunks.iter().any(|c| c.trim().is_empty())
@@ -109,6 +125,7 @@ impl SessionEvent {
     pub fn capture(session: &Session, text: &str) -> Self {
         Self::Captured {
             thought: Thought {
+                evidence: vec![],
                 concept: None,
                 id: session.next_id,
                 text: text.trim().into(),

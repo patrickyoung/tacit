@@ -38,7 +38,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     for art in content.artwork {
-        println!("Illustration for {}: {}", art.theme, art.asset);
+        if art.scope == tacit::timeline::ArtworkScope::Map {
+            println!("Whole-map illustration: {}", art.asset);
+        } else {
+            println!("Illustration for {}: {}", art.theme, art.asset);
+        }
     }
     for audio in content.audio {
         println!(

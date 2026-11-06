@@ -39,6 +39,10 @@ pub struct Audio {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    MapRevised {
+        fingerprint: String,
+        plan: crate::evolution::Plan,
+    },
     SpeechSegment {
         recording: String,
         segment: u64,
@@ -141,9 +145,23 @@ pub struct Entry {
     pub event: Event,
     pub hash: String,
 }
-/// Content-addressed illustration associated with a semantic theme, not a screen position.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtworkScope {
+    #[default]
+    Theme,
+    Map,
+}
+impl ArtworkScope {
+    fn is_theme(&self) -> bool {
+        *self == Self::Theme
+    }
+}
+/// Content-addressed illustration with renderer-independent semantic scope.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionArtwork {
+    #[serde(default, skip_serializing_if = "ArtworkScope::is_theme")]
+    pub scope: ArtworkScope,
     pub theme: String,
     pub fingerprint: String,
     pub asset: String,
@@ -168,6 +186,7 @@ pub struct SpeechSegment {
 /// Renderer-independent, serializable view. Presentation tracks are intentionally excluded.
 #[derive(Serialize)]
 pub struct SessionView<'a> {
+    pub sources: crate::evolution::Sources,
     pub session: &'a Session,
     pub artwork: &'a [SessionArtwork],
     pub audio: &'a [Audio],
@@ -180,6 +199,7 @@ pub struct SessionView<'a> {
 }
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Projection {
+    pub source_words: crate::evolution::Sources,
     pub session: Session,
     pub artwork: Vec<SessionArtwork>,
     pub presentations: std::collections::BTreeMap<String, Presentation>,
@@ -198,6 +218,7 @@ pub struct Projection {
 impl Projection {
     pub fn content(&self) -> SessionView<'_> {
         SessionView {
+            sources: self.evidence(),
             session: &self.session,
             artwork: &self.artwork,
             audio: &self.audio,
@@ -213,8 +234,49 @@ impl Projection {
             self.artwork.push(artwork);
         }
     }
+    pub fn evidence(&self) -> crate::evolution::Sources {
+        let mut sources = self.session.sources.clone();
+        sources.extend(self.source_words.clone());
+        for t in self
+            .session
+            .thoughts
+            .iter()
+            .chain(self.session.retired.iter().map(|r| &r.thought))
+        {
+            if t.evidence.is_empty() {
+                sources
+                    .entry(format!("thought-{}", t.id))
+                    .or_insert_with(|| t.text.clone());
+            }
+        }
+        for (id, _, text) in &self.transcripts {
+            if !self.direction_recordings.contains(id) {
+                sources.insert(format!("transcript-{id}"), text.clone());
+            }
+        }
+        sources
+    }
+    fn remember_sources(&mut self) {
+        for t in &self.session.thoughts {
+            if t.evidence.is_empty() {
+                self.source_words
+                    .entry(format!("thought-{}", t.id))
+                    .or_insert_with(|| t.text.clone());
+            }
+        }
+    }
     pub fn apply(&mut self, event: &Event) -> io::Result<()> {
         match event {
+            Event::MapRevised { fingerprint, plan } => {
+                if content_hash(&self.session)? != *fingerprint {
+                    return Err(io::Error::other("Map changed during editorial review"));
+                }
+                let next = plan
+                    .apply(&self.session, &self.evidence())
+                    .map_err(io::Error::other)?;
+                self.remember_sources();
+                self.session = next;
+            }
             Event::SpeechSegment {
                 recording,
                 segment,
@@ -306,9 +368,16 @@ impl Projection {
                 for art in &scene.artwork {
                     safe_asset(&art.asset)?;
                 }
+                self.remember_sources();
                 self.session = scene.session.clone();
+                self.remember_sources();
                 for art in &scene.artwork {
                     self.retain_artwork(SessionArtwork {
+                        scope: if art.key == crate::generated_art::CENTRAL_KEY {
+                            ArtworkScope::Map
+                        } else {
+                            ArtworkScope::Theme
+                        },
                         theme: art.key.strip_prefix("theme-").unwrap_or(&art.key).into(),
                         fingerprint: art.fingerprint.clone(),
                         asset: art.asset.clone(),
@@ -351,7 +420,9 @@ impl Projection {
                             .collect(),
                     });
                 }
+                self.remember_sources();
                 self.session = next;
+                self.remember_sources();
             }
             Event::TranscriptLinked {
                 recording,

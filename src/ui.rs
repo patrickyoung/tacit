@@ -129,7 +129,7 @@ pub struct State {
     read_only: bool,
     story: bool,
     worker: Option<tacit::organizer::Worker>,
-    reviewer: Option<tacit::organizer::Worker>,
+    reviewer: Option<tacit::evolution::Worker>,
     review_requested: Option<u64>,
     review_applied: Option<u64>,
     fast_finished: Option<u64>,
@@ -718,6 +718,9 @@ impl State {
                     self.active_recording = None;
                     self.voice_state = VoiceState::Ready;
                     self.live_text.clear();
+                    // The complete transcript is new editorial context even when every
+                    // live window was already mapped. Invalidate an in-flight review.
+                    self.revision += 1;
                     self.voice_status = if consistent {
                         "Recording saved · live concepts retained".into()
                     } else {
@@ -1571,6 +1574,21 @@ impl State {
             self.save();
         }
     }
+    fn unpin_selected(&mut self) {
+        if self.read_only {
+            return;
+        }
+        if let Some(id) = self.selected {
+            self.checkpoint();
+            if self
+                .dispatch_session(SessionEvent::Unpinned { id })
+                .is_err()
+            {
+                return;
+            }
+            self.save();
+        }
+    }
     fn remove_selected(&mut self) {
         if self.read_only {
             return;
@@ -2129,6 +2147,33 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
     drawing = drawing
         .fill_path(&cloud, WHITE)
         .stroke_path(&cloud, 2.5, LineCap::Round, GOLD);
+    let synthesis_size = (width - 2.0 * (leaf_w + indent + 26.0)).clamp(250.0, 420.0);
+    let synthesis_coverage = if cx.is_reduced_motion() {
+        if s.gallery
+            .layers
+            .iter()
+            .any(|l| l.key == generated_art::CENTRAL_KEY && l.retired.is_none())
+        {
+            1.0
+        } else {
+            0.0
+        }
+    } else {
+        s.gallery.coverage(generated_art::CENTRAL_KEY)
+    };
+    // Let the synthesis take visual priority where the inner theme margins overlap it.
+    let theme_visibility = |x: f32, y: f32, size: f32| {
+        let half = synthesis_size / 2.0;
+        if x < center[0] + half
+            && x + size > center[0] - half
+            && y < center[1] + half
+            && y + size > center[1] - half
+        {
+            1.0 - 0.85 * synthesis_coverage
+        } else {
+            1.0
+        }
+    };
     let mut sheet = el().key("tree-sheet").w(width).h(height);
     let mut art_layer = el()
         .key("background-art")
@@ -2173,7 +2218,11 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 .key(format!("theme-art-{}", layer.serial))
                 .absolute(x, y)
                 .size(size, size)
-                .opacity(opacity * (1.0 - s.gallery.coverage(&layer.concept.key))),
+                .opacity(
+                    opacity
+                        * (1.0 - s.gallery.coverage(&layer.concept.key))
+                        * theme_visibility(x, y, size),
+                ),
             );
         }
     }
@@ -2191,6 +2240,13 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             };
             let y = offsets.get(slot / 2).copied().unwrap_or(height - 180.0)
                 - if slot < 2 { 20.0 } else { 70.0 };
+            let central = layer.key == generated_art::CENTRAL_KEY;
+            let size = if central { synthesis_size } else { size };
+            let (x, y) = if central {
+                (center[0] - size / 2.0, center[1] - size / 2.0)
+            } else {
+                (x, y)
+            };
             let progress = if cx.is_reduced_motion() {
                 1.0
             } else {
@@ -2205,7 +2261,14 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 .key(format!("generated-{}-{}", layer.key, layer.fingerprint))
                 .absolute(x, y)
                 .size(size, size)
-                .opacity(opacity * progress.min(0.4) / 0.4)
+                .opacity(
+                    opacity * progress.min(0.4) / 0.4
+                        * if central {
+                            0.82
+                        } else {
+                            theme_visibility(x, y, size)
+                        },
+                )
                 .child(
                     el().absolute(0.0, 0.0)
                         .size(size, size * progress)
@@ -2229,6 +2292,20 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 0.35 + 0.65 * s.settling
             }),
     );
+    if synthesis_coverage > 0.0 && s.art_style != Style::Off {
+        // Keep the title legible even while branch transitions fade their canvas.
+        sheet = sheet.child(
+            canvas(Shape::new().fill_path(&cloud, WHITE).stroke_path(
+                &cloud,
+                2.5,
+                LineCap::Round,
+                GOLD,
+            ))
+            .key("synthesis-title-mask")
+            .absolute(0.0, 0.0)
+            .size(width, height),
+        );
+    }
     for node in labels {
         sheet = sheet.child(node);
     }
@@ -2842,6 +2919,7 @@ fn inspector(s: &State) -> El {
         .session
         .thoughts
         .iter()
+        .chain(s.projection.session.retired.iter().map(|r| &r.thought))
         .find(|t| Some(t.id) == s.selected)
     {
         panel = panel
@@ -2867,16 +2945,32 @@ fn inspector(s: &State) -> El {
                     .selectable(true),
             )
             .child(label(s.projection.session.placement_path(t), 12.0, MUTED))
-            .child(if s.read_only {
-                el()
-            } else {
-                button("Move to next branch", "move", State::move_selected)
-            })
-            .child(if s.read_only {
-                el()
-            } else {
-                button("Remove thought", "remove", State::remove_selected)
-            });
+            .child(
+                if s.read_only
+                    || s.projection
+                        .session
+                        .retired
+                        .iter()
+                        .any(|r| r.thought.id == t.id)
+                {
+                    el()
+                } else {
+                    button("Move to next branch", "move", State::move_selected)
+                },
+            )
+            .child(
+                if s.read_only
+                    || s.projection
+                        .session
+                        .retired
+                        .iter()
+                        .any(|r| r.thought.id == t.id)
+                {
+                    el()
+                } else {
+                    button("Remove thought", "remove", State::remove_selected)
+                },
+            );
     } else {
         panel = panel.child(label(
             "Select a thought to inspect its original words or change where it belongs.",
@@ -2884,11 +2978,54 @@ fn inspector(s: &State) -> El {
             MUTED,
         ));
     }
+    if let Some(retired) = s
+        .projection
+        .session
+        .retired
+        .iter()
+        .find(|r| Some(r.thought.id) == s.selected)
+    {
+        panel = panel
+            .child(label("PRIOR CONCEPT", 10.0, MUTED))
+            .child(label(retired.reason.clone(), 14.0, INK));
+        for id in &retired.replaced_by {
+            let id = *id;
+            panel = panel.child(button(
+                &format!("Follow replacement {id}"),
+                &format!("replacement-{id}"),
+                move |s| s.selected = Some(id),
+            ));
+        }
+    } else if !s.read_only
+        && s.projection
+            .session
+            .thoughts
+            .iter()
+            .any(|t| Some(t.id) == s.selected && t.pinned)
+    {
+        panel = panel.child(button("Allow AI to revise", "unpin", State::unpin_selected));
+    }
+    if !s.projection.session.retired.is_empty() {
+        panel = panel.child(label("HOW THE MAP EVOLVED", 10.0, MUTED));
+        for retired in s.projection.session.retired.iter().rev() {
+            let id = retired.thought.id;
+            panel = panel.child(button(
+                &retired
+                    .thought
+                    .concept
+                    .clone()
+                    .unwrap_or_else(|| format!("Prior thought {id}")),
+                &format!("retired-{id}"),
+                move |s| s.selected = Some(id),
+            ));
+        }
+    }
     let selected_theme = s
         .projection
         .session
         .thoughts
         .iter()
+        .chain(s.projection.session.retired.iter().map(|r| &r.thought))
         .find(|t| Some(t.id) == s.selected)
         .and_then(|t| t.category.as_ref())
         .and_then(|id| {
@@ -2954,12 +3091,27 @@ fn inspector(s: &State) -> El {
         })
 }
 fn compact_inspector(s: &State) -> El {
+    if s.projection
+        .session
+        .retired
+        .iter()
+        .any(|r| Some(r.thought.id) == s.selected)
+    {
+        return inspector(s).max_h(240.0);
+    }
     let mut r = row().gap(10.0).center_y();
+    if let Some(retired) = s.projection.session.retired.last() {
+        let id = retired.thought.id;
+        r = r.child(button("Prior concepts", "concept-history", move |s| {
+            s.selected = Some(id)
+        }));
+    }
     if let Some(t) = s
         .projection
         .session
         .thoughts
         .iter()
+        .chain(s.projection.session.retired.iter().map(|r| &r.thought))
         .find(|t| Some(t.id) == s.selected)
     {
         r = r
@@ -2989,6 +3141,7 @@ fn compact_inspector(s: &State) -> El {
         .session
         .thoughts
         .iter()
+        .chain(s.projection.session.retired.iter().map(|r| &r.thought))
         .find(|t| Some(t.id) == s.selected)
     {
         col()
@@ -3096,6 +3249,11 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
                     s.gallery.model.clone(),
                     wake.clone(),
                 ));
+                s.gallery.central_worker = Some(generated_art::Worker::start(
+                    config.clone(),
+                    s.gallery.model.clone(),
+                    wake.clone(),
+                ));
                 s.gallery.status = "Art · ready to illustrate themes".into();
             }
             let recording_wake = wake.clone();
@@ -3108,7 +3266,7 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
             }));
             let fast_wake = wake.clone();
             s.worker = Some(config.start(false, move || fast_wake()));
-            s.reviewer = Some(config.start(true, move || wake()));
+            s.reviewer = Some(tacit::evolution::Worker::start(config, move || wake()));
             return;
         }
         Err(error) => {
@@ -3333,20 +3491,36 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     while let Some(response) = s.reviewer.as_ref().and_then(|w| w.receive.try_recv().ok()) {
         if response.revision == s.revision {
             s.busy = false;
-            match response.result.and_then(|interpretation| {
-                s.dispatch_session(SessionEvent::Organized {
-                    interpretation,
-                    pass: "review".into(),
-                })
+            match response.result.and_then(|plan| {
+                let explanation = plan.explanation.clone();
+                let event = tacit::timeline::Event::MapRevised {
+                    fingerprint: response.fingerprint,
+                    plan,
+                };
+                s.projection
+                    .clone()
+                    .apply(&event)
+                    .map_err(|e| e.to_string())?;
+                s.checkpoint();
+                s.dispatch(event)?;
+                Ok(explanation)
             }) {
-                Ok(()) => {
+                Ok(explanation) => {
                     s.review_applied = Some(s.revision);
-                    s.organizer_status = "✦ Whole map refined · your words preserved".into();
+                    s.requested = Some(s.revision);
+                    s.review_requested = Some(s.revision);
+                    if s.selected
+                        .is_some_and(|id| !s.projection.session.thoughts.iter().any(|t| t.id == id))
+                    {
+                        // Keep the selected retired item inspectable, with its replacement links.
+                        s.revealed_selection = s.selected;
+                    }
+                    s.organizer_status = format!("✦ {explanation}");
                     s.settled_at = now;
                     s.settling = 0.0;
                     s.save();
                 }
-                Err(e) => s.organizer_status = format!("Review: {e} · keeping quick themes"),
+                Err(e) => s.organizer_status = format!("Review: {e} · current map retained"),
             }
             changed = true;
         }
@@ -3407,9 +3581,10 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         && !s.projection.session.thoughts.is_empty()
     {
         if now >= s.review_due {
-            let request = tacit::organizer::Request {
+            let request = tacit::evolution::Request {
                 revision: s.revision,
                 session: s.projection.session.clone(),
+                sources: s.projection.evidence(),
             };
             if reviewer.send.send(request).is_ok() {
                 s.organizer_status = "✦ Stepping back · refining the whole map…".into();
@@ -3532,6 +3707,31 @@ mod tests {
         );
         assert!(s.projection.session.thoughts.is_empty());
         assert!(!s.directing);
+    }
+
+    #[test]
+    fn synthesis_art_is_centered_behind_the_title_at_both_window_sizes() {
+        for size in [(1680.0, 1000.0), (820.0, 640.0)] {
+            let mut rt = runtime(size);
+            rt.state = State::hierarchy_demo();
+            let image = rt.state.image_cache.rgba(1, 1, vec![100, 160, 200, 255]);
+            image.wait().unwrap();
+            rt.state.gallery.layers.push(generated_art::Layer {
+                encoded: None,
+                key: generated_art::CENTRAL_KEY.into(),
+                fingerprint: "fixture".into(),
+                slot: 0,
+                image,
+                born: -10.0,
+                retired: None,
+            });
+            rt.frame(1.0);
+            let art = rt.find("generated-map-synthesis-fixture").unwrap();
+            let title = rt.find("central-idea").unwrap();
+            assert!((art.0 - title.0).abs() < 1.0);
+            assert!((art.1 - title.1).abs() < 1.0);
+            assert!(rt.find("thought-1").is_some());
+        }
     }
 
     #[test]
@@ -3765,40 +3965,51 @@ mod tests {
     #[test]
     fn regenerated_art_with_the_same_prompt_retains_each_actual_image() {
         use base64::Engine as _;
-        let dir = tempfile::tempdir().unwrap();
-        let mut state = State::empty();
-        state.journal = Some(
-            tacit::timeline::Journal::open(&dir.path().join("session.json"), Session::default())
+        for key in ["theme-one", generated_art::CENTRAL_KEY] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = State::empty();
+            state.journal = Some(
+                tacit::timeline::Journal::open(
+                    &dir.path().join("session.json"),
+                    Session::default(),
+                )
                 .unwrap(),
-        );
-        let mut assets = Vec::new();
-        for encoded in [
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg==",
-        ] {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .unwrap();
-            let image = state.image_cache.load(bytes.clone());
-            image.wait().unwrap();
-            state.gallery.layers = vec![generated_art::Layer {
-                key: "theme-one".into(),
-                fingerprint: "same-prompt".into(),
-                slot: 0,
-                image,
-                encoded: Some(bytes.clone()),
-                born: 0.0,
-                retired: None,
-            }];
-            state.record_presentation("art arrived");
-            assert!(!state.read_only);
-            let j = state.journal.as_ref().unwrap();
-            let asset = j.projection.scene().artwork[0].asset.clone();
-            assert_eq!(std::fs::read(j.asset(&asset).unwrap()).unwrap(), bytes);
-            assets.push(asset);
+            );
+            let mut assets = Vec::new();
+            for encoded in [
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwADAgH/5ncLrgAAAABJRU5ErkJggg==",
+            ] {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap();
+                let image = state.image_cache.load(bytes.clone());
+                image.wait().unwrap();
+                state.gallery.layers = vec![generated_art::Layer {
+                    key: key.into(),
+                    fingerprint: "same-prompt".into(),
+                    slot: 0,
+                    image,
+                    encoded: Some(bytes.clone()),
+                    born: 0.0,
+                    retired: None,
+                }];
+                state.record_presentation("art arrived");
+                assert!(!state.read_only);
+                let j = state.journal.as_ref().unwrap();
+                assert_eq!(j.projection.scene().artwork[0].key, key);
+                assert_eq!(
+                    j.projection.artwork.last().unwrap().scope
+                        == tacit::timeline::ArtworkScope::Map,
+                    key == generated_art::CENTRAL_KEY
+                );
+                let asset = j.projection.scene().artwork[0].asset.clone();
+                assert_eq!(std::fs::read(j.asset(&asset).unwrap()).unwrap(), bytes);
+                assets.push(asset);
+            }
+            assert_ne!(assets[0], assets[1]);
+            state.journal.as_ref().unwrap().validate_assets().unwrap();
         }
-        assert_ne!(assets[0], assets[1]);
-        state.journal.as_ref().unwrap().validate_assets().unwrap();
     }
     #[test]
     fn replay_uses_saved_projection_and_cannot_edit_live_history() {
@@ -3931,7 +4142,7 @@ mod tests {
             send: fast_send,
             receive: fast_receive,
         });
-        s.reviewer = Some(tacit::organizer::Worker {
+        s.reviewer = Some(tacit::evolution::Worker {
             send: review_send,
             receive: review_receive,
         });
@@ -3955,8 +4166,9 @@ mod tests {
         s.revision = 2;
         let before = s.projection.session.clone();
         review_response
-            .send(tacit::organizer::Response {
+            .send(tacit::evolution::Response {
                 revision: 1,
+                fingerprint: String::new(),
                 result: Err("stale review".into()),
             })
             .unwrap();

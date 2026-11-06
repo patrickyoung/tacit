@@ -30,6 +30,8 @@ impl Role {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Thought {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
     /// Concise interpretation for the map; `text` always retains the original words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concept: Option<String>,
@@ -58,6 +60,10 @@ pub fn validate_concept(concept: &str) -> Result<(), String> {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sources: crate::evolution::Sources,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<crate::evolution::RetiredThought>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub directions: Vec<String>,
     pub version: u32,
@@ -72,6 +78,8 @@ pub struct Session {
 impl Default for Session {
     fn default() -> Self {
         Self {
+            sources: Default::default(),
+            retired: vec![],
             directions: vec![],
             version: 1,
             title: "A thought taking shape".into(),
@@ -92,6 +100,7 @@ impl Session {
         self.next_id += 1;
         self.interpretation = None;
         self.thoughts.push(Thought {
+            evidence: vec![],
             concept: None,
             id,
             text: text.into(),
@@ -219,6 +228,32 @@ impl Session {
             }
             if thought.text.trim().is_empty() {
                 return Err("Empty thought in session".into());
+            }
+        }
+        for r in &self.retired {
+            if r.thought.id == 0
+                || r.thought.id >= self.next_id
+                || !ids.insert(r.thought.id)
+                || r.reason.trim().is_empty()
+                || r.reason.len() > 1000
+                || r.replaced_by
+                    .iter()
+                    .any(|id| *id == 0 || *id >= self.next_id)
+            {
+                return Err("Invalid retired concept history".into());
+            }
+        }
+        for thought in self
+            .thoughts
+            .iter()
+            .chain(self.retired.iter().map(|r| &r.thought))
+        {
+            if thought
+                .evidence
+                .iter()
+                .any(|id| !self.sources.contains_key(id))
+            {
+                return Err("Concept references missing source words".into());
             }
         }
         if let Some(i) = &self.interpretation {

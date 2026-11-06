@@ -148,8 +148,16 @@ impl crate::timeline::Projection {
                     garden: Garden::settled(&self.session),
                     ..Scene::default()
                 };
-                for (slot, category) in self.session.categories.iter().enumerate() {
-                    if let Some(art) = self.artwork.iter().rev().find(|a| a.theme == category.id) {
+                for (slot, category) in self
+                    .session
+                    .categories
+                    .iter()
+                    .filter(|c| c.parent.is_none())
+                    .enumerate()
+                {
+                    if let Some(art) = self.artwork.iter().rev().find(|a| {
+                        a.scope == crate::timeline::ArtworkScope::Theme && a.theme == category.id
+                    }) {
                         scene.artwork.push(Artwork {
                             key: format!("theme-{}", category.id),
                             fingerprint: art.fingerprint.clone(),
@@ -159,6 +167,21 @@ impl crate::timeline::Projection {
                             retired: None,
                         });
                     }
+                }
+                if let Some(art) = self
+                    .artwork
+                    .iter()
+                    .rev()
+                    .find(|a| a.scope == crate::timeline::ArtworkScope::Map)
+                {
+                    scene.artwork.push(Artwork {
+                        key: crate::generated_art::CENTRAL_KEY.into(),
+                        fingerprint: art.fingerprint.clone(),
+                        slot: 0,
+                        asset: art.asset.clone(),
+                        born: -10.0,
+                        retired: None,
+                    });
                 }
                 scene
             });
@@ -188,6 +211,11 @@ impl crate::timeline::Journal {
         let mut events = Vec::new();
         for a in &scene.artwork {
             let artwork = SessionArtwork {
+                scope: if a.key == crate::generated_art::CENTRAL_KEY {
+                    crate::timeline::ArtworkScope::Map
+                } else {
+                    crate::timeline::ArtworkScope::Theme
+                },
                 theme: a.key.strip_prefix("theme-").unwrap_or(&a.key).into(),
                 fingerprint: a.fingerprint.clone(),
                 asset: a.asset.clone(),

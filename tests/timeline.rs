@@ -262,6 +262,7 @@ fn rune_can_adapt_content_authored_without_a_rune_presentation() {
     };
     p.apply(&Event::ArtworkAvailable {
         artwork: tacit::timeline::SessionArtwork {
+            scope: tacit::timeline::ArtworkScope::Theme,
             theme: "learning".into(),
             fingerprint: "first".into(),
             asset: "first.png".into(),
@@ -270,6 +271,7 @@ fn rune_can_adapt_content_authored_without_a_rune_presentation() {
     .unwrap();
     p.apply(&Event::ArtworkAvailable {
         artwork: tacit::timeline::SessionArtwork {
+            scope: tacit::timeline::ArtworkScope::Theme,
             theme: "learning".into(),
             fingerprint: "second".into(),
             asset: "second.png".into(),
@@ -405,4 +407,54 @@ fn concepts_replay_with_original_words_and_split_invalidates_old_label() {
     let after = j.at(3).unwrap();
     assert_eq!(after.session.thoughts.len(), 2);
     assert!(after.session.thoughts.iter().all(|t| t.concept.is_none()));
+}
+
+#[test]
+fn whole_map_artwork_has_portable_scope_and_cannot_replace_a_same_named_theme() {
+    use tacit::timeline::{ArtworkScope, SessionArtwork};
+    let mut p = Projection::default();
+    p.session.categories.push(tacit::model::Category {
+        id: "map-synthesis".into(),
+        name: "Map synthesis".into(),
+        parent: None,
+        motif: None,
+        illustration: None,
+    });
+    for (scope, asset) in [
+        (ArtworkScope::Theme, "theme.png"),
+        (ArtworkScope::Map, "central.png"),
+    ] {
+        p.apply(&Event::ArtworkAvailable {
+            artwork: SessionArtwork {
+                scope,
+                theme: "map-synthesis".into(),
+                fingerprint: asset.into(),
+                asset: asset.into(),
+            },
+        })
+        .unwrap();
+    }
+    let scene = p.scene();
+    assert_eq!(
+        scene
+            .artwork
+            .iter()
+            .find(|a| a.key == "theme-map-synthesis")
+            .unwrap()
+            .asset,
+        "theme.png"
+    );
+    assert_eq!(
+        scene
+            .artwork
+            .iter()
+            .find(|a| a.key == "map-synthesis")
+            .unwrap()
+            .asset,
+        "central.png"
+    );
+    let legacy: SessionArtwork =
+        serde_json::from_str(r#"{"theme":"time","fingerprint":"old","asset":"old.png"}"#).unwrap();
+    assert_eq!(legacy.scope, ArtworkScope::Theme);
+    assert!(serde_json::to_value(legacy).unwrap().get("scope").is_none());
 }

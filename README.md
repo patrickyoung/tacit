@@ -123,7 +123,7 @@ Run `cargo run` normally after configuring a key. OpenRouter takes priority over
 
 - **Immediate:** local draft placement; keeping a thought saves it immediately.
 - **Fast pass:** after 180 ms without a committed edit, `google/gemini-3.1-flash-lite` creates themes and classifies thoughts. Once themes exist, only unclassified thoughts are sent with the theme list. Provider routing favors latency, with reasoning disabled and a 15-second deadline. Network feedback is not guaranteed to be instant.
-- **Review:** after three seconds without a committed edit and completion of the fast pass, `anthropic/claude-sonnet-4.6` reviews the complete map, refines themes, and develops the narrative and tentative relationships. It has its own worker and a 90-second deadline.
+- **Review:** after three seconds without a committed edit and completion of the fast pass, `anthropic/claude-sonnet-4.6` reviews the complete map, refines themes, and develops the narrative and tentative relationships. It has its own worker and a 120-second deadline.
 - **Transitions:** thought labels spring into their new positions, colored branches fade back in, and a soft pulse marks ongoing organization. Rune's reduced-motion preference suppresses the fade and pulse.
 
 Override models with `TACIT_FAST_MODEL` and `TACIT_REVIEW_MODEL`; choose models supporting structured output. Each pass validates IDs, theme references and complete assignment coverage before applying anything. Your wording and pinned placements remain intact, including pinned theme names. Theme IDs retain branch order. Old responses are discarded after capture, correction, removal or Undo. Each worker coalesces queued edits, and there are no automatic retry loops. Another committed edit retries after an error.
@@ -191,7 +191,8 @@ Headless runs do not read or write your real notebook or contact OpenRouter, Oll
 - `src/session_event.rs`: portable content events and the pure reducer.
 - `src/presentation.rs`: Rune presentation and version 1 scene compatibility adapter.
 - `src/storage.rs`: session loading, atomic saves, exclusive session lock.
-- `src/organizer.rs`: independent OpenRouter fast/review workers, Ollama fallback, and response validation.
+- `src/organizer.rs`: fast OpenRouter classification, Ollama fallback, and response validation.
+- `src/evolution.rs`: source-grounded whole-map editorial revisions and validation.
 - `src/voice.rs`: Rune WAV capture, authenticated Hex transcription streams, and exact sample uploads.
 - `src/ui.rs`: Rune canvas, vector illustrations, input, inspector, and narrative view.
 - `design/living-map.html`: the earlier conceptual exploration, independent of the Rust app.
@@ -239,3 +240,17 @@ cargo run --example concept_eval
 Nested groups share their root branch color and extend outward through curved branches. Large maps scroll; selecting a thought shows its full classification path and original words. Theme illustrations draw on descendant concepts and remain anchored to root themes, keeping the background legible.
 
 In **Direct the map**, instructions such as “Put Decision owners under Governance” can create or move whole subtrees. Merging groups retains their children. Cycles, unknown parents, and excessive depth are rejected atomically. Pinned thoughts protect their complete ancestor path during automatic review; explicit directions can move them. Parent relationships are saved in ordinary session events and replay through the same reducer.
+
+The central **whole-map illustration** connects all root themes, their nested groups, representative concepts, and supported relationships into one hand-drawn visual story. Generation is first scheduled about 30 seconds after at least two themes are available; display follows when the image model finishes. It uses a separate generation queue from branch illustrations and requests a changed composition at most once every two minutes; unchanged maps do not regenerate. Ongoing generation is allowed to finish rather than being continually superseded by new speech. Existing artwork remains visible on generation failure.
+
+The composition surrounds the central title cloud with a transparent opening, keeping the title readable. Central illustrations draw in and crossfade over six seconds (reduced motion shows the completed image immediately). Turning art off disables new requests and hides artwork. Actual images and transition timestamps are retained in the existing presentation/event archive, so replay uses the original artwork without new model calls. Central generation uses the configured OpenRouter image model and credits, just like theme illustrations.
+
+## A map that can change its mind
+
+The stronger OpenRouter reviewer now receives the complete source ledger, including full recording transcripts, active concepts, prior concepts, and user directions. It can add concepts, split compound ideas, merge fragments, update labels, move concepts, rebuild the three-level classification tree, and retire obsolete items. New concepts must cite existing source IDs; original words are resolved by the application, never rewritten by the model.
+
+Every retired concept retains its words, a reason, and links to any replacements. The margin's **How the map evolved** list opens those prior concepts. All previously represented evidence must remain attached to an active or retired concept. Explicitly pinned placements and evidence remain protected; **Allow AI to revise** releases a selected pin. Revisions use the existing layout transitions and are undoable.
+
+Each accepted revision is a `MapRevised` event with an exact input fingerprint. Validation rejects stale maps, unknown sources, orphan classifications, missing retirements, invalid replacement links, and reused historical IDs. Replay applies the saved revision without calling a model. Saved session JSON also retains the evidence dictionary and retired concepts. Legacy empty fields remain omitted for journal hash compatibility.
+
+Review currently supports up to 200 active concepts and 1 MiB of serialized context; exceeding the context limit reports an error and retains the map rather than silently dropping history. Live editorial quality depends on the configured review model. The fast pass continues to give initial feedback while the stronger reviewer works.
