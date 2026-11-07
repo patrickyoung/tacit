@@ -205,6 +205,12 @@ pub fn export(journal: &Journal, output: &Path) -> io::Result<()> {
             "-fps_mode",
             "vfr",
         ]);
+        // FFmpeg 6.1 can silently encode one-pixel-high FFV1 slices as empty frames.
+        // Keep small images in one slice, within FFmpeg's single-slice size limit;
+        // ordinary window captures retain the encoder's parallel slice selection.
+        if width <= 352 && height <= 288 {
+            command.args(["-slices", "1"]);
+        }
         if !audio.is_empty() {
             command.args(["-map", "[a]", "-c:a", "pcm_s16le"]);
         }

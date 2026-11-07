@@ -603,11 +603,15 @@ impl Journal {
         }
         if writable && complete != bytes.len() {
             atomic_write(&root.join("interrupted-tail.json"), &bytes[complete..])?;
+            // Windows append-only handles cannot truncate a file. Repair the tail
+            // with a separate writable handle before reopening for atomic appends.
+            OpenOptions::new()
+                .write(true)
+                .open(&log)?
+                .set_len(complete as u64)?;
         }
         let file = if writable {
-            let file = private_file(&log, true)?;
-            file.set_len(complete as u64)?;
-            file
+            private_file(&log, true)?
         } else {
             File::open(&log)?
         };
@@ -988,10 +992,15 @@ mod tests {
         let read = Journal::read(&path).unwrap();
         assert_eq!(read.projection, expected);
         drop(read);
-        let j = Journal::open(&path, Session::default()).unwrap();
+        let mut j = Journal::open(&path, Session::default()).unwrap();
         assert_eq!(j.projection, expected);
         assert!(j.root.join("interrupted-tail.json").exists());
+        let mut scene = j.projection.scene();
+        scene.session.add("An idea after recovery");
+        j.scene(1000, "capture", scene).unwrap();
+        let recovered = j.projection.clone();
         drop(j);
+        assert_eq!(Journal::read(&path).unwrap().projection, recovered);
         let bytes = fs::read_to_string(&log)
             .unwrap()
             .replace("Make room for meaningful work", "Tampered title");
