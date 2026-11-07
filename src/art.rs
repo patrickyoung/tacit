@@ -8,22 +8,29 @@ pub use crate::model::Motif;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Style {
     #[default]
+    Ink,
+    Off,
+    // Keep historical values serializable for exact presentation replay.
     Pastel,
     Chalk,
     Marker,
-    Off,
 }
 impl Style {
-    pub fn next(self) -> Self {
+    pub fn toggle(self) -> Self {
         match self {
-            Self::Pastel => Self::Chalk,
-            Self::Chalk => Self::Marker,
-            Self::Marker => Self::Off,
-            Self::Off => Self::Pastel,
+            Self::Off => Self::Ink,
+            _ => Self::Off,
+        }
+    }
+    pub fn current(self) -> Self {
+        match self {
+            Self::Off => Self::Off,
+            _ => Self::Ink,
         }
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Ink => "Art · ink",
             Self::Pastel => "Art · pastel",
             Self::Chalk => "Art · chalk",
             Self::Marker => "Art · marker",
@@ -381,9 +388,17 @@ pub fn draw(
             };
             a = wobble(a);
             b = wobble(b);
-            let pigment = if i % 3 == 1 { accent } else { ink };
-            let thickness = if style == Style::Marker { 3.6 } else { 2.3 };
-            if style != Style::Marker {
+            let pigment = if i % (if style == Style::Ink { 5 } else { 3 }) == 1 {
+                accent
+            } else {
+                ink
+            };
+            let thickness = match style {
+                Style::Ink => 1.8,
+                Style::Marker => 3.6,
+                _ => 2.3,
+            };
+            if matches!(style, Style::Pastel | Style::Chalk) {
                 shape = shape.line(a, b, 7.0 * size / 100., LineCap::Round, pigment.alpha(0.10));
                 let offset = if style == Style::Chalk { 1.2 } else { 0.7 } * size / 100.;
                 shape = shape.line(
@@ -399,7 +414,11 @@ pub fn draw(
                 b,
                 thickness * size / 100. * (1. + (j as f32 * 1.7).sin() * 0.12),
                 LineCap::Round,
-                pigment.alpha(if style == Style::Marker { 0.65 } else { 0.46 }),
+                pigment.alpha(match style {
+                    Style::Ink => 0.9,
+                    Style::Marker => 0.65,
+                    _ => 0.46,
+                }),
             );
             remaining -= length;
         }
@@ -409,6 +428,20 @@ pub fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ink_is_the_only_active_style_and_historical_styles_roundtrip() {
+        assert_eq!(Style::default(), Style::Ink);
+        assert_eq!(Style::Ink.toggle(), Style::Off);
+        assert_eq!(Style::Off.toggle(), Style::Ink);
+        for name in ["Pastel", "Chalk", "Marker"] {
+            let encoded = format!("\"{name}\"");
+            let legacy: Style = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(serde_json::to_string(&legacy).unwrap(), encoded);
+            assert_eq!(legacy.current(), Style::Ink);
+            assert_eq!(legacy.toggle(), Style::Off);
+        }
+        assert_eq!(Style::Off.current(), Style::Off);
+    }
     #[test]
     fn strokes_reveal_progressively_and_texture_is_deterministic() {
         let ink = Color {
@@ -424,16 +457,13 @@ mod tests {
             a: 1.0,
         };
         assert_eq!(
-            draw(Motif::Clock, Style::Pastel, ink, accent, 100., 0.),
+            draw(Motif::Clock, Style::Ink, ink, accent, 100., 0.),
             Shape::new()
         );
-        let half = draw(Motif::Clock, Style::Pastel, ink, accent, 100., 0.5);
-        let full = draw(Motif::Clock, Style::Pastel, ink, accent, 100., 1.);
+        let half = draw(Motif::Clock, Style::Ink, ink, accent, 100., 0.5);
+        let full = draw(Motif::Clock, Style::Ink, ink, accent, 100., 1.);
         assert_ne!(half, full);
-        assert_eq!(
-            full,
-            draw(Motif::Clock, Style::Pastel, ink, accent, 100., 1.)
-        );
+        assert_eq!(full, draw(Motif::Clock, Style::Ink, ink, accent, 100., 1.));
         assert_eq!(
             draw(Motif::Clock, Style::Off, ink, accent, 100., 1.),
             Shape::new()

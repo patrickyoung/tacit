@@ -1,4 +1,5 @@
 pub mod art;
+pub mod artist;
 pub mod camera;
 pub mod generated_art;
 pub mod model;

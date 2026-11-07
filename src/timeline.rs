@@ -160,6 +160,8 @@ impl ArtworkScope {
 /// Content-addressed illustration with renderer-independent semantic scope.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionArtwork {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mural: Option<crate::artist::Mural>,
     #[serde(default, skip_serializing_if = "ArtworkScope::is_theme")]
     pub scope: ArtworkScope,
     pub theme: String,
@@ -266,6 +268,17 @@ impl Projection {
         }
     }
     pub fn apply(&mut self, event: &Event) -> io::Result<()> {
+        if matches!(event, Event::Transaction { .. }) {
+            let mut next = self.clone();
+            next.apply_staged(event)?;
+            *self = next;
+            Ok(())
+        } else {
+            self.apply_staged(event)
+        }
+    }
+    /// The caller owns an unpublished projection and discards it on failure.
+    fn apply_staged(&mut self, event: &Event) -> io::Result<()> {
         match event {
             Event::MapRevised { fingerprint, plan } => {
                 if content_hash(&self.session)? != *fingerprint {
@@ -354,11 +367,9 @@ impl Projection {
                 {
                     return Err(io::Error::other("Invalid event transaction"));
                 }
-                let mut next = self.clone();
                 for event in events {
-                    next.apply(event)?;
+                    self.apply_staged(event)?;
                 }
-                *self = next;
             }
             Event::Opened { version, .. } if ![1, VERSION].contains(version) => {
                 return Err(io::Error::other("Unsupported timeline version"));
@@ -373,6 +384,7 @@ impl Projection {
                 self.remember_sources();
                 for art in &scene.artwork {
                     self.retain_artwork(SessionArtwork {
+                        mural: art.mural.clone(),
                         scope: if art.key == crate::generated_art::CENTRAL_KEY {
                             ArtworkScope::Map
                         } else {
@@ -583,7 +595,7 @@ impl Journal {
             if entries.is_empty() && !matches!(e.event, Event::Opened { .. }) {
                 return Err(io::Error::other("Missing timeline header"));
             }
-            projection.apply(&e.event)?;
+            projection.apply_staged(&e.event)?;
             entries.push(e);
             if entries.len().is_multiple_of(64) {
                 checkpoints.push((entries.len(), projection.clone()));
@@ -774,7 +786,7 @@ impl Journal {
     }
     pub fn append(&mut self, at_ms: u64, event: Event) -> io::Result<()> {
         let mut next = self.projection.clone();
-        next.apply(&event)?;
+        next.apply_staged(&event)?;
         let seq = self.entries.len() as u64;
         let at_ms = at_ms.max(self.entries.last().map_or(0, |e| e.at_ms));
         let previous = self
@@ -803,15 +815,16 @@ impl Journal {
     }
     pub fn at(&self, at_ms: u64) -> io::Result<Projection> {
         let end = self.entries.partition_point(|e| e.at_ms <= at_ms);
-        let (start, mut result) = self
-            .checkpoints
-            .iter()
-            .rev()
-            .find(|(n, _)| *n <= end)
+        if end == self.entries.len() {
+            return Ok(self.projection.clone());
+        }
+        let checkpoint = self.checkpoints.partition_point(|(n, _)| *n <= end);
+        let (start, mut result) = self.checkpoints[..checkpoint]
+            .last()
             .cloned()
             .unwrap_or_default();
         for e in &self.entries[start..end] {
-            result.apply(&e.event)?;
+            result.apply_staged(&e.event)?;
         }
         Ok(result)
     }

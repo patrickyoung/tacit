@@ -262,6 +262,7 @@ fn rune_can_adapt_content_authored_without_a_rune_presentation() {
     };
     p.apply(&Event::ArtworkAvailable {
         artwork: tacit::timeline::SessionArtwork {
+            mural: None,
             scope: tacit::timeline::ArtworkScope::Theme,
             theme: "learning".into(),
             fingerprint: "first".into(),
@@ -271,6 +272,7 @@ fn rune_can_adapt_content_authored_without_a_rune_presentation() {
     .unwrap();
     p.apply(&Event::ArtworkAvailable {
         artwork: tacit::timeline::SessionArtwork {
+            mural: None,
             scope: tacit::timeline::ArtworkScope::Theme,
             theme: "learning".into(),
             fingerprint: "second".into(),
@@ -327,6 +329,53 @@ fn transactions_are_atomic_and_presentation_pins_the_displayed_revision_and_cloc
     assert_eq!(j.replay_scene_at(450).unwrap().session.thoughts.len(), 1);
     assert_eq!(j.replay_scene_at(450).unwrap().render_time, Some(0.4));
     j.validate_replay().unwrap();
+}
+
+#[test]
+fn pixel_transactions_preserve_presentation_format_and_roll_back_invalid_frames() {
+    use tacit::timeline::{PixelFrame, RENDERER, content_hash};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.json");
+    let mut journal = Journal::open(&path, Session::demo()).unwrap();
+    let mut scene = journal.projection.scene();
+    scene.draft = "Not yet captured".into();
+    scene.render_time = Some(1.25);
+    scene.session_title = "A saved map".into();
+    let expected = scene.presentation_value().unwrap();
+    let png = tacit::video_archive::png_bytes(1, 1, &[12, 34, 56, 255]).unwrap();
+    let frame = PixelFrame {
+        asset: journal.import_bytes(&png, "png").unwrap(),
+        width: 1,
+        height: 1,
+        scale: 2.0,
+        content_hash: content_hash(&scene.session).unwrap(),
+    };
+    let before = journal.projection.clone();
+    let count = journal.entries.len();
+    let log = journal.root.join("events.jsonl");
+    let bytes = std::fs::read(&log).unwrap();
+    let mut invalid = frame.clone();
+    invalid.content_hash = "stale content".into();
+    assert!(
+        journal
+            .present_pixels(1250, scene.clone(), invalid)
+            .is_err()
+    );
+    assert_eq!(journal.projection, before);
+    assert_eq!(journal.entries.len(), count);
+    assert_eq!(std::fs::read(&log).unwrap(), bytes);
+
+    journal
+        .present_pixels(1250, scene.clone(), frame.clone())
+        .unwrap();
+    assert_eq!(journal.entries.len(), count + 1);
+    assert_eq!(journal.projection.presentations[RENDERER].state, expected);
+    assert_eq!(journal.projection.pixel_frame, Some(frame));
+    assert_eq!(journal.projection.replay_scene().unwrap(), scene);
+    let loaded = Journal::read(&path).unwrap();
+    assert_eq!(loaded.projection, journal.projection);
+    assert_eq!(loaded.replay_scene_at(1250).unwrap(), scene);
+    loaded.validate_replay().unwrap();
 }
 
 #[test]
@@ -426,6 +475,7 @@ fn whole_map_artwork_has_portable_scope_and_cannot_replace_a_same_named_theme() 
     ] {
         p.apply(&Event::ArtworkAvailable {
             artwork: SessionArtwork {
+                mural: None,
                 scope,
                 theme: "map-synthesis".into(),
                 fingerprint: asset.into(),

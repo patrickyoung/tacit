@@ -1105,8 +1105,14 @@ impl State {
     }
 
     fn record_presentation(&mut self, _reason: &str) {
+        let _ = self.commit_presentation(None);
+    }
+    fn commit_presentation(
+        &mut self,
+        pixels: Option<tacit::timeline::PixelFrame>,
+    ) -> Result<(), String> {
         if self.sessions_open || self.replay.is_some() || self.read_only || self.journal.is_none() {
-            return;
+            return Ok(());
         }
         let result = (|| -> std::io::Result<()> {
             let journal = self.journal.as_mut().unwrap();
@@ -1123,6 +1129,7 @@ impl State {
                     asset
                 };
                 artwork.push(tacit::timeline::Artwork {
+                    mural: layer.mural.clone(),
                     key: layer.key.clone(),
                     fingerprint: layer.fingerprint.clone(),
                     slot: layer.slot,
@@ -1134,6 +1141,7 @@ impl State {
             let mut garden = self.art.clone();
             garden.now = 0.0;
             let scene = tacit::timeline::Scene {
+                mural_layout: self.gallery.mural_layout,
                 workspace: self.modern_ui.then(|| tacit::presentation::Workspace {
                     camera: tacit::camera::Camera {
                         zoom: self.camera_zoom.get(),
@@ -1168,7 +1176,11 @@ impl State {
                 map_viewport: self.map_viewport,
                 reduced_motion: self.reduced_motion,
             };
-            journal.present_scene(journal.now_ms(), scene)?;
+            if let Some(frame) = pixels {
+                journal.present_pixels(journal.now_ms(), scene, frame)?;
+            } else {
+                journal.present_scene(journal.now_ms(), scene)?;
+            }
             // Presentation commits cannot change session content.
             self.projection = journal.projection.clone();
             Ok(())
@@ -1180,9 +1192,28 @@ impl State {
             if let Some(journal) = &self.journal {
                 self.projection = journal.projection.clone();
             }
+            return Err(self.status.clone());
         }
+        Ok(())
     }
     fn restore_scene(&mut self, scene: tacit::timeline::Scene, now: f64) {
+        let projection = self.journal.as_ref().map(|journal| {
+            if self.replay.is_some() {
+                journal
+                    .at((now * 1000.0).round() as u64)
+                    .expect("validated timeline")
+            } else {
+                journal.projection.clone()
+            }
+        });
+        self.restore_projected_scene(scene, now, projection);
+    }
+    fn restore_projected_scene(
+        &mut self,
+        scene: tacit::timeline::Scene,
+        now: f64,
+        projection: Option<tacit::timeline::Projection>,
+    ) {
         self.modern_ui = self.replay.is_none() || scene.workspace.is_some();
         if let Some(w) = &scene.workspace {
             self.camera_zoom.set(w.camera.zoom);
@@ -1202,14 +1233,8 @@ impl State {
         } else {
             now
         };
-        if let Some(journal) = &self.journal {
-            self.projection = if self.replay.is_some() {
-                journal
-                    .at((now * 1000.0).round() as u64)
-                    .expect("validated timeline")
-            } else {
-                journal.projection.clone()
-            };
+        if let Some(projection) = projection {
+            self.projection = projection;
         } else {
             self.projection.session = scene.session.clone();
         }
@@ -1258,11 +1283,16 @@ impl State {
         }
         self.draft = TextEdit::new(scene.draft);
         self.selected = scene.selected;
-        self.art_style = scene.style;
+        self.art_style = if self.replay.is_some() {
+            scene.style
+        } else {
+            scene.style.current()
+        };
         self.story = scene.story;
         self.art = scene.garden;
         self.art.now = render_now;
         self.gallery.now = render_now;
+        self.gallery.mural_layout = self.replay.is_none() || scene.mural_layout;
         self.reduced_motion = scene.reduced_motion;
         self.busy = scene.busy;
         self.settled_at = scene.settled_at;
@@ -1275,6 +1305,17 @@ impl State {
             .artwork
             .into_iter()
             .filter_map(|a| {
+                // Live editing resumes from the archived pixels, even if the PNG cache
+                // was pruned. Replay reuses decoded handles without reading bytes per frame.
+                let encoded = if self.replay.is_none() && a.mural.is_some() && a.retired.is_none() {
+                    self.journal
+                        .as_ref()
+                        .and_then(|j| j.asset(&a.asset).ok())
+                        .and_then(|p| std::fs::read(p).ok())
+                        .map(std::sync::Arc::new)
+                } else {
+                    None
+                };
                 let image = if let Some(image) = self.replay_images.get(&a.asset) {
                     image.clone()
                 } else {
@@ -1289,7 +1330,8 @@ impl State {
                 };
                 self.art_assets.insert(image.id(), a.asset.clone());
                 Some(generated_art::Layer {
-                    encoded: None,
+                    encoded,
+                    mural: a.mural,
                     key: a.key,
                     fingerprint: a.fingerprint,
                     slot: a.slot,
@@ -1337,15 +1379,14 @@ impl State {
         scale: f32,
         pixels: &[u8],
     ) -> Result<(), String> {
+        if !self.capturing_pixels() {
+            return Err("Original pixel capture is not active".into());
+        }
         self.journal
             .as_mut()
             .ok_or("No archive for original pixels")?
             .begin_pixels()
             .map_err(|e| e.to_string())?;
-        self.record_presentation("displayed frame");
-        if self.read_only {
-            return Err(self.status.clone());
-        }
         let raw_hash = *blake3::hash(pixels).as_bytes();
         let asset = if let Some((previous, frame)) = &self.last_pixels
             && previous == &raw_hash
@@ -1369,9 +1410,7 @@ impl State {
             content_hash: tacit::timeline::content_hash(&self.projection.session)
                 .map_err(|e| e.to_string())?,
         };
-        self.dispatch(tacit::timeline::Event::Pixels {
-            frame: frame.clone(),
-        })?;
+        self.commit_presentation(Some(frame.clone()))?;
         self.last_pixels = Some((raw_hash, frame));
         Ok(())
     }
@@ -1437,9 +1476,7 @@ impl State {
                 self.status = format!("Cannot replay: {error}");
                 return;
             }
-            if let Some(worker) = &self.gallery.worker {
-                let _ = worker.send.send(vec![]);
-            }
+            self.gallery.suspend();
             self.replay = Some(Replay {
                 at_ms: self.journal.as_ref().unwrap().first_frame_ms().unwrap(),
                 playing: false,
@@ -1876,7 +1913,10 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         .max()
         .unwrap_or(0);
     let indent = depth as f32 * 88.0;
-    let width = if s.modern_ui {
+    let mural = s.gallery.mural_layout;
+    let width = if mural {
+        1300.0 + indent * 2.0
+    } else if s.modern_ui {
         1100.0 + indent * 2.0
     } else if s.replay.is_some() && s.map_viewport[0] > 0.0 {
         s.map_viewport[0]
@@ -1971,9 +2011,11 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         offsets.push(height + 55.0);
         height += (pair.iter().copied().max().unwrap_or(1).max(2) as f32 * 72.0 + 100.0).max(230.0);
     }
-    height = height.max(460.0);
+    height = height.max(if mural { 640.0 } else { 460.0 });
     let center = [width / 2.0, height / 2.0];
     let leaf_w = (width * 0.27).min(255.0);
+    let mural_w = (width - 2.0 * (leaf_w + indent + 80.0)).clamp(360.0, 640.0);
+    let mural_h = mural_w * 2.0 / 3.0;
     let mut drawing = Shape::new();
     let mut labels = Vec::new();
     for (group, (_, name, role)) in groups.iter().enumerate() {
@@ -1989,10 +2031,14 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         } else {
             width - leaf_w - 55.0 - indent
         };
-        let start = [
-            center[0] + if left { -64.0 } else { 64.0 },
-            center[1] + if top { -24.0 } else { 24.0 },
-        ];
+        let start = if mural {
+            center
+        } else {
+            [
+                center[0] + if left { -64.0 } else { 64.0 },
+                center[1] + if top { -24.0 } else { 24.0 },
+            ]
+        };
         drawing = curve(drawing, start, [fork_x, fork_y], ink, 9.0);
         let leaf_x = if left {
             12.0 + indent
@@ -2012,11 +2058,15 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 .absolute(heading_x, first_y - 45.0)
                 .gap(8.0)
                 .center_y()
-                .child(canvas(illustration(role)).size(38.0, 34.0))
+                .child(if mural {
+                    el()
+                } else {
+                    canvas(illustration(role)).size(38.0, 34.0)
+                })
                 .child(
                     label(name, 20.0, ink)
                         .font(TextStyle::new(20.0, 600.0))
-                        .max_w(leaf_w - 44.0),
+                        .max_w(leaf_w - if mural { 8.0 } else { 44.0 }),
                 ),
         );
         let entries = &entries[group];
@@ -2188,9 +2238,11 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         .cubic_to(p(-126.0, 30.0), p(-126.0, -13.0), p(-101.0, -27.0))
         .cubic_to(p(-100.0, -38.0), p(-92.0, -43.0), p(-82.0, -43.0))
         .close();
-    drawing = drawing
-        .fill_path(&cloud, WHITE)
-        .stroke_path(&cloud, 2.5, LineCap::Round, GOLD);
+    if !mural {
+        drawing = drawing
+            .fill_path(&cloud, WHITE)
+            .stroke_path(&cloud, 2.5, LineCap::Round, GOLD);
+    }
     let synthesis_size = (width - 2.0 * (leaf_w + indent + 26.0)).clamp(250.0, 420.0);
     let synthesis_coverage = if cx.is_reduced_motion() {
         if s.gallery
@@ -2223,7 +2275,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         .key("background-art")
         .absolute(0.0, 0.0)
         .size(width, height);
-    if s.art_style != Style::Off {
+    if s.art_style != Style::Off && !mural {
         let size = (width / 2.0 - leaf_w - 94.0 - indent).clamp(56.0, 124.0);
         for layer in &s.art.layers {
             if cx.is_reduced_motion() && layer.retiring() {
@@ -2238,7 +2290,11 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             };
             let y = offsets.get(slot / 2).copied().unwrap_or(height - 180.0)
                 - if slot < 2 { 20.0 } else { 70.0 };
-            let pigment = color(Role::ALL[slot % 4]);
+            let pigment = if s.art_style == Style::Ink {
+                INK
+            } else {
+                color(Role::ALL[slot % 4])
+            };
             let accent = color(Role::ALL[(slot + 1) % 4]);
             let progress = if cx.is_reduced_motion() {
                 1.0
@@ -2273,6 +2329,28 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
     if s.art_style != Style::Off {
         let size = (width / 2.0 - leaf_w - 94.0 - indent).clamp(56.0, 140.0);
         for layer in &s.gallery.layers {
+            if mural {
+                if layer.key != generated_art::CENTRAL_KEY
+                    || layer.mural.is_none()
+                    || (cx.is_reduced_motion() && layer.retired.is_some())
+                {
+                    continue;
+                }
+                // Crossfade complete scenes; a strip reveal would break continuity.
+                let alpha = if cx.is_reduced_motion() {
+                    1.0
+                } else {
+                    layer.opacity(s.gallery.now) * layer.progress(s.gallery.now)
+                };
+                art_layer = art_layer.child(
+                    el().key(format!("generated-{}-{}", layer.key, layer.fingerprint))
+                        .absolute(center[0] - mural_w / 2.0, center[1] - mural_h / 2.0)
+                        .size(mural_w, mural_h)
+                        .opacity(alpha)
+                        .pixels(layer.image.pixels()),
+                );
+                continue;
+            }
             if cx.is_reduced_motion() && layer.retired.is_some() {
                 continue;
             }
@@ -2326,17 +2404,20 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             art_layer = art_layer.child(art);
         }
     }
-    sheet = sheet.child(art_layer).child(
-        canvas(drawing)
-            .key("tree-branches")
-            .size(width, height)
-            .opacity(if cx.is_reduced_motion() {
-                1.0
-            } else {
-                0.35 + 0.65 * s.settling
-            }),
-    );
-    if synthesis_coverage > 0.0 && s.art_style != Style::Off {
+    let branches = canvas(drawing)
+        .key("tree-branches")
+        .size(width, height)
+        .opacity(if cx.is_reduced_motion() {
+            1.0
+        } else {
+            0.35 + 0.65 * s.settling
+        });
+    sheet = if mural {
+        sheet.child(branches).child(art_layer)
+    } else {
+        sheet.child(art_layer).child(branches)
+    };
+    if !mural && synthesis_coverage > 0.0 && s.art_style != Style::Off {
         // Keep the title legible even while branch transitions fade their canvas.
         sheet = sheet.child(
             canvas(Shape::new().fill_path(&cloud, WHITE).stroke_path(
@@ -2353,7 +2434,19 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
     for node in labels {
         sheet = sheet.child(node);
     }
-    sheet = sheet.child(
+    sheet = sheet.child(if mural {
+        col()
+            .key("central-idea")
+            .absolute(center[0] - mural_w / 2.0, center[1] - mural_h / 2.0 - 76.0)
+            .size(mural_w, 60.0)
+            .center()
+            .gap(8.0)
+            .child(
+                label(short_label(&s.projection.session.title), 20.0, INK)
+                    .font(TextStyle::new(20.0, 600.0)),
+            )
+            .child(label("THE CENTRAL IDEA", 9.0, GOLD))
+    } else {
         col()
             .key("central-idea")
             .absolute(center[0] - 78.0, center[1] - 62.0)
@@ -2381,8 +2474,8 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 } else {
                     1.0
                 }),
-            ),
-    );
+            )
+    });
     if s.modern_ui {
         return workspace::canvas(s, sheet, [width, height]);
     }
@@ -2637,7 +2730,7 @@ fn legacy_view(s: &State, cx: &mut Cx<State>) -> El {
         ))
         .child(button(s.art_style.label(), "art-style", |s| {
             if s.replay.is_none() {
-                s.art_style = s.art_style.next();
+                s.art_style = s.art_style.toggle();
             }
         }))
         .child(button("Undo", "undo", State::undo));
@@ -3084,13 +3177,23 @@ fn inspector(s: &State) -> El {
         });
     if s.art_style != Style::Off
         && let Some(art) = s.gallery.layers.iter().rev().find(|l| {
-            l.retired.is_none() && selected_theme.as_ref().is_none_or(|key| &l.key == key)
+            l.retired.is_none()
+                && if s.gallery.mural_layout {
+                    l.mural.is_some() && l.key == generated_art::CENTRAL_KEY
+                } else {
+                    selected_theme.as_ref().is_none_or(|key| &l.key == key)
+                }
         })
     {
         panel = panel.child(label("VISUAL THREAD", 10.0, MUTED)).child(
-            el().key("art-detail")
-                .pixels(art.image.pixels())
-                .size(230.0, 230.0),
+            el().key("art-detail").pixels(art.image.pixels()).size(
+                230.0,
+                if s.gallery.mural_layout {
+                    230.0 * 2.0 / 3.0
+                } else {
+                    230.0
+                },
+            ),
         );
     }
     if let Some(i) = &s.projection.session.interpretation {
@@ -3323,17 +3426,8 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
         Ok(Some(config)) => {
             s.organizer_status = "OpenRouter · quick themes + thoughtful review".into();
             if std::env::var("TACIT_IMAGE_ART").as_deref() != Ok("off") {
-                s.gallery.worker = Some(generated_art::Worker::start(
-                    config.clone(),
-                    s.gallery.model.clone(),
-                    wake.clone(),
-                ));
-                s.gallery.central_worker = Some(generated_art::Worker::start(
-                    config.clone(),
-                    s.gallery.model.clone(),
-                    wake.clone(),
-                ));
-                s.gallery.status = "Art · ready to illustrate themes".into();
+                s.gallery.worker = Some(generated_art::Worker::start(config.clone(), wake.clone()));
+                s.gallery.status = "Art · ready to compose a mural".into();
             }
             let recording_wake = wake.clone();
             let direction_wake = wake.clone();
@@ -3428,19 +3522,21 @@ pub fn poll(s: &mut State, frame_now: f64, tx: &mut Tx) -> bool {
         let (at, playing) = (replay.at_ms, replay.playing);
         let changed = replay.last_projected != Some(at);
         replay.last_projected = Some(at);
-        let scene = if changed {
-            s.journal
-                .as_ref()
-                .map(|j| j.replay_scene_at(at).expect("validated presentation"))
+        let projected_scene = if changed {
+            s.journal.as_ref().map(|j| {
+                let projection = j.at(at).expect("validated timeline");
+                let scene = projection.replay_scene().expect("validated presentation");
+                (projection, scene)
+            })
         } else {
             None
         };
-        if let Some(scene) = scene {
+        if let Some((projection, scene)) = projected_scene {
             let scroll = scene.map_scroll;
             let story_scroll = scene.story_scroll;
             let inspector_scroll = scene.inspector_scroll;
             let workspace = scene.workspace.clone();
-            s.restore_scene(scene, at as f64 / 1000.0);
+            s.restore_projected_scene(scene, at as f64 / 1000.0, Some(projection));
             tx.scroll_to_instant("map", scroll[0], scroll[1]);
             tx.scroll_to_instant("story", story_scroll[0], story_scroll[1]);
             tx.scroll_to_instant("inspector", inspector_scroll[0], inspector_scroll[1]);
@@ -3501,11 +3597,19 @@ pub fn poll(s: &mut State, frame_now: f64, tx: &mut Tx) -> bool {
         .as_ref()
         .map_or(frame_now, |j| j.now_ms() as f64 / 1000.0);
     let changed = poll_live(s, now, tx);
-    s.record_presentation("scene changed");
+    // The compositor commits the final layout and original pixels together. Polling
+    // before layout must not serialize and sync a second presentation for that frame.
+    if !s.capturing_pixels() {
+        s.record_presentation("scene changed");
+    }
     changed || export_changed
 }
 fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
-    let art_deadline = s.art.update(&s.projection.session, now);
+    let art_deadline = if s.gallery.mural_layout {
+        None
+    } else {
+        s.art.update(&s.projection.session, now)
+    };
     let image_changed = s
         .gallery
         .update(&s.projection.session, s.art_style, s.busy, now, tx);
@@ -3801,14 +3905,32 @@ mod tests {
         assert!(!s.directing);
     }
 
+    fn mural_fixture() -> tacit::artist::Mural {
+        tacit::artist::Mural {
+            direction: tacit::artist::Direction {
+                scene: "A workshop opens into a garden".into(),
+                anchors: vec!["A shared table".into()],
+                change: "Extend the table into the garden".into(),
+            },
+            evidence: "fixture-evidence".into(),
+            artist_model: tacit::artist::MODEL.into(),
+            image_model: generated_art::MODEL.into(),
+            parent: Some("previous-scene".into()),
+        }
+    }
     #[test]
-    fn synthesis_art_is_centered_behind_the_title_at_both_window_sizes() {
-        for size in [(1680.0, 1000.0), (820.0, 640.0)] {
+    fn mural_has_an_unobstructed_center_and_legacy_replay_keeps_its_title_cloud() {
+        for (size, mural) in [(1680.0, 1000.0), (820.0, 640.0)]
+            .into_iter()
+            .flat_map(|size| [(size, true), (size, false)])
+        {
             let mut rt = runtime(size);
             rt.state = State::hierarchy_demo();
+            rt.state.gallery.mural_layout = mural;
             let image = rt.state.image_cache.rgba(1, 1, vec![100, 160, 200, 255]);
             image.wait().unwrap();
             rt.state.gallery.layers.push(generated_art::Layer {
+                mural: mural.then(mural_fixture),
                 encoded: None,
                 key: generated_art::CENTRAL_KEY.into(),
                 fingerprint: "fixture".into(),
@@ -3821,7 +3943,14 @@ mod tests {
             let art = rt.find("generated-map-synthesis-fixture").unwrap();
             let title = rt.find("central-idea").unwrap();
             assert!((art.0 - title.0).abs() < 1.0);
-            assert!((art.1 - title.1).abs() < 1.0);
+            if mural {
+                assert!(title.1 < art.1 - 60.0);
+                assert!(rt.find("synthesis-title-mask").is_none());
+                assert!(rt.find("theme-art-0").is_none());
+            } else {
+                assert!((art.1 - title.1).abs() < 1.0);
+                assert!(rt.find("synthesis-title-mask").is_some());
+            }
             assert!(rt.find("thought-1").is_some());
         }
     }
@@ -4078,11 +4207,12 @@ mod tests {
                 let image = state.image_cache.load(bytes.clone());
                 image.wait().unwrap();
                 state.gallery.layers = vec![generated_art::Layer {
+                    mural: (key == generated_art::CENTRAL_KEY).then(mural_fixture),
                     key: key.into(),
                     fingerprint: "same-prompt".into(),
                     slot: 0,
                     image,
-                    encoded: Some(bytes.clone()),
+                    encoded: Some(std::sync::Arc::new(bytes.clone())),
                     born: 0.0,
                     retired: None,
                 }];
@@ -4098,6 +4228,24 @@ mod tests {
                 let asset = j.projection.scene().artwork[0].asset.clone();
                 assert_eq!(std::fs::read(j.asset(&asset).unwrap()).unwrap(), bytes);
                 assets.push(asset);
+            }
+            let saved = state.journal.as_ref().unwrap().projection.scene();
+            state.gallery.layers.clear();
+            state.restore_scene(saved, 10.0);
+            if key == generated_art::CENTRAL_KEY {
+                let layer = &state.gallery.layers[0];
+                assert_eq!(layer.mural, Some(mural_fixture()));
+                assert!(layer.encoded.is_some());
+                let reopened =
+                    tacit::timeline::Journal::read(&state.journal.as_ref().unwrap().root).unwrap();
+                assert_eq!(
+                    reopened.projection.scene().artwork[0].mural,
+                    Some(mural_fixture())
+                );
+                assert_eq!(
+                    reopened.projection.artwork.last().unwrap().mural,
+                    Some(mural_fixture())
+                );
             }
             assert_ne!(assets[0], assets[1]);
             state.journal.as_ref().unwrap().validate_assets().unwrap();
@@ -4134,6 +4282,7 @@ mod tests {
         rt.state.toggle_replay();
         assert!(!rt.state.read_only);
         assert_eq!(rt.state.projection.session, expected);
+        assert_eq!(rt.state.art_style, Style::Ink);
     }
     #[test]
     fn typing_previews_then_enter_captures_without_losing_original_words() {
@@ -4271,7 +4420,7 @@ mod tests {
         assert_eq!(fast_requests.try_recv().unwrap().revision, 2);
     }
     #[test]
-    fn background_art_style_cycles_without_changing_the_map() {
+    fn ink_art_toggles_without_changing_the_map() {
         let mut rt = runtime((820.0, 640.0));
         let before = rt.state.projection.session.clone();
         let ids = rt
@@ -4281,7 +4430,8 @@ mod tests {
             .iter()
             .map(|l| l.serial)
             .collect::<Vec<_>>();
-        for expected in [Style::Chalk, Style::Marker, Style::Off, Style::Pastel] {
+        assert_eq!(rt.state.art_style, Style::Ink);
+        for expected in [Style::Off, Style::Ink] {
             click(&mut rt, "art-style");
             assert!(rt.state.art_style == expected);
             assert_eq!(rt.state.projection.session, before);
@@ -4427,6 +4577,8 @@ mod tests {
     #[test]
     fn modern_canvas_pans_both_axes_and_zooms_without_editing_content() {
         let mut rt = runtime((1280.0, 860.0));
+        // Rune's debug stale-view audit deliberately commits some live-only events.
+        rt.check_live_only(false);
         rt.frame(1.0);
         assert!(rt.state.map_viewport[0] > 800.0);
         assert!(rt.find("inspector").is_none());
@@ -4437,12 +4589,94 @@ mod tests {
         rt.frame(1.1);
         assert_eq!(rt.state.camera_pan.get(), [pan[0] + 90.0, pan[1] - 60.0]);
         let zoom = rt.state.camera_zoom.get();
+        let commits = rt.stats.commits;
         rt.magnify_event(rune::MagnifyEvent::new(0.25).at(x, y));
         rt.frame(1.2);
         assert!((rt.state.camera_zoom.get() - zoom * 1.25).abs() < 0.001);
+        assert_eq!(
+            rt.stats.commits, commits,
+            "pinching must not rebuild the view"
+        );
+        rt.wheel_event(rune::WheelEvent::new(0.0, 10.0).at(x, y).mods(Mods {
+            cmd: true,
+            ..Mods::default()
+        }));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(
+            rt.stats.commits, commits,
+            "wheel zoom must not rebuild the view"
+        );
         assert_eq!(rt.state.projection.session, before);
         click(&mut rt, "zoom-fit");
         assert!(rt.state.camera().valid());
+        rt.check_live_only(true);
+        rt.magnify_event(rune::MagnifyEvent::new(-0.1).at(x, y));
+        rt.frame(1.0);
+        assert!(rt.live_only_warnings().is_empty());
+    }
+    #[test]
+    fn zoomed_concepts_remain_selectable_without_rebuilding_the_view() {
+        let mut rt = runtime((1280.0, 860.0));
+        rt.check_live_only(false);
+        rt.frame(1.0);
+        let (x, y) = rt.find("thought-1").unwrap();
+        let commits = rt.stats.commits;
+        rt.magnify_event(rune::MagnifyEvent::new(0.15).at(x, y));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.stats.commits, commits);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.state.selected, Some(1));
+    }
+    #[test]
+    fn displayed_pixels_and_presentation_commit_once_and_replay_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mut state = State::empty();
+        state.journal = Some(tacit::timeline::Journal::open(&path, Session::default()).unwrap());
+        state.journal.as_mut().unwrap().begin_pixels().unwrap();
+        let before = state.journal.as_ref().unwrap().entries.len();
+        state.draft = TextEdit::new("A draft recorded with its pixels");
+        state.camera_zoom.set(1.25);
+        poll(&mut state, 0.0, &mut Tx::default());
+        assert_eq!(state.journal.as_ref().unwrap().entries.len(), before);
+        let pixels = [255, 0, 0, 255];
+        state.record_pixels((1, 1), 2.0, &pixels).unwrap();
+        let journal = state.journal.as_ref().unwrap();
+        assert_eq!(journal.entries.len(), before + 1);
+        assert_eq!(state.projection, journal.projection);
+        let expected = journal.projection.clone();
+        assert_eq!(expected.replay_scene().unwrap().draft, state.draft.text);
+        assert_eq!(
+            expected
+                .replay_scene()
+                .unwrap()
+                .workspace
+                .unwrap()
+                .camera
+                .zoom,
+            1.25
+        );
+        assert_eq!(expected.pixel_frame.as_ref().unwrap().scale, 2.0);
+        let asset = expected.pixel_frame.as_ref().unwrap().asset.clone();
+        // Reusing identical image bytes must still save a new presentation and timestamp.
+        state.draft = TextEdit::new("A changed draft");
+        state.art.now += 1.0;
+        state.record_pixels((1, 1), 1.0, &pixels).unwrap();
+        let journal = state.journal.as_ref().unwrap();
+        assert_eq!(journal.entries.len(), before + 2);
+        assert_eq!(
+            journal.projection.pixel_frame.as_ref().unwrap().asset,
+            asset
+        );
+        let loaded = tacit::timeline::Journal::read(&path).unwrap();
+        assert_eq!(loaded.projection, state.projection);
+        loaded.validate_replay().unwrap();
+        assert_eq!(
+            loaded.projection.replay_scene().unwrap().draft,
+            "A changed draft"
+        );
     }
     #[test]
     fn drawer_and_transcript_controls_work_at_both_window_sizes() {
@@ -4479,5 +4713,83 @@ mod tests {
         assert_eq!(rt.state.selected, None);
         assert!(rt.find("live-segment-current-1").is_some());
         assert!(rt.find("selected-original").is_none());
+    }
+
+    #[test]
+    #[ignore = "manual headless performance probe; no network or microphone"]
+    fn performance_report() {
+        use std::{hint::black_box, time::Instant};
+        let mut state = State::themed_demo();
+        for n in 0..154 {
+            state.projection.session.add(&format!(
+                "Idea {n}: {}",
+                "Protect time for focused work and shared decisions. ".repeat(10)
+            ));
+        }
+        let session = state.projection.session.clone();
+        state.art = Garden::settled(&session);
+        let mut rt = Runtime::new(
+            state,
+            view,
+            (1280.0, 860.0),
+            Env {
+                system_dark: false,
+                scale: 1.0,
+            },
+        );
+        rt.frame(0.0);
+        rt.frame(1.0);
+        let (x, y) = rt.find("map").unwrap();
+        let started = Instant::now();
+        for n in 0..120 {
+            rt.magnify_event(
+                rune::MagnifyEvent::new(if n % 2 == 0 { 0.01 } else { -0.01 }).at(x, y),
+            );
+            rt.frame(1.0 / 60.0);
+        }
+        println!(
+            "PERF zoom_ms_per_frame {:.3}",
+            started.elapsed().as_secs_f64() * 1000.0 / 120.0
+        );
+
+        let (send, _requests) = std::sync::mpsc::channel();
+        let (_responses, receive) = std::sync::mpsc::channel();
+        let mut gallery = Gallery::default();
+        gallery.worker = Some(generated_art::Worker { send, receive });
+        gallery.update(&session, Style::Ink, false, 0.0, &mut Tx::default());
+        let started = Instant::now();
+        for _ in 0..1000 {
+            black_box(gallery.update(&session, Style::Ink, false, 1.0, &mut Tx::default()));
+        }
+        println!(
+            "PERF art_planning_ms_per_tick {:.3}",
+            started.elapsed().as_secs_f64()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        rt.state.journal = Some(
+            tacit::timeline::Journal::open(&dir.path().join("session.json"), session).unwrap(),
+        );
+        let mut pixels = [232, 227, 207, 255].repeat(1280 * 860);
+        let started = Instant::now();
+        for n in 0..40 {
+            pixels[n * 4] = n as u8;
+            poll(&mut rt.state, n as f64 / 60.0, &mut Tx::default());
+            rt.state.record_pixels((1280, 860), 1.0, &pixels).unwrap();
+        }
+        println!(
+            "PERF archive_ms_per_frame {:.3}",
+            started.elapsed().as_secs_f64() * 1000.0 / 40.0
+        );
+        let journal = rt.state.journal.as_ref().unwrap();
+        let at = journal.duration();
+        let started = Instant::now();
+        for _ in 0..100 {
+            black_box(journal.replay_scene_at(at).unwrap());
+        }
+        println!(
+            "PERF replay_ms_per_seek {:.3}",
+            started.elapsed().as_secs_f64() * 1000.0 / 100.0
+        );
     }
 }

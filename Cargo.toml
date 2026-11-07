@@ -22,6 +22,11 @@ wgpu = { version = "~30.0.1", default-features = false, features = ["std", "park
 [profile.dev.package."*"]
 debug = false
 
+# Keep pixel conversion, serialization and map construction responsive in cargo run,
+# while retaining debug information/assertions and cheap dependency rebuilds.
+[profile.dev.package.tacit]
+opt-level = 1
+
 [dev-dependencies]
 tempfile = "3"
 
@@ -29,6 +34,12 @@ tempfile = "3"
 [profile.dev.package.png]
 opt-level = 3
 [profile.dev.package.fdeflate]
+opt-level = 3
+# PNG's checksums process every pixel too; optimizing only the encoder leaves
+# these transitive dependencies on the per-frame capture path unoptimized.
+[profile.dev.package.simd-adler32]
+opt-level = 3
+[profile.dev.package.crc32fast]
 opt-level = 3
 [profile.dev.package.blake3]
 opt-level = 3

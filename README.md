@@ -18,25 +18,27 @@ cargo run
 
 Type a thought and watch its tentative placement update immediately. Press **Enter** to keep it; **Shift+Enter** adds a newline. Select a thought to inspect its original words, move it to the next branch, or remove it. **Undo** reverses the last capture, move, or removal. **Read the thread** switches to a narrative view. Tab navigates controls. Cmd+S (Ctrl+S on Linux) retries saving, and Escape clears selection.
 
-The map is a colorful radial tree: an illustrated central idea, tapered curved branches, and shorter thought labels. Select a thought to read its complete original wording. OpenRouter creates up to eight named thematic branches. Offline, four narrative lenses provide a starting point: observations, questions, tensions, and possibilities. Moving a thought pins its classification so the organizer cannot override it. Long regions scroll; smaller windows move the inspector controls beneath the map. Colored branches indicate classification, not causal claims.
+The map places a single ink mural beneath the central idea, with tapered curved branches and short thought labels to either side. Select a thought to read its complete original wording. OpenRouter creates up to eight named thematic branches. Offline, four narrative lenses provide a starting point: observations, questions, tensions, and possibilities. Moving a thought pins its classification so the organizer cannot override it. Long regions scroll; smaller windows move the inspector controls beneath the map. Colored branches indicate classification, not causal claims.
 
-## Generated thematic artwork
+## Evolving mural
 
-Tacit now uses OpenRouter image-generation models to paint original scenes for its themes. The default is `openai/gpt-image-2.5-flare`, with medium quality and transparent backgrounds. The **Art · pastel** control cycles through pastel, chalk, bold marker, and off. The image model receives a theme's visual brief and name, not the entire notebook. Older themes without a brief use up to three kept thoughts as context.
+Tacit develops **one evolving mural** in the center of the canvas. `openai/gpt-image-2.5-flare` runs at **low** quality for both the first image and subsequent edits, producing 1536 × 1024 transparent PNGs. The title sits above the landscape artwork; there is no circular frame, central opening, or per-topic illustration.
 
-The semantic organizer writes a concrete scene brief for each category and preserves it verbatim until the meaning changes. Images are generated on an independent background worker after themes have settled for five seconds. Classification and typing stay responsive. Images arrive one at a time; a feathered 2.4-second reveal and crossfade preserve the previous artwork while replacements are generated. Existing vector motifs remain the immediate/offline fallback. Reduced-motion mode shows completed images without reveal effects.
+A dedicated **artist** pass (`openai/gpt-6.1-terra`) reads the committed messages, source evidence, concepts and tentative connections, alongside the previous scene description and actual mural image. It chooses a coherent setting, recurring forms and specific changes. GPT Image then edits the previous pixels using [OpenRouter's reference-image input](https://openrouter.ai/docs/guides/overview/multimodal/image-generation), preserving recognizable forms and composition while weaving new concepts into the scene. The artist can keep the existing image when no visual change is needed. This process is independent of classification and cannot alter the messages or map.
 
-Generation uses your existing OpenRouter key and credits. The cache is keyed by model, style and scene prompt, so reopening a map or returning to a style reuses its art. Cache files live under `$XDG_CACHE_HOME/tacit/art` (default `~/.cache/tacit/art`), with private permissions on Unix, bounded to 128 PNGs / 256 MiB. These images may depict private notebook concepts. No API keys or plaintext prompts are stored in the image cache.
+One shared style blends manga brush-pen contours and hatching, Indian folk-art rhythms and block-print patterning, British editorial drawing and engraving, Appalachian quilt geometry and botanical folk craft, and Danish modernist simplicity and paper-cut forms. Warm charcoal ink and a restrained indigo or terracotta accent combine contemporary geometry with traditional handwork. Unmarked areas stay transparent, letting the artwork sit directly on the app's canvas. **Art · ink** toggles it on and off.
 
-Set `TACIT_IMAGE_ART=off` to disable cloud image generation while keeping local artwork. `TACIT_IMAGE_MODEL` overrides the default; the selected model must support the Images API, transparent PNG output, medium quality and square aspect ratio. **Art · off** also stops queued work. A request already running may finish into the cache, but obsolete results cannot replace current art. Failed images preserve existing artwork; **Retry art** retries without changing your thoughts. No automatic retry loop runs.
+The background worker coalesces updates, starts planning after about eight seconds, and starts subsequent revisions at most once every 30 seconds. Network time is additional. Completed scenes crossfade over six seconds; reduced motion shows them immediately. The artist receives up to 128 KiB of context; larger conversations retain their previous artwork. New messages can arrive while a scene renders; corrections or deletions invalidate results based on obsolete evidence. No requests run during replay. Without cloud image generation the canvas retains its text and branches without separate fallback illustrations.
 
-The visual vocabulary is no longer limited to the twelve fallback icons: generated scenes can combine concepts from the thoughts. Raster artwork reveals as a soft wash; the fallback vectors retain their stroke-by-stroke animation. Style selection is saved with the presentation track.
+The session archive saves each image, its scene description, continuity anchors, evidence fingerprint and parent revision. Reopening resumes from these archived pixels even if the image cache was cleared. Image cache identities include the parent pixels, prompt, model and output settings; private PNGs live under `$XDG_CACHE_HOME/tacit/art` (default `~/.cache/tacit/art`), bounded to 128 PNGs / 256 MiB. Private prompts are stored only in the session archive, not the image cache. The diagnostic's single `demo-mural.json` manifest contains only the built-in fictional example.
 
-To verify the complete image-generation path with one fictional demo theme (a paid request unless cached):
+Generation and art direction use your existing OpenRouter key and credits. `TACIT_IMAGE_ART=off` disables these cloud calls. `TACIT_IMAGE_MODEL` overrides the single image model (which must support low-quality landscape transparent PNGs and image references); `TACIT_ARTIST_MODEL` overrides the artist (which must support vision and structured output). `TACIT_CENTRAL_IMAGE_MODEL` is no longer used. **Art · off** hides artwork and cancels queued work. An in-flight call may finish into the cache, but cannot replace the current mural after cancellation. Failures preserve existing artwork; **Retry art** retries without changing your thoughts. There is no automatic retry loop.
+
+A live diagnostic sends only the fictional demo through the artist and image model and saves a preview for `--scene generated`:
 
 ```sh
 cargo run -- --check-image
-cargo run -- --scene generated --snap /tmp/tacit-generated.png --size 1280x860
+cargo run -- --scene generated --snap /tmp/tacit-generated.png --size 1280x860 --at 1
 ```
 
 Normal headless snapshots never contact the network; the generated demo scene loads only existing cache entries. The explicit `--check-image` diagnostic validates the PNG by decoding it before caching.
@@ -85,7 +87,7 @@ cargo run -- --replay /path/to/session.tacit --replay-pixels
 cargo run -- --export-video /path/to/session.tacit /path/to/original.mkv
 ```
 
-The first capture implementation uses synchronous GPU readback and durable writes, prioritizing retaining every application frame over throughput. It adds rendering latency and retains potentially substantial media; no automatic pruning is performed. It records the frames Tacit presents, not a promised fixed frame rate. Frame timestamps have millisecond resolution. Scene replay remains renderer/version dependent; original-pixel playback and lossless video preserve the visual record independently of future renderer changes.
+Original capture uses synchronous GPU readback and durable writes, prioritizing retaining every application frame over throughput. Each frame's presentation and pixels commit together in one journal transaction; capture avoids an additional presentation save during UI polling. PNG compression and checksums, and Tacit's pixel conversion, are optimized in developer builds too. Capture still adds rendering latency and retains potentially substantial media; no automatic pruning is performed. It records the frames Tacit presents, not a promised fixed frame rate. Frame timestamps have millisecond resolution. Scene replay remains renderer/version dependent; original-pixel playback and lossless video preserve the visual record independently of future renderer changes.
 
 The export uses the [Matroska FFV1 codec mapping](https://www.matroska.org/technical/codec_specs.html#v_ffv1) and [Matroska timestamp semantics](https://www.matroska.org/technical/notes.html).
 
@@ -123,10 +125,12 @@ Run `cargo run` normally after configuring a key. OpenRouter takes priority over
 
 - **Immediate:** local draft placement; keeping a thought saves it immediately.
 - **Fast pass:** after 180 ms without a committed edit, `google/gemini-3.1-flash-lite` creates themes and classifies thoughts. Once themes exist, only unclassified thoughts are sent with the theme list. Provider routing favors latency, with reasoning disabled and a 15-second deadline. Network feedback is not guaranteed to be instant.
-- **Review:** after three seconds without a committed edit and completion of the fast pass, `anthropic/claude-sonnet-4.6` reviews the complete map, refines themes, and develops the narrative and tentative relationships. It has its own worker and a 120-second deadline.
+- **Review:** after three seconds without a committed edit and completion of the fast pass, `openai/gpt-6.1-terra` reviews the complete map, refines themes, and develops the narrative and tentative relationships. It has its own worker and a 120-second deadline.
 - **Transitions:** thought labels spring into their new positions, colored branches fade back in, and a soft pulse marks ongoing organization. Rune's reduced-motion preference suppresses the fade and pulse.
 
 Override models with `TACIT_FAST_MODEL` and `TACIT_REVIEW_MODEL`; choose models supporting structured output. Each pass validates IDs, theme references and complete assignment coverage before applying anything. Your wording and pinned placements remain intact, including pinned theme names. Theme IDs retain branch order. Old responses are discarded after capture, correction, removal or Undo. Each worker coalesces queued edits, and there are no automatic retry loops. Another committed edit retries after an error.
+
+Transcript segmentation and **Direct the map** instructions use `anthropic/claude-sonnet-4.6`, configured separately with `TACIT_ASSIST_MODEL`.
 
 Only kept thoughts and theme metadata go to OpenRouter and its model providers; drafts and Hex audio stay out of these requests. Cloud calls use your OpenRouter credits. Automatic organization is bounded to 200 thoughts / 64 KiB of input per request; larger maps remain editable locally. Older notebooks load without migration.
 
@@ -163,6 +167,9 @@ cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build --release
+# Headless performance probe: synthetic map, zoom, art planning, frame archiving and replay.
+# Uses temporary storage; no network, microphone or real notebook access.
+cargo test --bin tacit performance_report -- --ignored --nocapture --test-threads=1
 # Synthetic archive for offline playback QA; output directory must be new:
 cargo run --example replay_fixture -- /tmp/tacit-replay-fixture
 ```
@@ -237,13 +244,11 @@ Optional live-model validation with synthetic content:
 cargo run --example concept_eval
 ```
 
-Nested groups share their root branch color and extend outward through curved branches. Large maps scroll; selecting a thought shows its full classification path and original words. Theme illustrations draw on descendant concepts and remain anchored to root themes, keeping the background legible.
+Nested groups share their root branch color and extend outward through curved branches. Large maps scroll; selecting a thought shows its full classification path and original words. The mural draws on descendant concepts across the whole map, while text branches remain readable to either side.
 
 In **Direct the map**, instructions such as “Put Decision owners under Governance” can create or move whole subtrees. Merging groups retains their children. Cycles, unknown parents, and excessive depth are rejected atomically. Pinned thoughts protect their complete ancestor path during automatic review; explicit directions can move them. Parent relationships are saved in ordinary session events and replay through the same reducer.
 
-The central **whole-map illustration** connects all root themes, their nested groups, representative concepts, and supported relationships into one hand-drawn visual story. Generation is first scheduled about 30 seconds after at least two themes are available; display follows when the image model finishes. It uses a separate generation queue from branch illustrations and requests a changed composition at most once every two minutes; unchanged maps do not regenerate. Ongoing generation is allowed to finish rather than being continually superseded by new speech. Existing artwork remains visible on generation failure.
-
-The composition surrounds the central title cloud with a transparent opening, keeping the title readable. Central illustrations draw in and crossfade over six seconds (reduced motion shows the completed image immediately). Turning art off disables new requests and hides artwork. Actual images and transition timestamps are retained in the existing presentation/event archive, so replay uses the original artwork without new model calls. Central generation uses the configured OpenRouter image model and credits, just like theme illustrations.
+The central mural evolves as described above. Artwork and its art direction are archived alongside the map; old scene recordings retain their original layout and images without new model calls.
 
 ## A map that can change its mind
 
@@ -261,6 +266,6 @@ The live workspace puts Brainstorm / Direct the map beside a prominent recording
 
 The right inspector has moved into a bottom review dock. Select a concept to read its original words, move/unpin it, or follow relationships and prior concepts. Choose **Transcript** to return to the chronological recording text. Finalized live windows appear before recording finishes; the final transcript replaces those windows without duplicate display. Expand the dock for longer reading, scroll back to pause following, and use **Jump to live** to return to the latest words. Typed input remains available below the transcript.
 
-The map is now a camera-driven canvas: two-axis trackpad/wheel panning, background drag-to-pan, pinch zoom, and Command/Ctrl+wheel zoom around the pointer. **− / 100% / + / Fit map** controls sit beneath the canvas. Keyboard shortcuts follow [MindNode's zoom conventions](https://www.mindnode.com/support/guides/keyboard-shortcuts): Command +/−, Command 0 for actual size, and Command * to fit. Panning uses Rune live offsets, avoiding a full map layout rebuild on every movement; zoom uses immediate scale transforms for complete redraws. The camera stays where you put it as new speech arrives; Fit map reframes the growing map.
+The map is now a camera-driven canvas: two-axis trackpad/wheel panning, background drag-to-pan, pinch zoom, and Command/Ctrl+wheel zoom around the pointer. **− / 100% / + / Fit map** controls sit beneath the canvas. Keyboard shortcuts follow [MindNode's zoom conventions](https://www.mindnode.com/support/guides/keyboard-shortcuts): Command +/−, Command 0 for actual size, and Command * to fit. Panning and zoom gestures use Rune live transforms, avoiding a full interface and map layout rebuild on every movement. The camera stays where you put it as new speech arrives; Fit map reframes the growing map.
 
 Camera position/zoom, dock expansion, follow mode and transcript scroll position are saved in presentation events. Older presentation events retain the original interface for scene replay. No network or microphone access is needed for headless UI checks.

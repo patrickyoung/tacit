@@ -12,6 +12,8 @@ use std::io;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Artwork {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mural: Option<crate::artist::Mural>,
     pub key: String,
     pub fingerprint: String,
     pub slot: usize,
@@ -29,6 +31,8 @@ pub struct Workspace {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mural_layout: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<Workspace>,
     pub session: Session,
@@ -69,6 +73,7 @@ fn zero_size(size: &[f32; 2]) -> bool {
 impl Default for Scene {
     fn default() -> Self {
         Self {
+            mural_layout: false,
             workspace: None,
             session: Session::default(),
             render_time: None,
@@ -109,6 +114,20 @@ impl Scene {
         );
         Ok(value)
     }
+    fn into_presentation_value(mut self) -> io::Result<serde_json::Value> {
+        // The presentation stores only a content hash. Do not serialize the entire
+        // source ledger to a JSON tree just to discard it on every displayed frame.
+        let session = std::mem::take(&mut self.session);
+        let mut value = serde_json::to_value(self).map_err(io::Error::other)?;
+        let state = value.as_object_mut().unwrap();
+        state.remove("session");
+        state.remove("render_time");
+        state.insert(
+            "content_hash".into(),
+            crate::timeline::content_hash(&session)?.into(),
+        );
+        Ok(value)
+    }
 }
 impl crate::timeline::Projection {
     pub fn replay_scene(&self) -> io::Result<Scene> {
@@ -131,9 +150,10 @@ impl crate::timeline::Projection {
             .ok_or_else(|| io::Error::other("Malformed presentation"))?
             .insert(
                 "session".into(),
-                serde_json::to_value(session).map_err(io::Error::other)?,
+                serde_json::to_value(Session::default()).map_err(io::Error::other)?,
             );
         let mut scene: Scene = serde_json::from_value(state).map_err(io::Error::other)?;
+        scene.session = session.clone();
         scene.render_time = self.frame_times.get(RENDERER).copied();
         if scene.viewport.iter().any(|v| !v.is_finite() || *v <= 0.0) {
             return Err(io::Error::other("Invalid recorded viewport"));
@@ -153,9 +173,10 @@ impl crate::timeline::Projection {
             .filter(|p| p.version == 1)
             .and_then(|p| {
                 let mut state = p.state.clone();
-                state
-                    .as_object_mut()?
-                    .insert("session".into(), serde_json::to_value(&self.session).ok()?);
+                state.as_object_mut()?.insert(
+                    "session".into(),
+                    serde_json::to_value(Session::default()).ok()?,
+                );
                 serde_json::from_value::<Scene>(state).ok()
             })
             .unwrap_or_else(|| {
@@ -175,6 +196,7 @@ impl crate::timeline::Projection {
                         a.scope == crate::timeline::ArtworkScope::Theme && a.theme == category.id
                     }) {
                         scene.artwork.push(Artwork {
+                            mural: art.mural.clone(),
                             key: format!("theme-{}", category.id),
                             fingerprint: art.fingerprint.clone(),
                             slot,
@@ -191,6 +213,7 @@ impl crate::timeline::Projection {
                     .find(|a| a.scope == crate::timeline::ArtworkScope::Map)
                 {
                     scene.artwork.push(Artwork {
+                        mural: art.mural.clone(),
                         key: crate::generated_art::CENTRAL_KEY.into(),
                         fingerprint: art.fingerprint.clone(),
                         slot: 0,
@@ -199,6 +222,7 @@ impl crate::timeline::Projection {
                         retired: None,
                     });
                 }
+                scene.mural_layout = scene.artwork.iter().any(|a| a.mural.is_some());
                 scene
             });
         scene.session = self.session.clone();
@@ -224,9 +248,28 @@ impl crate::timeline::Journal {
         self.present_scene(at_ms, scene)
     }
     pub fn present_scene(&mut self, at_ms: u64, scene: Scene) -> io::Result<()> {
+        let events = self.presentation_events(scene)?;
+        if !events.is_empty() {
+            self.append(at_ms, Event::Transaction { events })?;
+        }
+        Ok(())
+    }
+    /// Commit a displayed scene and its original pixels with one durable append.
+    pub fn present_pixels(
+        &mut self,
+        at_ms: u64,
+        scene: Scene,
+        frame: crate::timeline::PixelFrame,
+    ) -> io::Result<()> {
+        let mut events = self.presentation_events(scene)?;
+        events.push(Event::Pixels { frame });
+        self.append(at_ms, Event::Transaction { events })
+    }
+    fn presentation_events(&self, scene: Scene) -> io::Result<Vec<Event>> {
         let mut events = Vec::new();
         for a in &scene.artwork {
             let artwork = SessionArtwork {
+                mural: a.mural.clone(),
                 scope: if a.key == crate::generated_art::CENTRAL_KEY {
                     crate::timeline::ArtworkScope::Map
                 } else {
@@ -240,7 +283,8 @@ impl crate::timeline::Journal {
                 events.push(Event::ArtworkAvailable { artwork });
             }
         }
-        let state = scene.presentation_value()?;
+        let render_time = scene.render_time;
+        let state = scene.into_presentation_value()?;
         if self
             .projection
             .presentations
@@ -253,7 +297,7 @@ impl crate::timeline::Journal {
                 state,
             });
         }
-        if let Some(time) = scene.render_time
+        if let Some(time) = render_time
             && (self.projection.frame_times.get(RENDERER) != Some(&time) || !events.is_empty())
         {
             events.push(Event::Frame {
@@ -261,10 +305,7 @@ impl crate::timeline::Journal {
                 time,
             });
         }
-        if !events.is_empty() {
-            self.append(at_ms, Event::Transaction { events })?;
-        }
-        Ok(())
+        Ok(events)
     }
     /// Strict playback: never synthesize a layout when the recorded track is unavailable.
     pub fn replay_scene_at(&self, at_ms: u64) -> io::Result<Scene> {

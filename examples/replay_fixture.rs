@@ -62,6 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = std::env::args().nth(2) {
         let asset = j.import(std::path::Path::new(&path), "png")?;
         scene.artwork.push(tacit::timeline::Artwork {
+            mural: None,
             key: "lens-0".into(),
             fingerprint: "fixture-art".into(),
             slot: 0,

@@ -51,10 +51,8 @@ fn three_levels_preserve_sources_and_ancestor_membership() {
     assert!(s.within_category(&s.thoughts[0], "Research"));
     assert_eq!(s.thoughts[0].text, original);
     assert_eq!(tacit::art::concepts(&s).len(), 1);
-    assert_eq!(
-        tacit::generated_art::briefs(&s, tacit::art::Style::Pastel, "fixture").len(),
-        1
-    );
+    let evidence = tacit::artist::Evidence::from_session(&s).unwrap();
+    assert!(evidence.data.to_string().contains("Shared budgets"));
 }
 #[test]
 fn rejects_cycles_orphans_and_excess_depth_atomically() {

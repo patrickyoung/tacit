@@ -65,7 +65,7 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
                 let mut camera = s.camera();
                 camera.zoom_at((e.dy * 0.006).exp(), [e.x, e.y]);
                 s.set_camera(camera);
-                tx.instant();
+                tx.live_only();
             } else {
                 let p = s.camera_pan.get();
                 s.camera_pan.set([p[0] + e.dx, p[1] + e.dy]);
@@ -78,13 +78,13 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
                 let mut camera = s.camera();
                 camera.zoom_at(1.0 + e.delta, [e.x, e.y]);
                 s.set_camera(camera);
-                tx.instant();
+                tx.live_only();
             }
             true
         })
         .on_smart_magnify(|s: &mut State, _, _, tx| {
             s.fit_map();
-            tx.instant();
+            tx.live_only();
             true
         })
         .on_drag(|s: &mut State, d, tx| {
@@ -108,8 +108,7 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
             sheet
                 .absolute(0.0, 0.0)
                 .origin(0.0, 0.0)
-                .scale(s.camera_zoom.get())
-                .scale_motion(rune::Spring::NONE)
+                .live_scale(&s.camera_zoom)
                 .live_offset(&s.camera_pan),
         )
 }
@@ -662,7 +661,7 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
         ))
         .child(button(s.art_style.label(), "art-style", |s| {
             if s.replay.is_none() {
-                s.art_style = s.art_style.next();
+                s.art_style = s.art_style.toggle();
             }
         }))
         .child(button("Undo", "undo", State::undo));
