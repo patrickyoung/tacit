@@ -100,6 +100,8 @@ pub struct State {
     pixel_image: Option<(String, rune::Image)>,
     last_pixels: Option<([u8; 32], tacit::timeline::PixelFrame)>,
     video_export: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    video_destination_pending: bool,
+    saved_video: Option<PathBuf>,
     replay_audio: Option<(String, rune::Player)>,
     replay_images: std::collections::HashMap<String, rune::Image>,
     image_cache: rune::ImageCache,
@@ -288,6 +290,9 @@ impl State {
             ..Self::empty()
         };
         state.restore_scene(scene, now);
+        state
+            .gallery
+            .set_session_identity(state.path.as_ref().unwrap());
         Ok(state)
     }
     fn refresh_sessions(&mut self) {
@@ -312,7 +317,7 @@ impl State {
                 | VoiceState::Finishing
                 | VoiceState::Cancelling
         ) || !self.pending_recordings.is_empty()
-            || self.video_export.is_some()
+            || self.video_busy()
             || self.directing
             || self.queued_direction.is_some()
         {
@@ -366,7 +371,12 @@ impl State {
         let Some(base) = &self.library_base else {
             return;
         };
-        match tacit::sessions::create(base, &self.session_name_edit.text) {
+        let created = if self.session_name_edit.text.trim().is_empty() {
+            tacit::sessions::create_automatic(base)
+        } else {
+            tacit::sessions::create(base, &self.session_name_edit.text)
+        };
+        match created {
             Ok(entry) => self.switch_session(entry.path),
             Err(e) => self.status = format!("Cannot create session: {e}"),
         }
@@ -401,6 +411,8 @@ impl State {
             pixel_replay: false,
             pixel_image: None,
             video_export: None,
+            video_destination_pending: false,
+            saved_video: None,
             last_pixels: None,
             replay_audio: None,
             replay_images: Default::default(),
@@ -1360,25 +1372,145 @@ impl State {
             })
             .collect();
     }
-    fn export_video(&mut self) {
-        if self.video_export.is_some() {
+    fn video_busy(&self) -> bool {
+        self.video_destination_pending || self.video_export.is_some()
+    }
+    fn first_video_frame_ms(&self) -> Option<u64> {
+        self.journal.as_ref()?.entries.iter().find_map(|entry| {
+            entry
+                .event
+                .leaves()
+                .any(|event| matches!(event, tacit::timeline::Event::Pixels { .. }))
+                .then_some(entry.at_ms)
+        })
+    }
+    fn replay_start_ms(&self) -> u64 {
+        self.pixel_replay
+            .then(|| self.first_video_frame_ms())
+            .flatten()
+            .or_else(|| self.journal.as_ref()?.first_frame_ms())
+            .unwrap_or(0)
+    }
+    fn can_play_session(&self) -> bool {
+        self.journal.is_some()
+            && (self.replay.is_some() || !self.read_only)
+            && !self.voice_in_progress()
+            && self.pending_recordings.is_empty()
+            && !self.directing
+            && self.queued_direction.is_none()
+            && !self.video_busy()
+    }
+    fn play_session(&mut self) {
+        if !self.can_play_session() {
+            return;
+        }
+        if self.replay.is_none() {
+            self.toggle_replay();
+        }
+        if let Some(replay) = &mut self.replay {
+            replay.playing = true;
+            replay.last_tick = None;
+        }
+    }
+    fn choose_video_file(&mut self, tx: &mut Tx) {
+        if !self.can_play_session() || self.first_video_frame_ms().is_none() {
+            return;
+        }
+        let title: String = self
+            .session_name
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+            .take(64)
+            .collect();
+        let title = if title.trim().is_empty() {
+            "Tacit session"
+        } else {
+            title.trim()
+        };
+        let options = rune::FileDialogOptions {
+            title: "Save session video".into(),
+            file_name: Some(format!("{title}-{}.mkv", tacit::timeline::unix_ms())),
+            ..Default::default()
+        }
+        .filter("Lossless video", &["mkv"]);
+        self.video_destination_pending = true;
+        tx.save_file(options, |s: &mut State, result, _| {
+            s.video_destination_pending = false;
+            match result {
+                Ok(Some(path)) => s.export_video_to(path),
+                Ok(None) => {}
+                Err(error) => s.status = format!("Cannot choose a video destination: {error}"),
+            }
+        });
+    }
+    fn export_video_to(&mut self, mut output: PathBuf) {
+        if !self.can_play_session() || self.first_video_frame_ms().is_none() {
+            return;
+        }
+        if output.extension().is_none() {
+            output.set_extension("mkv");
+        }
+        if output.extension().and_then(|s| s.to_str()) != Some("mkv") {
+            self.status = "Choose an .mkv filename for the lossless video".into();
+            return;
+        }
+        if output.exists() {
+            self.status = "That file already exists · choose a new video filename".into();
+            return;
+        }
+        // Freeze the journal before the worker reads it. Live capture stays paused
+        // until export completes, so the audio and pixels share a stable endpoint.
+        if self.replay.is_none() {
+            self.toggle_replay();
+        }
+        if self.replay.is_none() {
             return;
         }
         let Some(journal) = &self.journal else {
             return;
         };
         let source = journal.root.clone();
-        let output = source.join(format!("original-{}.mkv", tacit::timeline::unix_ms()));
         let (send, receive) = std::sync::mpsc::channel();
         self.video_export = Some(receive);
-        self.status = "Exporting original pixels and audio as lossless video…".into();
+        self.status = "Saving video with original audio…".into();
+        let wake = self.wake.clone();
         std::thread::spawn(move || {
             let result = tacit::timeline::Journal::read(&source)
                 .and_then(|journal| tacit::video_archive::export(&journal, &output))
                 .map(|()| output)
                 .map_err(|e| e.to_string());
             let _ = send.send(result);
+            if let Some(wake) = wake {
+                wake();
+            }
         });
+    }
+    fn show_saved_video(&mut self) {
+        let Some(path) = &self.saved_video else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        let result = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .status();
+        #[cfg(target_os = "windows")]
+        let result = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .status();
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let result = std::process::Command::new("xdg-open")
+            .arg(path.parent().unwrap_or(path))
+            .status();
+        match result {
+            Ok(status) if status.success() => {}
+            _ => {
+                self.status = format!(
+                    "Video saved at {} · could not open its folder",
+                    path.display()
+                )
+            }
+        }
     }
     pub fn capturing_pixels(&self) -> bool {
         self.journal.is_some() && !self.read_only && self.replay.is_none() && !self.sessions_open
@@ -1457,12 +1589,15 @@ impl State {
         Ok(())
     }
     fn toggle_replay(&mut self) {
-        if self.archive_only {
+        if self.archive_only || self.video_busy() {
             return;
         }
         if matches!(
             self.voice_state,
-            VoiceState::Recording | VoiceState::Starting | VoiceState::Finishing
+            VoiceState::Recording
+                | VoiceState::Starting
+                | VoiceState::Finishing
+                | VoiceState::Cancelling
         ) || !self.pending_recordings.is_empty()
             || self.directing
             || self.queued_direction.is_some()
@@ -1481,6 +1616,7 @@ impl State {
                 );
             }
             self.read_only = false;
+            self.pixel_image = None;
             self.voice_state = VoiceState::Unavailable;
             self.voice_status = "Replay ended · reconnect Hex to record".into();
         } else if self.journal.is_some() && !self.read_only {
@@ -1497,24 +1633,28 @@ impl State {
                 return;
             }
             self.gallery.suspend();
+            self.pixel_replay = self.first_video_frame_ms().is_some();
             self.replay = Some(Replay {
-                at_ms: self.journal.as_ref().unwrap().first_frame_ms().unwrap(),
+                at_ms: self.replay_start_ms(),
                 playing: false,
                 last_tick: None,
                 last_projected: None,
             });
             self.read_only = true;
         }
+        if let Some(wake) = &self.wake {
+            wake();
+        }
     }
     fn seek_replay(&mut self, delta: i64) {
         let end = self.journal.as_ref().map_or(0, |j| j.duration());
+        let start = self.replay_start_ms();
         if let Some(replay) = &mut self.replay {
-            replay.at_ms = replay.at_ms.saturating_add_signed(delta).min(end).max(
-                self.journal
-                    .as_ref()
-                    .and_then(|j| j.first_frame_ms())
-                    .unwrap_or(0),
-            );
+            replay.at_ms = replay
+                .at_ms
+                .saturating_add_signed(delta)
+                .min(end)
+                .max(start);
             replay.last_tick = None;
         }
         if let Some((_, player)) = self.replay_audio.take() {
@@ -1630,7 +1770,31 @@ impl State {
         }
         if let Some(path) = &self.path {
             self.status = match storage::save(path, &self.projection.session) {
-                Ok(()) => "Saved on this device".into(),
+                Ok(()) => {
+                    if let Some(base) = &self.library_base {
+                        match tacit::sessions::update_automatic_name(
+                            base,
+                            path,
+                            &self.projection.session,
+                        ) {
+                            Ok(name) => {
+                                self.session_name = name.clone();
+                                if let Some(entry) =
+                                    self.session_entries.iter_mut().find(|e| &e.path == path)
+                                {
+                                    entry.name = name;
+                                }
+                            }
+                            Err(e) => {
+                                self.status = format!(
+                                    "Session saved, but its name could not be updated: {e}"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    "Saved on this device".into()
+                }
                 Err(e) => format!("Not saved: {e}. Use Retry save."),
             };
         }
@@ -1741,6 +1905,13 @@ fn button(content: &str, key: &str, action: impl Fn(&mut State) + 'static) -> El
         .radius(7.0)
         .hover(LINE)
         .on_press(action)
+}
+fn enabled(control: El, available: bool) -> El {
+    if available {
+        control
+    } else {
+        control.inert().focusable(false).opacity(0.45)
+    }
 }
 fn color(role: Role) -> Color {
     match role {
@@ -2040,6 +2211,14 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
     let leaf_w = (width * 0.27).min(255.0);
     let mural_w = (width - 2.0 * (leaf_w + indent + 80.0)).clamp(360.0, 640.0);
     let mural_h = mural_w * 2.0 / 3.0;
+    let reserve_art = mural
+        && s.replay.is_none()
+        && s.art_style != Style::Off
+        && s.gallery.layers.iter().any(|l| {
+            l.key == generated_art::CENTRAL_KEY
+                && l.mural.is_some()
+                && l.opacity(s.gallery.now) > 0.0
+        });
     let mut drawing = Shape::new();
     let mut labels = Vec::new();
     for (group, (_, name, role)) in groups.iter().enumerate() {
@@ -2055,7 +2234,18 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         } else {
             width - leaf_w - 55.0 - indent
         };
-        let start = if mural {
+        let start = if reserve_art {
+            // Transparent faces and objects must not expose branch strokes.
+            [
+                center[0]
+                    + if left {
+                        -mural_w / 2.0 - 12.0
+                    } else {
+                        mural_w / 2.0 + 12.0
+                    },
+                center[1],
+            ]
+        } else if mural {
             center
         } else {
             [
@@ -2219,20 +2409,20 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                     id.map_or_else(
                         || "Growing · Enter to keep".into(),
                         |id| {
-                            format!(
-                                "{:02}{}",
-                                id,
-                                if s.projection
-                                    .session
-                                    .thoughts
-                                    .iter()
-                                    .any(|t| t.id == id && t.pinned)
-                                {
-                                    " · pinned"
+                            let pinned = s
+                                .projection
+                                .session
+                                .thoughts
+                                .iter()
+                                .any(|t| t.id == id && t.pinned);
+                            if s.modern_ui {
+                                return if pinned {
+                                    "Pinned".into()
                                 } else {
-                                    ""
-                                }
-                            )
+                                    String::new()
+                                };
+                            }
+                            format!("{:02}{}", id, if pinned { " · pinned" } else { "" })
                         },
                     ),
                     10.0,
@@ -2537,6 +2727,70 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         map
     }
 }
+fn save_video_button(s: &State) -> El {
+    let has_video = s.first_video_frame_ms().is_some();
+    enabled(
+        button(
+            if s.video_export.is_some() {
+                "Saving video…"
+            } else {
+                "Save video"
+            },
+            "export-video",
+            |_| {},
+        )
+        .on_press_tx(State::choose_video_file)
+        .help(if has_video {
+            "Choose where to save the original video and audio. Live capture pauses while saving."
+        } else {
+            "This session has no recorded video frames. Scene playback is still available."
+        }),
+        has_video && s.can_play_session(),
+    )
+}
+fn saved_video_button(s: &State) -> El {
+    if let Some(path) = &s.saved_video {
+        button(
+            if cfg!(target_os = "macos") {
+                "Show in Finder"
+            } else {
+                "Show in folder"
+            },
+            "show-video",
+            State::show_saved_video,
+        )
+        .help(path.display().to_string())
+    } else {
+        el()
+    }
+}
+fn session_video_controls(s: &State) -> El {
+    if s.journal.is_none() || s.replay.is_some() || s.archive_only {
+        return el();
+    }
+    row()
+        .gap(4.0)
+        .center_y()
+        .child(enabled(
+            button(
+                if s.first_video_frame_ms().is_some() {
+                    "Play video"
+                } else {
+                    "Play session"
+                },
+                "replay",
+                State::play_session,
+            )
+            .help(if s.can_play_session() {
+                "Watch this session from the beginning with its original audio."
+            } else {
+                "Finish recording, transcription or map guidance before playback."
+            }),
+            s.can_play_session(),
+        ))
+        .child(save_video_button(s))
+        .child(saved_video_button(s))
+}
 fn replay_controls(s: &State) -> El {
     let replay = s.replay.as_ref().unwrap();
     col()
@@ -2550,13 +2804,10 @@ fn replay_controls(s: &State) -> El {
                     "replay-play",
                     |s| {
                         let end = s.journal.as_ref().map_or(0, |j| j.duration());
+                        let start = s.replay_start_ms();
                         if let Some(r) = &mut s.replay {
                             if r.at_ms >= end {
-                                r.at_ms = s
-                                    .journal
-                                    .as_ref()
-                                    .and_then(|j| j.first_frame_ms())
-                                    .unwrap_or(0);
+                                r.at_ms = start;
                             }
                             r.playing = !r.playing;
                             r.last_tick = None;
@@ -2579,33 +2830,38 @@ fn replay_controls(s: &State) -> El {
                     INK,
                 )),
         )
-        .child(label(s.replay_caption(), 11.0, MUTED))
+        .child(label(s.replay_caption(), 11.0, MUTED).wrap_anywhere())
         .child(
             row()
                 .gap(8.0)
-                .child(button(
-                    if s.pixel_replay {
-                        "Scene replay"
-                    } else {
-                        "Original pixels"
-                    },
-                    "replay-renderer",
-                    |s| {
-                        s.pixel_replay = !s.pixel_replay;
-                        if let Some(replay) = &mut s.replay {
-                            replay.last_projected = None;
-                        }
-                    },
-                ))
-                .child(button(
-                    "Export lossless video",
-                    "export-video",
-                    State::export_video,
-                ))
+                .child(if s.first_video_frame_ms().is_some() {
+                    button(
+                        if s.pixel_replay {
+                            "Scene replay"
+                        } else {
+                            "Video playback"
+                        },
+                        "replay-renderer",
+                        |s| {
+                            s.pixel_replay = !s.pixel_replay;
+                            s.seek_replay(0);
+                            if let Some(replay) = &mut s.replay {
+                                replay.last_projected = None;
+                            }
+                        },
+                    )
+                } else {
+                    label("Scene playback · no recorded video", 11.0, MUTED)
+                })
+                .child(save_video_button(s))
+                .child(saved_video_button(s))
                 .child(if s.archive_only {
                     label("Saved archive", 11.0, MUTED)
                 } else {
-                    button("Back to live", "back-live", State::toggle_replay)
+                    enabled(
+                        button("Back to live", "back-live", State::toggle_replay),
+                        !s.video_busy(),
+                    )
                 }),
         )
 }
@@ -2707,10 +2963,28 @@ fn legacy_view(s: &State, cx: &mut Cx<State>) -> El {
             .w_full()
             .h_full()
             .fill(PAPER)
+            .child(
+                row()
+                    .padding(12.0)
+                    .gap(12.0)
+                    .center_y()
+                    .child(label("SESSION VIDEO", 11.0, GREEN))
+                    .child(
+                        label(&s.session_name, 14.0, INK)
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .truncate(),
+                    )
+                    .child(sessions_button(s)),
+            )
             .child(picture)
             .child(replay_controls(s).padding(12.0))
-            .child(sessions_button(s))
-            .child(label(s.status.clone(), 11.0, MUTED));
+            .child(
+                label(s.status.clone(), 11.0, MUTED)
+                    .px(12.0)
+                    .py(8.0)
+                    .wrap_anywhere(),
+            );
     }
     if s.replay.is_some() {
         cx.reduced_motion(s.reduced_motion);
@@ -3352,7 +3626,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
 }
 pub fn on_key(s: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    if s.modern_ui && s.replay.is_none() {
+    if s.modern_ui && s.replay.is_none() && !s.story {
         match event.key {
             Key::Command('+') | Key::Command('=') => {
                 s.zoom_center(1.2);
@@ -3484,10 +3758,13 @@ pub fn poll(s: &mut State, frame_now: f64, tx: &mut Tx) -> bool {
     if let Some(receiver) = &s.video_export {
         match receiver.try_recv() {
             Ok(result) => {
-                s.status = result.map_or_else(
-                    |e| format!("Video export failed: {e}"),
-                    |p| format!("Original video saved: {}", p.display()),
-                );
+                match result {
+                    Ok(path) => {
+                        s.status = format!("Video saved: {}", path.display());
+                        s.saved_video = Some(path);
+                    }
+                    Err(error) => s.status = format!("Video export failed: {error}"),
+                }
                 s.video_export = None;
                 export_changed = true;
             }
@@ -3939,6 +4216,9 @@ mod tests {
 
     fn mural_fixture() -> tacit::artist::Mural {
         tacit::artist::Mural {
+            identity: "fixture-session".into(),
+            content: "fixture-content".into(),
+            render_policy: "fixture-policy".into(),
             direction: tacit::artist::Direction {
                 story: "A team struggles to decide who owns a decision".into(),
                 connections: vec![tacit::artist::VisualConnection {
@@ -4294,6 +4574,33 @@ mod tests {
         assert_eq!(state.path.as_ref(), Some(&base));
         assert_eq!(state.draft.text, "Unfinished draft");
     }
+
+    #[test]
+    fn new_session_does_not_inherit_the_rename_field_and_gets_a_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("session.json");
+        let mut rt = runtime((820.0, 640.0));
+        rt.state = State::open_session(base.clone()).unwrap();
+        rt.state.library_base = Some(base.clone());
+        rt.state.refresh_sessions();
+        rt.state.sessions_open = true;
+        rt.state.session_name_edit = TextEdit::new("The previous conversation");
+        rt.invalidate();
+        click(&mut rt, "session-create");
+        assert_ne!(rt.state.path.as_ref(), Some(&base));
+        assert_eq!(rt.state.session_name, "Conversation 1");
+        assert!(rt.state.projection.session.thoughts.is_empty());
+        rt.state.draft = TextEdit::new("How should we improve onboarding?");
+        rt.state.capture();
+        assert_eq!(rt.state.session_name, "How should we improve onboarding?");
+        let first = rt.state.path.clone();
+        click(&mut rt, "sessions");
+        click(&mut rt, "session-create");
+        assert_ne!(rt.state.path, first);
+        assert!(rt.state.session_name.starts_with("Conversation "));
+        rt.state.switch_session(first.unwrap());
+        assert_eq!(rt.state.session_name, "How should we improve onboarding?");
+    }
     #[test]
     fn failed_journal_write_never_publishes_a_live_edit() {
         let dir = tempfile::tempdir().unwrap();
@@ -4442,6 +4749,221 @@ mod tests {
         assert_eq!(rt.state.projection.session, expected);
         assert_eq!(rt.state.art_style, Style::Ink);
     }
+    fn video_runtime(dir: &std::path::Path, size: (f32, f32)) -> Runtime<State> {
+        let mut rt = runtime(size);
+        rt.state.session_name = "Make room for meaningful work".into();
+        rt.state.journal = Some(
+            tacit::timeline::Journal::open(
+                &dir.join("session.json"),
+                rt.state.projection.session.clone(),
+            )
+            .unwrap(),
+        );
+        rt.state
+            .record_pixels((2, 2), 1.0, &[255, 0, 0, 255].repeat(4))
+            .unwrap();
+        let journal = rt.state.journal.as_mut().unwrap();
+        let asset = journal
+            .import_bytes(
+                &tacit::video_archive::png_bytes(2, 2, &[0, 0, 255, 255].repeat(4)).unwrap(),
+                "png",
+            )
+            .unwrap();
+        let frame = tacit::timeline::PixelFrame {
+            asset,
+            width: 2,
+            height: 2,
+            scale: 1.0,
+            content_hash: tacit::timeline::content_hash(&journal.projection.session).unwrap(),
+        };
+        journal
+            .present_pixels(journal.now_ms() + 20_000, journal.projection.scene(), frame)
+            .unwrap();
+        rt.state.projection = journal.projection.clone();
+        rt.invalidate();
+        rt.frame(1.0);
+        rt
+    }
+    #[test]
+    fn video_actions_play_original_frames_and_restore_live_at_both_sizes() {
+        for size in [(820.0, 640.0), (1280.0, 860.0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut rt = video_runtime(dir.path(), size);
+            let expected = rt.state.projection.session.clone();
+            for key in ["replay", "export-video"] {
+                let rect = rt
+                    .elements()
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(key))
+                    .map(|e| e.rect)
+                    .unwrap();
+                assert!(
+                    rect[0] >= 0.0
+                        && rect[1] >= 0.0
+                        && rect[0] + rect[2] <= size.0 + 1.0
+                        && rect[1] + rect[3] <= size.1 + 1.0,
+                    "{key} must remain visible at {size:?}: {rect:?}"
+                );
+            }
+            click(&mut rt, "replay");
+            rt.frame(1.0); // Playback projection runs on the frame after the action.
+            assert!(rt.state.pixel_replay);
+            assert!(rt.state.replay.as_ref().unwrap().playing);
+            let first_asset = rt.state.pixel_image.as_ref().unwrap().0.clone();
+            assert!(!rt.state.capturing_pixels());
+            click(&mut rt, "replay-play");
+            assert!(!rt.state.replay.as_ref().unwrap().playing);
+            click(&mut rt, "replay-forward");
+            click(&mut rt, "replay-forward");
+            rt.frame(1.0);
+            assert_ne!(rt.state.pixel_image.as_ref().unwrap().0, first_asset);
+            click(&mut rt, "replay-back");
+            rt.frame(1.0);
+            assert_eq!(rt.state.pixel_image.as_ref().unwrap().0, first_asset);
+            click(&mut rt, "replay-renderer");
+            assert!(!rt.state.pixel_replay);
+            click(&mut rt, "replay-renderer");
+            assert!(rt.state.pixel_replay);
+            click(&mut rt, "back-live");
+            assert!(rt.state.replay.is_none());
+            assert!(rt.state.capturing_pixels());
+            assert_eq!(rt.state.projection.session, expected);
+        }
+    }
+    #[test]
+    fn save_video_dialog_can_cancel_and_reject_existing_files_without_stopping_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = video_runtime(dir.path(), (820.0, 640.0));
+        click(&mut rt, "export-video");
+        let (kind, options) = rt.file_dialog().unwrap();
+        assert_eq!(kind, rune::FileDialogKind::Save);
+        assert!(
+            options
+                .file_name
+                .as_ref()
+                .unwrap()
+                .starts_with("Make room for meaningful work-")
+        );
+        assert!(!rt.state.can_switch_session());
+        rt.resolve_file_dialog(None).unwrap();
+        rt.frame(1.0);
+        assert!(rt.state.capturing_pixels());
+        assert!(rt.state.replay.is_none());
+        assert!(!rt.state.video_busy());
+        let existing = dir.path().join("keep.mkv");
+        std::fs::write(&existing, b"keep this file").unwrap();
+        click(&mut rt, "export-video");
+        rt.resolve_file_dialog(Some(existing.clone())).unwrap();
+        rt.frame(1.0);
+        assert_eq!(std::fs::read(existing).unwrap(), b"keep this file");
+        assert!(rt.state.status.contains("already exists"));
+        assert!(rt.state.capturing_pixels());
+        assert!(!rt.state.video_busy());
+    }
+    #[test]
+    fn save_video_from_live_exports_to_chosen_path_and_can_return_to_voice() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            eprintln!("ffmpeg unavailable; UI codec integration test skipped");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = video_runtime(dir.path(), (820.0, 640.0));
+        click(&mut rt, "export-video");
+        let destination = dir.path().join("my session video");
+        rt.resolve_file_dialog(Some(destination.clone())).unwrap();
+        rt.frame(1.0);
+        assert!(rt.state.replay.is_some());
+        assert!(!rt.state.capturing_pixels());
+        if rt.state.video_export.is_some() {
+            rt.state.toggle_replay();
+            assert!(
+                rt.state.replay.is_some(),
+                "capture must stay closed during export"
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while rt.state.video_export.is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            rt.frame(1.0);
+        }
+        assert!(!rt.state.video_busy(), "export timed out");
+        let output = destination.with_extension("mkv");
+        assert_eq!(
+            rt.state.saved_video.as_ref(),
+            Some(&output),
+            "{}",
+            rt.state.status
+        );
+        assert!(std::fs::metadata(&output).unwrap().len() > 0);
+        assert!(rt.find("show-video").is_some());
+        let probe = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v",
+                "-show_entries",
+                "stream=codec_name,width,height",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(probe.status.success());
+        assert_eq!(String::from_utf8(probe.stdout).unwrap().trim(), "ffv1,2,2");
+        click(&mut rt, "back-live");
+        assert!(rt.state.capturing_pixels());
+        assert!(rt.find("replay").is_some());
+        assert!(rt.find("export-video").is_some());
+    }
+    #[test]
+    fn video_controls_respect_voice_work_and_scene_only_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = video_runtime(dir.path(), (820.0, 640.0));
+        for voice in [
+            VoiceState::Starting,
+            VoiceState::Recording,
+            VoiceState::Finishing,
+            VoiceState::Cancelling,
+        ] {
+            rt.state.voice_state = voice;
+            rt.invalidate();
+            click(&mut rt, "replay");
+            click(&mut rt, "export-video");
+            assert!(rt.state.replay.is_none());
+            assert!(rt.file_dialog().is_none());
+        }
+        rt.state.voice_state = VoiceState::Ready;
+        rt.state.journal = Some(
+            tacit::timeline::Journal::open(
+                &dir.path().join("older-session.json"),
+                rt.state.projection.session.clone(),
+            )
+            .unwrap(),
+        );
+        rt.invalidate();
+        click(&mut rt, "export-video");
+        assert!(rt.file_dialog().is_none());
+        click(&mut rt, "replay");
+        assert!(rt.state.replay.is_some());
+        assert!(!rt.state.pixel_replay);
+        assert!(rt.find("replay-renderer").is_none());
+        // Read-only archives retain export controls whenever original frames exist.
+        let mut rt = video_runtime(&dir.path().join("read-only"), (820.0, 640.0));
+        rt.state.toggle_replay();
+        rt.state.archive_only = true;
+        rt.invalidate();
+        click(&mut rt, "export-video");
+        assert!(rt.file_dialog().is_some());
+        assert!(rt.find("back-live").is_none());
+        rt.resolve_file_dialog(None).unwrap();
+        rt.frame(1.0);
+    }
     #[test]
     fn typing_previews_then_enter_captures_without_losing_original_words() {
         let mut rt = runtime((1280.0, 860.0));
@@ -4580,6 +5102,10 @@ mod tests {
     #[test]
     fn ink_art_toggles_without_changing_the_map() {
         let mut rt = runtime((820.0, 640.0));
+        let (send, _requests) = std::sync::mpsc::channel();
+        let (_responses, receive) = std::sync::mpsc::channel();
+        rt.state.gallery.worker = Some(generated_art::Worker { send, receive });
+        rt.invalidate();
         let before = rt.state.projection.session.clone();
         let ids = rt
             .state
@@ -4705,8 +5231,22 @@ mod tests {
         assert!(commands.try_recv().is_err());
         events.send(VoiceEvent::Recording).unwrap();
         rt.frame(0.0);
+        click(&mut rt, "mode-direct");
+        assert!(!rt.state.direction_mode, "Recording locks the input mode");
+        assert!(
+            rt.elements()
+                .iter()
+                .filter(|e| { matches!(e.key.as_deref(), Some("mode-direct" | "mode-brainstorm")) })
+                .all(|e| e.inert && !e.focusable)
+        );
+        // A storage failure must never take away the microphone's stop control.
+        rt.state.read_only = true;
+        rt.invalidate();
+        rt.frame(0.0);
+        assert!(rt.find("thought-input").is_none());
         click(&mut rt, "voice-stop");
         assert_eq!(commands.try_recv().unwrap(), VoiceCommand::Finish);
+        rt.state.read_only = false;
         events
             .send(VoiceEvent::Transcript("A thought".into()))
             .unwrap();
@@ -4848,11 +5388,91 @@ mod tests {
             assert!(!rt.state.sessions_open);
             click(&mut rt, "transcript-expand");
             assert!(rt.state.transcript_expanded);
-            click(&mut rt, "transcript-follow");
+            assert!(rt.find("transcript-follow").is_none());
+            let (x, y) = rt.find("transcript-scroll").unwrap();
+            rt.wheel_event(rune::WheelEvent::new(0.0, 80.0).at(x, y).precise(true));
+            rt.frame(1.0);
             assert!(!rt.state.transcript_following);
             click(&mut rt, "transcript-follow");
             assert!(rt.state.transcript_following);
+            assert!(rt.find("transcript-follow").is_none());
         }
+    }
+
+    #[test]
+    fn unavailable_guidance_preserves_the_draft_and_explains_the_requirement() {
+        let mut rt = runtime((820.0, 640.0));
+        let before = rt.state.projection.session.clone();
+        click(&mut rt, "mode-direct");
+        click(&mut rt, "thought-input");
+        rt.key(KeyEvent {
+            key: Key::Text("Put decisions first".into()),
+            mods: Mods::default(),
+        });
+        rt.frame(1.0);
+        assert!(rt.find("voice-start").is_none());
+        assert!(rt.find("voice-check").is_none());
+        let elements = rt.elements();
+        let submit = elements
+            .iter()
+            .find(|e| e.key.as_deref() == Some("capture"))
+            .unwrap();
+        assert!(submit.inert && !submit.focusable);
+        assert!(
+            elements
+                .iter()
+                .any(|e| e.key.as_deref() == Some("voice-feedback")
+                    && e.text.as_deref().is_some_and(|t| t.contains("OpenRouter")))
+        );
+        rt.key(KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        });
+        rt.frame(1.0);
+        assert_eq!(rt.state.direction_draft.text, "Put decisions first");
+        assert_eq!(rt.state.projection.session, before);
+        assert!(rt.state.queued_direction.is_none());
+        click(&mut rt, "mode-brainstorm");
+        assert!(rt.state.draft.text.is_empty());
+        assert_eq!(rt.state.direction_draft.text, "Put decisions first");
+    }
+
+    #[test]
+    fn workspace_removes_inapplicable_actions_without_hiding_recovery() {
+        let mut rt = runtime((820.0, 640.0));
+        for key in [
+            "capture",
+            "save",
+            "undo",
+            "art-style",
+            "retry-art",
+            "voice-check",
+        ] {
+            assert!(
+                rt.find(key).is_none(),
+                "{key} has no action in the idle demo"
+            );
+        }
+        click(&mut rt, "toggle-story");
+        assert!(rt.find("map-navigation").is_none());
+        assert!(rt.find("thought-input").is_some());
+        click(&mut rt, "toggle-story");
+        assert!(rt.find("zoom-fit").is_some());
+
+        rt.state.path = Some(PathBuf::from("unused-recovery-path.json"));
+        rt.state.status = "Not saved: disk full. Use Retry save.".into();
+        rt.frame(1.0);
+        assert!(rt.find("save").is_some());
+        rt.state.read_only = true;
+        rt.frame(1.0);
+        assert!(rt.find("save").is_none());
+        assert!(rt.find("thought-input").is_none());
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|e| e.key.as_deref() == Some("session-status")
+                    && e.text.as_deref().is_some_and(|t| t.contains("disk full")))
+        );
     }
     #[test]
     fn live_voice_keeps_transcript_review_visible() {

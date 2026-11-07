@@ -1,7 +1,7 @@
 //! One evolving mural. Art direction and image editing run off the UI thread.
 use crate::{
     art::Style,
-    artist::{self, Direction, Evidence, Mural},
+    artist::{self, Action, Decision, Direction, Evidence, Mural},
     model::Session,
     organizer::CloudConfig,
 };
@@ -21,6 +21,22 @@ pub const MODEL: &str = "openai/gpt-image-2.5-flare";
 /// Kept stable for archived artwork and other renderers.
 pub const CENTRAL_KEY: &str = "map-synthesis";
 const IMAGE_SIZE: &str = "1536x1024";
+const IMAGE_QUALITY: &str = "high";
+const DRAW: &str = "Draw a fresh composition from this session's art direction and fictional design cues. Make its specific story immediately recognizable. This session has its own cast; there are no recurring Tacit characters. Return the complete mural with alpha transparency.";
+const EDIT: &str = "Edit the supplied mural IN PLACE using the direction's change instructions. Preserve only the specified useful anchors and distinctive characters from THIS session. Simplify weak details as needed; narrative accuracy and visual clarity take priority over keeping obsolete scenery. Return the complete updated mural with alpha transparency.";
+
+/// A prompt or rendering change must reach existing sessions even without new speech.
+fn render_policy() -> String {
+    blake3::hash(
+        format!(
+            "{}\0{DRAW}\0{EDIT}\0{IMAGE_QUALITY}\0{IMAGE_SIZE}\0transparent\0png",
+            artist::policy()
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
+}
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const INITIAL_DELAY: f64 = 8.0;
 const UPDATE_INTERVAL: f64 = 30.0;
@@ -33,25 +49,28 @@ pub struct Brief {
     pub previous: Option<Arc<Vec<u8>>>,
 }
 impl Brief {
-    pub fn new(direction: &Direction, model: &str, previous: Option<Arc<Vec<u8>>>) -> Self {
-        let operation = if previous.is_some() {
-            "Edit the supplied mural IN PLACE using the art direction's change instructions. It is the actual previous artwork, not a loose style reference. Preserve the specified continuity anchors and unchanged areas. When the direction calls for re-staging an irrelevant older setting, replace its setting, props and actions as instructed while retaining useful character, perspective and composition continuity. Narrative accuracy takes priority over preserving obsolete scenery. Return the complete updated mural with alpha transparency."
-        } else {
-            "Draw the first scene of a mural that will evolve with a conversation. Make the specific story and visible interactions in the art direction immediately recognizable, with room for the scene to develop."
-        };
+    pub fn new(
+        direction: &Direction,
+        model: &str,
+        previous: Option<Arc<Vec<u8>>>,
+        identity: &str,
+        content: &str,
+    ) -> Self {
+        let operation = if previous.is_some() { EDIT } else { DRAW };
         let direction = serde_json::to_string(direction).expect("serializable direction");
         let prompt = format!(
-            "{operation}\nPurpose: {}\nArt direction: {direction}\nThe story and connections explain what the actions must convey; do not render them as text or separate illustrations.\nComposition: {}\nVisual language: {}",
+            "{operation}\nPurpose: {}\nArt direction: {direction}\nThe story and connections explain what the actions must convey; do not render them as text or separate illustrations.\nComposition: {}\nVisual language: {}\nSession design brief: {}. These are fictional starting points when the source gives no appearance, not facts about participants. Follow the explicit scene for the final cast. Never draw the key as text.",
             artist::NARRATIVE,
             artist::COMPOSITION,
             artist::STYLE,
+            artist::visual_identity(identity),
         );
         let parent = previous
             .as_ref()
             .map(|b| blake3::hash(b).to_hex().to_string());
         let fingerprint = blake3::hash(
             format!(
-                "tacit-mural-image-v1\0{model}\0low\0{IMAGE_SIZE}\0transparent\0png\0{}\0{prompt}",
+                "tacit-mural-image-v2\0{content}\0{model}\0{IMAGE_QUALITY}\0{IMAGE_SIZE}\0transparent\0png\0{}\0{prompt}",
                 parent.as_deref().unwrap_or("initial")
             )
             .as_bytes(),
@@ -72,6 +91,53 @@ fn data_url(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     )
 }
+/// Review the visible ink on a light canvas, not the arbitrary RGB hidden under
+/// transparent pixels. The original RGBA remains the image-edit reference/archive.
+fn review_preview(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    validate_png(bytes)?;
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder
+        .read_info()
+        .map_err(|_| "Cannot read mural preview")?;
+    let size = reader
+        .output_buffer_size()
+        .filter(|s| *s <= 64 * 1024 * 1024)
+        .ok_or("Mural preview is too large")?;
+    let mut pixels = vec![0; size];
+    let info = reader
+        .next_frame(&mut pixels)
+        .map_err(|_| "Cannot decode mural preview")?;
+    let channels = info.color_type.samples();
+    let mut rgb = Vec::with_capacity(info.width as usize * info.height as usize * 3);
+    for pixel in pixels[..info.buffer_size()].chunks_exact(channels) {
+        let (color, alpha) = match info.color_type {
+            png::ColorType::Rgba => ([pixel[0], pixel[1], pixel[2]], pixel[3]),
+            png::ColorType::Rgb => ([pixel[0], pixel[1], pixel[2]], 255),
+            png::ColorType::GrayscaleAlpha => ([pixel[0]; 3], pixel[1]),
+            png::ColorType::Grayscale => ([pixel[0]; 3], 255),
+            png::ColorType::Indexed => return Err("Unsupported mural preview color".into()),
+        };
+        for (ink, canvas) in color.into_iter().zip([245u16, 242, 232]) {
+            rgb.push(
+                ((ink as u16 * alpha as u16 + canvas * (255 - alpha as u16) + 127) / 255) as u8,
+            );
+        }
+    }
+    let mut preview = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut preview, info.width, info.height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|_| "Cannot encode mural preview")?;
+        writer
+            .write_image_data(&rgb)
+            .map_err(|_| "Cannot finish mural preview")?;
+    }
+    Ok(preview)
+}
 fn image_request(
     brief: &Brief,
 ) -> Result<openrouter_rs::api::images::ImageGenerationRequest, String> {
@@ -84,7 +150,7 @@ fn image_request(
         .size(IMAGE_SIZE)
         .background("transparent")
         .output_format("png")
-        .quality("low")
+        .quality(IMAGE_QUALITY)
         .n(1);
     if let Some(bytes) = &brief.previous {
         validate_png(bytes)?;
@@ -128,7 +194,32 @@ pub struct Request {
     pub evidence: Evidence,
     pub model: String,
     pub artist_model: String,
+    pub identity: String,
+    pub render_policy: String,
     pub base: Option<Base>,
+}
+impl Request {
+    fn can_keep_previous(&self) -> bool {
+        self.base.as_ref().is_some_and(|base| {
+            base.mural.render_policy == self.render_policy
+                && base.mural.identity == self.identity
+                && base.mural.content == self.evidence.content
+                && base.mural.image_model == self.model
+                && base.mural.artist_model == self.artist_model
+        })
+    }
+    fn brief(&self, decision: &Decision) -> Brief {
+        Brief::new(
+            &decision.direction,
+            &self.model,
+            self.base
+                .as_ref()
+                .filter(|_| decision.action == Action::Edit)
+                .map(|b| b.encoded.clone()),
+            &self.identity,
+            &self.evidence.content,
+        )
+    }
 }
 pub struct Artifact {
     pub fingerprint: String,
@@ -146,22 +237,25 @@ pub async fn paint(config: &CloudConfig, request: &Request) -> Result<Artifact, 
     };
     check_cancelled()?;
     let previous = request.base.as_ref();
-    let url = previous.map(|b| data_url(&b.encoded));
+    let url = previous
+        .map(|b| review_preview(&b.encoded).map(|p| data_url(&p)))
+        .transpose()?;
     let decision = artist::direct(
         config,
         &request.artist_model,
         &request.evidence,
         previous.map(|b| &b.mural),
         url.as_deref(),
+        &request.identity,
+        request.can_keep_previous(),
     )
     .await?;
     // Do not start an image call after art was disabled, replay began, or the
     // evidence was corrected while the artist was thinking.
     check_cancelled()?;
-    if !decision.repaint
+    if decision.action == Action::Keep
         && let Some(base) = previous
-        && base.mural.image_model == request.model
-        && base.mural.artist_model == request.artist_model
+        && request.can_keep_previous()
     {
         let mut mural = base.mural.clone();
         mural.evidence = request.evidence.fingerprint.clone();
@@ -172,11 +266,7 @@ pub async fn paint(config: &CloudConfig, request: &Request) -> Result<Artifact, 
             mural,
         });
     }
-    let brief = Brief::new(
-        &decision.direction,
-        &request.model,
-        previous.map(|b| b.encoded.clone()),
-    );
+    let brief = request.brief(&decision);
     let path = cache_dir().join(format!("{}.png", brief.fingerprint));
     let bytes = if let Some(bytes) = read_cache(&path) {
         bytes
@@ -189,6 +279,9 @@ pub async fn paint(config: &CloudConfig, request: &Request) -> Result<Artifact, 
         fingerprint: brief.fingerprint,
         encoded: Some(Arc::new(bytes)),
         mural: Mural {
+            identity: request.identity.clone(),
+            content: request.evidence.content.clone(),
+            render_policy: request.render_policy.clone(),
             direction: decision.direction,
             evidence: request.evidence.fingerprint.clone(),
             artist_model: request.artist_model.clone(),
@@ -289,6 +382,8 @@ pub struct Gallery {
     pub now: f64,
     /// Historical scene replay can still use the original radial composition.
     pub mural_layout: bool,
+    identity: String,
+    render_policy: String,
     planned_for: Option<(Session, Style, String, String)>,
     input: Option<Evidence>,
     pending: Option<Request>,
@@ -309,6 +404,8 @@ impl Default for Gallery {
             status: String::new(),
             now: 0.,
             mural_layout: true,
+            identity: "tacit-fictional-demo".into(),
+            render_policy: render_policy(),
             planned_for: None,
             input: None,
             pending: None,
@@ -321,6 +418,23 @@ impl Default for Gallery {
     }
 }
 impl Gallery {
+    pub fn is_working(&self) -> bool {
+        self.pending.is_some()
+    }
+    /// Called once after restoring a session. Archived identity survives moves and
+    /// renames; new sessions get an opaque key without sending their local path.
+    pub fn set_session_identity(&mut self, path: &Path) {
+        self.identity = self
+            .current()
+            .and_then(|l| l.mural.as_ref())
+            .filter(|m| !m.identity.is_empty())
+            .map(|m| m.identity.clone())
+            .unwrap_or_else(|| {
+                blake3::hash(path.as_os_str().as_encoded_bytes())
+                    .to_hex()
+                    .to_string()
+            });
+    }
     pub fn retry(&mut self) {
         self.attempted = None;
         self.due = Some(self.now);
@@ -474,6 +588,9 @@ impl Gallery {
                     m.evidence == input.fingerprint
                         && m.image_model == self.model
                         && m.artist_model == self.artist_model
+                        && m.render_policy == self.render_policy
+                        && m.identity == self.identity
+                        && m.content == input.content
                 });
             if done || attempted {
                 self.due = None;
@@ -511,6 +628,8 @@ impl Gallery {
                                 evidence: input.clone(),
                                 model: self.model.clone(),
                                 artist_model: self.artist_model.clone(),
+                                identity: self.identity.clone(),
+                                render_policy: self.render_policy.clone(),
                                 base,
                             };
                             if self
@@ -571,6 +690,8 @@ pub fn check_demo(config: &CloudConfig, session: &Session) -> Result<PathBuf, St
         evidence: Evidence::from_session(session).ok_or("Empty demo")?,
         model: gallery.model,
         artist_model: gallery.artist_model,
+        identity: gallery.identity,
+        render_policy: gallery.render_policy,
         base: None,
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -601,6 +722,8 @@ impl Gallery {
             d.mural.evidence == input.fingerprint
                 && d.mural.image_model == self.model
                 && d.mural.artist_model == self.artist_model
+                && d.mural.render_policy == self.render_policy
+                && d.mural.identity == self.identity
         }) else {
             return;
         };
@@ -727,6 +850,33 @@ mod tests {
                 .unwrap(),
         )
     }
+    #[test]
+    fn review_ignores_hidden_rgb_without_altering_original_edit_pixels() {
+        let original = [20, 10, 0, 0, 15, 25, 35, 255, 0, 0, 0, 128];
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 3, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&original)
+                .unwrap();
+        }
+        let saved = encoded.clone();
+        let preview = review_preview(&encoded).unwrap();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(preview))
+            .read_info()
+            .unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!(info.color_type, png::ColorType::Rgb);
+        assert_eq!(&pixels[..3], &[245, 242, 232]);
+        assert_eq!(&pixels[3..6], &[15, 25, 35]);
+        assert_eq!(&pixels[6..9], &[122, 121, 116]);
+        assert_eq!(encoded, saved);
+    }
     fn direction() -> Direction {
         Direction {
             story: "A team struggles to decide who owns a decision".into(),
@@ -763,6 +913,9 @@ mod tests {
                     fingerprint: fingerprint.into(),
                     encoded: Some(encoded),
                     mural: Mural {
+                        identity: request.identity.clone(),
+                        content: request.evidence.content.clone(),
+                        render_policy: request.render_policy.clone(),
                         direction: direction(),
                         evidence: request.evidence.fingerprint.clone(),
                         artist_model: request.artist_model.clone(),
@@ -922,6 +1075,7 @@ mod tests {
         tick(&mut g, &s, 16.);
         tick(&mut g, &s, 38.);
         let request = q.try_recv().unwrap().unwrap();
+        assert!(request.can_keep_previous());
         let mut mural = request.base.unwrap().mural;
         mural.evidence = request.evidence.fingerprint;
         r.send(Response {
@@ -955,12 +1109,92 @@ mod tests {
         assert_eq!(g.current().unwrap().fingerprint, "first-scene");
     }
     #[test]
-    fn initial_and_edit_requests_use_low_quality_landscape_and_alpha() {
+    fn sessions_have_independent_designs_and_cache_entries_for_identical_thoughts() {
+        let (mut a, qa, ra) = setup();
+        let (mut b, qb, _) = setup();
+        a.set_session_identity(Path::new("/sessions/one/session.json"));
+        b.set_session_identity(Path::new("/sessions/two/session.json"));
+        let s = Session::demo();
+        initial(&mut a, &s, &qa, &ra);
+        tick(&mut b, &s, 0.);
+        tick(&mut b, &s, 8.);
+        let request = qb.try_recv().unwrap().unwrap();
+        assert!(request.base.is_none());
+        assert_ne!(a.identity, request.identity);
+        let da = artist::visual_identity(&a.identity);
+        let db = artist::visual_identity(&request.identity);
+        assert_ne!(da["lead_figure_if_needed"], db["lead_figure_if_needed"]);
+        assert_ne!(
+            Brief::new(&direction(), MODEL, None, &a.identity, "content").fingerprint,
+            Brief::new(&direction(), MODEL, None, &request.identity, "content").fingerprint
+        );
+        // The saved identity, rather than its current filesystem location, wins.
+        let saved = a.identity.clone();
+        a.set_session_identity(Path::new("/moved/session.json"));
+        assert_eq!(a.identity, saved);
+    }
+    #[test]
+    fn old_rendering_policy_refreshes_without_new_thoughts_and_cannot_be_kept() {
+        for obsolete in ["", "previous-rendering-policy"] {
+            let (mut g, q, r) = setup();
+            let s = Session::demo();
+            initial(&mut g, &s, &q, &r);
+            g.layers[0].mural.as_mut().unwrap().render_policy = obsolete.into();
+            g.suspend(); // reopening / returning from replay
+            let _ = q.try_recv();
+            tick(&mut g, &s, 16.);
+            tick(&mut g, &s, 38.);
+            let request = q.try_recv().unwrap().unwrap();
+            assert!(request.base.is_some());
+            assert!(!request.can_keep_previous());
+            // Old pixels remain visible until a successful replacement arrives.
+            assert_eq!(g.current().unwrap().fingerprint, "first-scene");
+            r.send(success(&request, "refreshed-scene")).unwrap();
+            tick(&mut g, &s, 40.);
+            tick(&mut g, &s, 500.);
+            assert_eq!(g.current().unwrap().fingerprint, "refreshed-scene");
+            assert!(q.try_recv().is_err());
+        }
+    }
+    #[test]
+    fn redraw_can_escape_old_pixels_while_edits_keep_session_continuity() {
+        let (mut g, q, r) = setup();
+        let mut s = Session::demo();
+        initial(&mut g, &s, &q, &r);
+        s.add("We are considering a different approach");
+        tick(&mut g, &s, 16.);
+        tick(&mut g, &s, 38.);
+        let mut request = q.try_recv().unwrap().unwrap();
+        assert!(!request.can_keep_previous());
+        for (action, expects_pixels) in [(Action::Edit, true), (Action::Redraw, false)] {
+            let brief = request.brief(&Decision {
+                action,
+                direction: direction(),
+            });
+            assert_eq!(brief.previous.is_some(), expects_pixels);
+            if expects_pixels {
+                assert_eq!(brief.previous, Some(bytes()));
+            }
+            assert!(brief.prompt.contains(&request.identity));
+        }
+        request.evidence.content = request.base.as_ref().unwrap().mural.content.clone();
+        assert!(request.can_keep_previous());
+        request.identity = "another-session".into();
+        assert!(!request.can_keep_previous());
+    }
+    #[test]
+    fn initial_and_edit_requests_use_high_quality_landscape_and_alpha() {
         for previous in [None, Some(bytes())] {
-            let brief = Brief::new(&direction(), MODEL, previous.clone());
+            let brief = Brief::new(
+                &direction(),
+                MODEL,
+                previous.clone(),
+                "session-one",
+                "content",
+            );
             let request = serde_json::to_value(image_request(&brief).unwrap()).unwrap();
             assert_eq!(request["model"], MODEL);
-            assert_eq!(request["quality"], "low");
+            assert_eq!(request["quality"], "high");
             assert_eq!(request["background"], "transparent");
             assert_eq!(request["size"], IMAGE_SIZE);
             assert_eq!(request["aspect_ratio"], "3:2");
@@ -978,18 +1212,29 @@ mod tests {
     }
     #[test]
     fn cache_identity_tracks_parent_pixels_and_output_model() {
-        let a = Brief::new(&direction(), MODEL, None);
-        let b = Brief::new(&direction(), MODEL, Some(bytes()));
+        let a = Brief::new(&direction(), MODEL, None, "session-one", "content");
+        let b = Brief::new(&direction(), MODEL, Some(bytes()), "session-one", "content");
         assert_ne!(a.fingerprint, b.fingerprint);
         assert_ne!(
             a.fingerprint,
-            Brief::new(&direction(), "other", None).fingerprint
+            Brief::new(&direction(), MODEL, None, "session-one", "new-content").fingerprint
+        );
+        assert_ne!(
+            a.fingerprint,
+            Brief::new(&direction(), "other", None, "session-one", "content").fingerprint
         );
         let mut different = bytes().as_ref().clone();
         different.push(0);
         assert_ne!(
             b.fingerprint,
-            Brief::new(&direction(), MODEL, Some(Arc::new(different))).fingerprint
+            Brief::new(
+                &direction(),
+                MODEL,
+                Some(Arc::new(different)),
+                "session-one",
+                "content"
+            )
+            .fingerprint
         );
         assert!(validate_png(b"not a PNG").is_err());
         assert!(validate_png(&bytes()).is_ok());

@@ -10,7 +10,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 ureq = { version = "3", default-features = false, features = ["json"] }
 
-rune = { git = "https://github.com/anomalyco/rune.git", rev = "801e61aac1c93c8e0eef3ee0d1f13f8560af4f37", default-features = false, features = ["metal-backend"] }
+rune = { git = "https://github.com/anomalyco/rune.git", rev = "801e61aac1c93c8e0eef3ee0d1f13f8560af4f37", default-features = false, features = ["metal-backend", "native-file-dialog"] }
 openrouter-rs = "0.24.0"
 tokio = { version = "1.54.1", features = ["rt", "time", "net"] }
 base64 = "0.23.1"
