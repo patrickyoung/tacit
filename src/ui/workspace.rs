@@ -150,10 +150,34 @@ fn mode_controls(s: &State) -> El {
         ))
 }
 fn voice_controls(s: &State) -> El {
+    if (s.directing || s.queued_direction.is_some())
+        && matches!(
+            s.voice_state,
+            VoiceState::Ready | VoiceState::Unavailable | VoiceState::Checking
+        )
+    {
+        return label(
+            if s.directing {
+                "Applying map guidance…"
+            } else {
+                "Finishing captured thoughts…"
+            },
+            13.0,
+            MUTED,
+        )
+        .px(12.0);
+    }
     let action = match s.voice_state {
-        VoiceState::Ready => pill("●  Start recording", "voice-start", true, |s| {
-            s.voice_command(VoiceCommand::Start)
-        })
+        VoiceState::Ready => pill(
+            if s.direction_mode {
+                "●  Speak guidance"
+            } else {
+                "●  Start recording"
+            },
+            "voice-start",
+            true,
+            |s| s.voice_command(VoiceCommand::Start),
+        )
         .fill(GREEN),
         VoiceState::Recording => pill(
             if s.direction_mode {

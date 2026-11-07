@@ -128,6 +128,7 @@ pub struct State {
     pub draft: TextEdit,
     direction_mode: bool,
     direction_draft: TextEdit,
+    queued_direction: Option<String>,
     director: Option<tacit::direction::Worker>,
     directing: bool,
     direction_status: String,
@@ -313,9 +314,10 @@ impl State {
         ) || !self.pending_recordings.is_empty()
             || self.video_export.is_some()
             || self.directing
+            || self.queued_direction.is_some()
         {
             self.status =
-                "Finish recording, transcription, or video export before switching sessions".into();
+                "Finish recording, transcription, map guidance, or video export before switching sessions".into();
             return false;
         }
         true
@@ -428,9 +430,10 @@ impl State {
             draft: TextEdit::new(""),
             direction_mode: false,
             direction_draft: TextEdit::new(""),
+            queued_direction: None,
             director: None,
             directing: false,
-            direction_status: "Give instructions to reshape this map".into(),
+            direction_status: "Guide the categories, structure, and placement of your ideas".into(),
             selected: None,
             history: vec![],
             path: None,
@@ -552,7 +555,11 @@ impl State {
                 self.voice_state,
                 VoiceState::Ready | VoiceState::Unavailable
             ),
-            VoiceCommand::Start => self.voice_state == VoiceState::Ready && !self.directing,
+            VoiceCommand::Start => {
+                self.voice_state == VoiceState::Ready
+                    && !self.directing
+                    && self.queued_direction.is_none()
+            }
             VoiceCommand::Retry(_) => matches!(
                 self.voice_state,
                 VoiceState::Ready | VoiceState::Unavailable
@@ -943,11 +950,22 @@ impl State {
         if instruction.is_empty() {
             return;
         }
-        if !self.pending_recordings.is_empty() {
-            self.direction_status =
-                "Wait for recorded thoughts to finish splitting, then apply this direction".into();
+        self.queued_direction = Some(instruction);
+        self.start_queued_direction();
+    }
+    fn start_queued_direction(&mut self) {
+        if self.read_only || self.replay.is_some() || self.directing {
             return;
         }
+        if self.queued_direction.is_none() {
+            return;
+        }
+        if !self.pending_recordings.is_empty() {
+            self.direction_status =
+                "Finishing captured thoughts, then applying your guidance…".into();
+            return;
+        }
+        let instruction = self.queued_direction.take().unwrap();
         let request = tacit::direction::Request {
             session: self.projection.session.clone(),
             instruction,
@@ -958,7 +976,7 @@ impl State {
             .is_some_and(|w| w.send.send(request).is_ok())
         {
             self.directing = true;
-            self.direction_status = "Considering your direction…".into();
+            self.direction_status = "Applying your guidance to the map…".into();
         } else {
             self.direction_status =
                 "Map direction needs OpenRouter; your instruction is kept here".into();
@@ -1446,6 +1464,8 @@ impl State {
             self.voice_state,
             VoiceState::Recording | VoiceState::Starting | VoiceState::Finishing
         ) || !self.pending_recordings.is_empty()
+            || self.directing
+            || self.queued_direction.is_some()
         {
             return;
         }
@@ -1685,6 +1705,10 @@ impl State {
             return;
         }
         self.pending_recordings.clear();
+        if self.queued_direction.take().is_some() {
+            self.direction_status =
+                "Pending guidance cancelled; your instruction is kept here".into();
+        }
         if let Some(previous) = self.history.pop() {
             self.revision += 1;
             if self
@@ -3668,7 +3692,15 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         s.receive_direction(response, now);
         changed = true;
     }
-    if s.directing {
+    if !s.read_only
+        && s.queued_direction.is_some()
+        && s.pending_recordings.is_empty()
+        && !s.directing
+    {
+        s.start_queued_direction();
+        changed = true;
+    }
+    if s.directing || s.queued_direction.is_some() {
         return changed;
     }
     if s.worker.is_none() {
@@ -4009,6 +4041,127 @@ mod tests {
         s.voice_state = VoiceState::Recording;
         s.toggle_direction();
         assert!(s.direction_mode);
+    }
+    #[test]
+    fn spoken_guidance_resumes_once_after_splitting_and_refines_the_latest_map() {
+        use std::sync::mpsc;
+        use tacit::direction::{Classification, Edit, Placement};
+        let mut s = State::empty();
+        let recording = "Hosting costs doubled. We could remove unused replicas.";
+        s.draft = TextEdit::new(recording);
+        s.capture();
+        s.draft = TextEdit::new("New hires need mentors.");
+        s.capture();
+        s.pending_recordings.extend([1, 2]);
+        let (send, _split_requests) = mpsc::channel();
+        let (split_results, receive) = mpsc::channel();
+        s.recording_worker = Some(tacit::recording::Worker { send, receive });
+        let (send, requests) = mpsc::channel();
+        let (results, receive) = mpsc::channel();
+        s.director = Some(tacit::direction::Worker { send, receive });
+        s.direction_mode = true;
+        let instruction = "Could you separate hiring from infrastructure costs?";
+        s.receive_voice(VoiceEvent::Transcript(instruction.into()), 1.0);
+        assert_eq!(s.queued_direction.as_deref(), Some(instruction));
+        assert_eq!(s.direction_draft.text, instruction);
+        assert_eq!(s.projection.session.thoughts.len(), 2);
+        assert!(!s.directing);
+        assert!(requests.try_recv().is_err());
+
+        split_results
+            .send(tacit::recording::Response {
+                id: 1,
+                text: recording.into(),
+                result: Ok(vec![
+                    "Hosting costs doubled. ".into(),
+                    "We could remove unused replicas.".into(),
+                ]),
+            })
+            .unwrap();
+        poll_live(&mut s, 2.0, &mut Tx::default());
+        assert!(requests.try_recv().is_err());
+        // Failed splitting also finishes the wait, using the retained full thought.
+        split_results
+            .send(tacit::recording::Response {
+                id: 2,
+                text: "New hires need mentors.".into(),
+                result: Err("Synthetic split failure".into()),
+            })
+            .unwrap();
+        poll_live(&mut s, 3.0, &mut Tx::default());
+        let request = requests.try_recv().unwrap();
+        assert_eq!(request.instruction, instruction);
+        assert_eq!(request.session, s.projection.session);
+        assert_eq!(request.session.thoughts.len(), 3);
+        assert!(s.queued_direction.is_none());
+        assert!(s.directing);
+        assert!(!s.can_switch_session());
+        let before = request.session.clone();
+        results
+            .send(tacit::direction::Response {
+                fingerprint: tacit::timeline::content_hash(&request.session).unwrap(),
+                instruction: request.instruction,
+                result: Ok(tacit::direction::Plan {
+                    explanation: "Separated hiring from infrastructure costs.".into(),
+                    edits: vec![Edit::RefineCategories {
+                        classification: Classification {
+                            categories: ["hiring", "cloud-costs"]
+                                .iter()
+                                .map(|name| tacit::model::Category {
+                                    id: (*name).into(),
+                                    name: (*name).into(),
+                                    parent: None,
+                                    motif: None,
+                                    illustration: None,
+                                })
+                                .collect(),
+                            placements: request
+                                .session
+                                .thoughts
+                                .iter()
+                                .map(|t| Placement {
+                                    id: t.id,
+                                    category: if t.id == 2 { "hiring" } else { "cloud-costs" }
+                                        .into(),
+                                })
+                                .collect(),
+                        },
+                    }],
+                }),
+            })
+            .unwrap();
+        poll_live(&mut s, 4.0, &mut Tx::default());
+        assert!(requests.try_recv().is_err());
+        assert!(!s.directing);
+        assert!(s.direction_draft.text.is_empty());
+        assert_eq!(s.projection.session.categories.len(), 2);
+        assert_eq!(s.projection.session.directions, [instruction]);
+        assert!(
+            s.projection
+                .session
+                .thoughts
+                .iter()
+                .all(|t| !t.pinned && t.text != instruction)
+        );
+        s.undo();
+        assert_eq!(s.projection.session, before);
+    }
+    #[test]
+    fn undo_cancels_queued_guidance_and_keeps_its_draft() {
+        use std::sync::mpsc;
+        let mut s = State::empty();
+        s.pending_recordings.insert(1);
+        s.direction_draft = TextEdit::new("Refine these categories");
+        let (send, requests) = mpsc::channel();
+        let (_results, receive) = mpsc::channel();
+        s.director = Some(tacit::direction::Worker { send, receive });
+        s.submit_direction();
+        assert!(s.queued_direction.is_some());
+        s.undo();
+        poll_live(&mut s, 1.0, &mut Tx::default());
+        assert!(s.queued_direction.is_none());
+        assert_eq!(s.direction_draft.text, "Refine these categories");
+        assert!(requests.try_recv().is_err());
     }
     #[test]
     fn final_transcript_only_adds_missing_live_windows() {

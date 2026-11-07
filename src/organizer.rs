@@ -47,6 +47,7 @@ impl Worker {
 pub const FAST_MODEL: &str = "google/gemini-3.1-flash-lite";
 pub const REVIEW_MODEL: &str = "openai/gpt-6.1-terra";
 pub const ASSIST_MODEL: &str = "anthropic/claude-sonnet-4.6";
+pub const CATEGORY_GUIDANCE: &str = "Classify by the specific problem, decision, outcome or workstream, not by repeated words, the fact that everything is business-related, or a generic bucket such as Operations, Strategy or People. Audit each existing category for distinct conceptual threads. Split a broad category into clearly named peers or useful subcategories when it contains independently discussable issues. Use root categories for distinct workstreams and children for specific issues within one workstream. A shared setting or stakeholder does not make two ideas the same topic. Name sibling categories at comparable levels of specificity so someone can explain why each thought belongs there rather than next door. Place thoughts in the most specific justified category; use broad parents mainly to organize their children. A distinct topic may stand alone; do not force it into a larger group just to reduce category count. Keep genuinely related observations, questions and proposals connected, with distinct actionable ideas as separate thought nodes. Reuse category IDs where the meaning continues, but allow names and parentage to improve as understanding develops. Existing categories are provisional, not a fixed taxonomy. Use no more than three levels or eight roots, and avoid empty scaffolding, one-child chains and a separate category for every sentence.";
 
 #[derive(Clone)]
 pub struct CloudConfig {
@@ -226,7 +227,7 @@ fn cloud_request(
         );
     }
     let mode = if review {
-        "Review as a professional visual facilitator: first infer the discussion’s central question and its distinct conceptual threads; then audit EVERY placement against the original wording and neighboring thoughts. Resolve pronouns and topic returns using context. Distinguish causes, symptoms, constraints, questions, and proposals rather than grouping by repeated nouns. Consolidate true synonyms but preserve meaningful disagreement and competing options. Prefer a small set of coherent, specific branches at comparable conceptual levels; do not force unrelated ideas into generic buckets. Write a narrative under 120 words with original thought ID citations, connecting what is observed, what is unresolved, and what could happen next without claiming invented consensus. Use only supported, precisely labelled relationships. Audit the result for missing IDs, overlapping branches, unsupported inference, and unnecessary movement before answering. Make only justified changes."
+        "Review as a professional visual facilitator: infer the discussion’s central question and distinct conceptual threads, then audit EVERY placement against original wording and context. Resolve pronouns and topic returns. Refine category boundaries and split overly broad groups rather than merely adding to them. Preserve meaningful disagreement, competing options and independently actionable ideas. Choose as many specific branches as the evidence needs within the category limits. Write a narrative under 120 words with original thought ID citations, connecting observations, unresolved issues and possibilities without invented consensus. Use only supported, precisely labelled relationships. Audit for missing IDs, overlapping categories and unsupported inference."
     } else if context.is_some() {
         "Quickly classify only the supplied new thoughts into the existing hierarchy. Return categories containing ONLY genuinely new groups, or an empty array when reusing existing groups; Tacit retains existing category metadata and parent paths. Assignments can reference existing category IDs. Never reparent or rename existing groups in this incremental pass. Keep narrative to one sentence and relationships empty."
     } else {
@@ -253,7 +254,7 @@ fn cloud_request(
     ChatCompletionRequest::builder()
         .model(model)
         .messages(vec![
-            Message::new(Role::System, system),
+            Message::new(Role::System, format!("{system}\n{CATEGORY_GUIDANCE}")),
             Message::new(Role::User, input),
         ])
         .max_tokens(
