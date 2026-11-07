@@ -20,7 +20,17 @@ pub struct Artwork {
     pub retired: Option<f64>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Workspace {
+    pub camera: crate::camera::Camera,
+    pub expanded: bool,
+    pub following: bool,
+    pub transcript_scroll: [f32; 2],
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Scene {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<Workspace>,
     pub session: Session,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_time: Option<f64>,
@@ -59,6 +69,7 @@ fn zero_size(size: &[f32; 2]) -> bool {
 impl Default for Scene {
     fn default() -> Self {
         Self {
+            workspace: None,
             session: Session::default(),
             render_time: None,
             session_title: String::new(),
@@ -126,6 +137,11 @@ impl crate::timeline::Projection {
         scene.render_time = self.frame_times.get(RENDERER).copied();
         if scene.viewport.iter().any(|v| !v.is_finite() || *v <= 0.0) {
             return Err(io::Error::other("Invalid recorded viewport"));
+        }
+        if scene.workspace.as_ref().is_some_and(|w| {
+            !w.camera.valid() || w.transcript_scroll.iter().any(|v| !v.is_finite())
+        }) {
+            return Err(io::Error::other("Invalid recorded workspace camera"));
         }
         Ok(scene)
     }

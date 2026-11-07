@@ -1,3 +1,4 @@
+mod workspace;
 use rune::{
     Color, Cx, El, Key, KeyEvent, LineCap, Path, ScrollSpec, Shape, TextEdit, TextStyle, Tx,
     canvas, col, el, row, text, text_input,
@@ -103,6 +104,15 @@ pub struct State {
     replay_images: std::collections::HashMap<String, rune::Image>,
     image_cache: rune::ImageCache,
     art_assets: std::collections::HashMap<rune::ImageId, String>,
+    modern_ui: bool,
+    camera_zoom: rune::Live<f32>,
+    camera_pan: rune::Live<[f32; 2]>,
+    map_size: [f32; 2],
+    camera_ready: bool,
+    drag_pan: [f32; 2],
+    transcript_expanded: bool,
+    transcript_following: bool,
+    transcript_scroll: rune::Live<[f32; 2]>,
     map_scroll: rune::Live<[f32; 2]>,
     story_scroll: rune::Live<[f32; 2]>,
     inspector_scroll: rune::Live<[f32; 2]>,
@@ -394,6 +404,15 @@ impl State {
             replay_images: Default::default(),
             art_assets: Default::default(),
             image_cache: rune::ImageCache::new(std::sync::Arc::new(|| {})),
+            modern_ui: true,
+            camera_zoom: rune::Live::new(1.0),
+            camera_pan: rune::Live::new([0.0; 2]),
+            map_size: [1100.0, 600.0],
+            camera_ready: false,
+            drag_pan: [0.0; 2],
+            transcript_expanded: false,
+            transcript_following: true,
+            transcript_scroll: rune::Live::new([0.0; 2]),
             map_scroll: rune::Live::new([0.0; 2]),
             story_scroll: rune::Live::new([0.0; 2]),
             inspector_scroll: rune::Live::new([0.0; 2]),
@@ -602,6 +621,9 @@ impl State {
                 }
             }
             VoiceEvent::Started { id, started } => {
+                if self.modern_ui {
+                    self.selected = None;
+                }
                 self.live_text.clear();
                 self.active_recording = Some(id.clone());
                 let start_ms = self.journal.as_ref().map_or(0, |j| {
@@ -890,7 +912,9 @@ impl State {
             return;
         }
         self.live_text.clear();
-        self.selected = Some(thought_id);
+        if !self.modern_ui {
+            self.selected = Some(thought_id);
+        }
         self.save();
         self.schedule_recording_split(thought_id, &text);
     }
@@ -1110,6 +1134,15 @@ impl State {
             let mut garden = self.art.clone();
             garden.now = 0.0;
             let scene = tacit::timeline::Scene {
+                workspace: self.modern_ui.then(|| tacit::presentation::Workspace {
+                    camera: tacit::camera::Camera {
+                        zoom: self.camera_zoom.get(),
+                        pan: self.camera_pan.get(),
+                    },
+                    expanded: self.transcript_expanded,
+                    following: self.transcript_following,
+                    transcript_scroll: self.transcript_scroll.get(),
+                }),
                 session: self.projection.session.clone(),
                 render_time: Some(self.art.now),
                 session_title: self.session_name.clone(),
@@ -1150,6 +1183,15 @@ impl State {
         }
     }
     fn restore_scene(&mut self, scene: tacit::timeline::Scene, now: f64) {
+        self.modern_ui = self.replay.is_none() || scene.workspace.is_some();
+        if let Some(w) = &scene.workspace {
+            self.camera_zoom.set(w.camera.zoom);
+            self.camera_pan.set(w.camera.pan);
+            self.camera_ready = true;
+            self.transcript_expanded = w.expanded;
+            self.transcript_following = w.following;
+            self.transcript_scroll.set(w.transcript_scroll);
+        }
         self.session_name = scene.session_title.clone();
         self.live_text = scene.live_text.clone();
         self.direction_mode = scene.direction_mode;
@@ -1834,7 +1876,9 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         .max()
         .unwrap_or(0);
     let indent = depth as f32 * 88.0;
-    let width = if s.replay.is_some() && s.map_viewport[0] > 0.0 {
+    let width = if s.modern_ui {
+        1100.0 + indent * 2.0
+    } else if s.replay.is_some() && s.map_viewport[0] > 0.0 {
         s.map_viewport[0]
     } else {
         cx.layout_size("map").map_or(920.0, |size| size[0])
@@ -2339,6 +2383,9 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 }),
             ),
     );
+    if s.modern_ui {
+        return workspace::canvas(s, sheet, [width, height]);
+    }
     let map = col()
         .key("map")
         .on_layout(|s: &mut State, rect| {
@@ -2525,7 +2572,7 @@ fn sessions_view(s: &State) -> El {
         )
         .child(label(s.status.clone(), 12.0, MUTED))
 }
-pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+fn legacy_view(s: &State, cx: &mut Cx<State>) -> El {
     if s.sessions_open {
         return sessions_view(s);
     }
@@ -3170,7 +3217,39 @@ fn compact_inspector(s: &State) -> El {
         r
     }
 }
-pub fn on_key(s: &mut State, event: &KeyEvent, _: &mut Tx) -> bool {
+pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    if !s.modern_ui || (s.replay.is_some() && s.pixel_replay) {
+        legacy_view(s, cx)
+    } else {
+        workspace::view(s, cx)
+    }
+}
+pub fn on_key(s: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
+    if s.modern_ui && s.replay.is_none() {
+        match event.key {
+            Key::Command('+') | Key::Command('=') => {
+                s.zoom_center(1.2);
+                tx.instant();
+                return true;
+            }
+            Key::Command('-') => {
+                s.zoom_center(1.0 / 1.2);
+                tx.instant();
+                return true;
+            }
+            Key::Command('0') => {
+                s.zoom_center(1.0 / s.camera_zoom.get());
+                tx.instant();
+                return true;
+            }
+            Key::Command('*') => {
+                s.fit_map();
+                tx.instant();
+                return true;
+            }
+            _ => {}
+        }
+    }
     match event.key {
         Key::Command('s') => {
             s.save();
@@ -3360,10 +3439,18 @@ pub fn poll(s: &mut State, frame_now: f64, tx: &mut Tx) -> bool {
             let scroll = scene.map_scroll;
             let story_scroll = scene.story_scroll;
             let inspector_scroll = scene.inspector_scroll;
+            let workspace = scene.workspace.clone();
             s.restore_scene(scene, at as f64 / 1000.0);
             tx.scroll_to_instant("map", scroll[0], scroll[1]);
             tx.scroll_to_instant("story", story_scroll[0], story_scroll[1]);
             tx.scroll_to_instant("inspector", inspector_scroll[0], inspector_scroll[1]);
+            if let Some(w) = &workspace {
+                tx.scroll_to_instant(
+                    "transcript-scroll",
+                    w.transcript_scroll[0],
+                    w.transcript_scroll[1],
+                );
+            }
         }
         let audio = s
             .journal
@@ -3448,14 +3535,19 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     if s.previewed_draft != s.draft.text {
         s.previewed_draft.clone_from(&s.draft.text);
-        if !s.draft.text.trim().is_empty() {
+        if !s.modern_ui && !s.draft.text.trim().is_empty() {
             tx.scroll_into_view("draft-preview");
         }
         changed = true;
     }
     if s.revealed_selection != s.selected {
         s.revealed_selection = s.selected;
-        if let Some(id) = s.selected {
+        if s.modern_ui && s.selected.is_some() {
+            tx.scroll_to_instant("transcript-scroll", 0.0, 0.0);
+        }
+        if !s.modern_ui
+            && let Some(id) = s.selected
+        {
             tx.scroll_into_view(format!("thought-{id}"));
         }
         changed = true;
@@ -4331,5 +4423,61 @@ mod tests {
                 .iter()
                 .any(|t| t.text == "A thought")
         );
+    }
+    #[test]
+    fn modern_canvas_pans_both_axes_and_zooms_without_editing_content() {
+        let mut rt = runtime((1280.0, 860.0));
+        rt.frame(1.0);
+        assert!(rt.state.map_viewport[0] > 800.0);
+        assert!(rt.find("inspector").is_none());
+        let before = rt.state.projection.session.clone();
+        let pan = rt.state.camera_pan.get();
+        let (x, y) = rt.find("map").unwrap();
+        rt.wheel_event(rune::WheelEvent::new(90.0, -60.0).at(x, y).precise(true));
+        rt.frame(1.1);
+        assert_eq!(rt.state.camera_pan.get(), [pan[0] + 90.0, pan[1] - 60.0]);
+        let zoom = rt.state.camera_zoom.get();
+        rt.magnify_event(rune::MagnifyEvent::new(0.25).at(x, y));
+        rt.frame(1.2);
+        assert!((rt.state.camera_zoom.get() - zoom * 1.25).abs() < 0.001);
+        assert_eq!(rt.state.projection.session, before);
+        click(&mut rt, "zoom-fit");
+        assert!(rt.state.camera().valid());
+    }
+    #[test]
+    fn drawer_and_transcript_controls_work_at_both_window_sizes() {
+        for size in [(820.0, 640.0), (1280.0, 860.0)] {
+            let mut rt = runtime(size);
+            rt.state.sessions_open = true;
+            rt.frame(1.0);
+            assert!(rt.find("session-drawer").is_some());
+            assert!(rt.find("map").is_some());
+            click(&mut rt, "sessions-back");
+            assert!(!rt.state.sessions_open);
+            click(&mut rt, "transcript-expand");
+            assert!(rt.state.transcript_expanded);
+            click(&mut rt, "transcript-follow");
+            assert!(!rt.state.transcript_following);
+            click(&mut rt, "transcript-follow");
+            assert!(rt.state.transcript_following);
+        }
+    }
+    #[test]
+    fn live_voice_keeps_transcript_review_visible() {
+        let mut rt = runtime((820.0, 640.0));
+        rt.state.selected = None;
+        rt.state.receive_speech_segment(
+            "current",
+            1,
+            tacit::timeline::Cue {
+                start_ms: 0,
+                end_ms: 1000,
+                text: "A fresh spoken idea".into(),
+            },
+        );
+        rt.frame(1.0);
+        assert_eq!(rt.state.selected, None);
+        assert!(rt.find("live-segment-current-1").is_some());
+        assert!(rt.find("selected-original").is_none());
     }
 }

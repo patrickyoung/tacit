@@ -146,7 +146,7 @@ For model-generated classifications, a session title, a narrative, and suggested
 TACIT_MODEL=your-installed-model cargo run
 ```
 
-Tacit sends committed thoughts to `http://127.0.0.1:11434/api/generate`, after a 180 ms quiet period. Draft text is only previewed with local rules. The worker stays off the UI thread, coalesces pending edits, rejects stale results, validates references, and respects pinned classifications. Model-generated links appear beneath their source thoughts and in the margin; select a link to inspect its target. All model interpretations are suggestions.
+Tacit sends committed thoughts to `http://127.0.0.1:11434/api/generate`, after a 180 ms quiet period. Draft text is only previewed with local rules. The worker stays off the UI thread, coalesces pending edits, rejects stale results, validates references, and respects pinned classifications. Model-generated links appear beneath their source thoughts and in the selected concept’s review dock; select a link to inspect its target. All model interpretations are suggestions.
 
 A missing server, unknown model, timeout, or invalid response leaves thought capture usable and reports the problem in the status line. Another edit requests organization again. No model is downloaded or server started automatically. The Ollama backend only calls loopback; use an actual local model if you want all inference to stay on your machine.
 
@@ -227,7 +227,7 @@ cargo run --example facilitation_eval
 
 Thoughts now carry a separate `concept` phrase. Cloud organization distills each source into a meaningful 2–6 word label (at most eight words and 58 characters), retaining qualifications, uncertainty, and negation. The fast pass names new concepts and upgrades older thoughts without labels; the stronger reviewer refines those concepts and groups related meanings into thematic branches. Good labels remain stable across incremental updates.
 
-The map displays concept phrases. Select a node to see **Concept** followed by **Original words** in the right-hand inspector; narrower windows show both below the map. Full text, WAV recordings, and WebVTT are unchanged. Until a concept is available, a node uses the existing shortened source preview. Offline organization can supply concepts too, but older/local responses without them remain compatible.
+The map displays concept phrases. Select a node to see its concept and original words in the bottom review dock. Full text, WAV recordings, and WebVTT are unchanged. Until a concept is available, a node uses the existing shortened source preview. Offline organization can supply concepts too, but older/local responses without them remain compatible.
 
 Concepts are interpretations, not replacement transcripts. They are validated, saved in session events, and included in replay and other renderers. Splitting a thought invalidates its old concept so each resulting idea can be distilled independently. Themes now support two further classification levels: **theme → subtheme → concept group → thoughts**. The organizer assigns concepts to the most specific useful group and avoids unnecessary nesting. Maps support up to eight root themes and 72 categories across three levels; existing flat maps load unchanged.
 
@@ -249,8 +249,18 @@ The composition surrounds the central title cloud with a transparent opening, ke
 
 The stronger OpenRouter reviewer now receives the complete source ledger, including full recording transcripts, active concepts, prior concepts, and user directions. It can add concepts, split compound ideas, merge fragments, update labels, move concepts, rebuild the three-level classification tree, and retire obsolete items. New concepts must cite existing source IDs; original words are resolved by the application, never rewritten by the model.
 
-Every retired concept retains its words, a reason, and links to any replacements. The margin's **How the map evolved** list opens those prior concepts. All previously represented evidence must remain attached to an active or retired concept. Explicitly pinned placements and evidence remain protected; **Allow AI to revise** releases a selected pin. Revisions use the existing layout transitions and are undoable.
+Every retired concept retains its words, a reason, and links to any replacements. The review dock’s **Prior concepts** control opens those prior concepts and their history list. All previously represented evidence must remain attached to an active or retired concept. Explicitly pinned placements and evidence remain protected; **Allow AI to revise** releases a selected pin. Revisions use the existing layout transitions and are undoable.
 
 Each accepted revision is a `MapRevised` event with an exact input fingerprint. Validation rejects stale maps, unknown sources, orphan classifications, missing retirements, invalid replacement links, and reused historical IDs. Replay applies the saved revision without calling a model. Saved session JSON also retains the evidence dictionary and retired concepts. Legacy empty fields remain omitted for journal hash compatibility.
 
 Review currently supports up to 200 active concepts and 1 MiB of serialized context; exceeding the context limit reports an error and retains the map rather than silently dropping history. Live editorial quality depends on the configured review model. The fast pass continues to give initial feedback while the stronger reviewer works.
+
+## Voice-first workspace and canvas navigation
+
+The live workspace puts Brainstorm / Direct the map beside a prominent recording control above the canvas. Sessions open in a collapsible left drawer; at narrow sizes the drawer overlays the workspace. Switching is still blocked while a recording is in progress.
+
+The right inspector has moved into a bottom review dock. Select a concept to read its original words, move/unpin it, or follow relationships and prior concepts. Choose **Transcript** to return to the chronological recording text. Finalized live windows appear before recording finishes; the final transcript replaces those windows without duplicate display. Expand the dock for longer reading, scroll back to pause following, and use **Jump to live** to return to the latest words. Typed input remains available below the transcript.
+
+The map is now a camera-driven canvas: two-axis trackpad/wheel panning, background drag-to-pan, pinch zoom, and Command/Ctrl+wheel zoom around the pointer. **− / 100% / + / Fit map** controls sit beneath the canvas. Keyboard shortcuts follow [MindNode's zoom conventions](https://www.mindnode.com/support/guides/keyboard-shortcuts): Command +/−, Command 0 for actual size, and Command * to fit. Panning uses Rune live offsets, avoiding a full map layout rebuild on every movement; zoom uses immediate scale transforms for complete redraws. The camera stays where you put it as new speech arrives; Fit map reframes the growing map.
+
+Camera position/zoom, dock expansion, follow mode and transcript scroll position are saved in presentation events. Older presentation events retain the original interface for scene replay. No network or microphone access is needed for headless UI checks.
