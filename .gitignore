@@ -1,3 +1,21 @@
 /target
 /.tacit
 *.tmp
+
+# Local credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Private session archives, transcripts, and recordings
+*.tacit/
+session.json
+sessions.json
+*.jsonl
+*.wav
+*.vtt
+*.mp4
+*.mkv
+.DS_Store
