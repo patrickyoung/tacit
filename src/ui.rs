@@ -3908,9 +3908,14 @@ mod tests {
     fn mural_fixture() -> tacit::artist::Mural {
         tacit::artist::Mural {
             direction: tacit::artist::Direction {
-                scene: "A workshop opens into a garden".into(),
-                anchors: vec!["A shared table".into()],
-                change: "Extend the table into the garden".into(),
+                story: "A team struggles to decide who owns a decision".into(),
+                connections: vec![tacit::artist::VisualConnection {
+                    thought_ids: vec![2],
+                    depiction: "Colleagues hesitate over an unclaimed work item".into(),
+                }],
+                scene: "Colleagues pause over an unclaimed decision in a modern workspace".into(),
+                anchors: vec!["The shared project display".into()],
+                change: "Show the unresolved handoff, keeping the decision visibly pending".into(),
             },
             evidence: "fixture-evidence".into(),
             artist_model: tacit::artist::MODEL.into(),

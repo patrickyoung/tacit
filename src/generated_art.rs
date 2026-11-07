@@ -35,15 +35,16 @@ pub struct Brief {
 impl Brief {
     pub fn new(direction: &Direction, model: &str, previous: Option<Arc<Vec<u8>>>) -> Self {
         let operation = if previous.is_some() {
-            "Edit the supplied mural IN PLACE. It is the actual previous artwork, not a loose style reference. Retain its recognizable setting, perspective, scale, anchor forms, linework and unchanged areas. Transform only what the art direction calls for, integrating it seamlessly into the same environment. Return the complete updated mural with alpha transparency."
+            "Edit the supplied mural IN PLACE using the art direction's change instructions. It is the actual previous artwork, not a loose style reference. Preserve the specified continuity anchors and unchanged areas. When the direction calls for re-staging an irrelevant older setting, replace its setting, props and actions as instructed while retaining useful character, perspective and composition continuity. Narrative accuracy takes priority over preserving obsolete scenery. Return the complete updated mural with alpha transparency."
         } else {
-            "Create the first scene of a mural that will evolve with a conversation. Establish a distinctive, cohesive world with room to develop."
+            "Draw the first scene of a mural that will evolve with a conversation. Make the specific story and visible interactions in the art direction immediately recognizable, with room for the scene to develop."
         };
         let direction = serde_json::to_string(direction).expect("serializable direction");
         let prompt = format!(
-            "{operation}\nArt direction: {direction}\nVisual language: {}\nComposition: {}",
+            "{operation}\nPurpose: {}\nArt direction: {direction}\nThe story and connections explain what the actions must convey; do not render them as text or separate illustrations.\nComposition: {}\nVisual language: {}",
+            artist::NARRATIVE,
+            artist::COMPOSITION,
             artist::STYLE,
-            artist::COMPOSITION
         );
         let parent = previous
             .as_ref()
@@ -164,6 +165,7 @@ pub async fn paint(config: &CloudConfig, request: &Request) -> Result<Artifact, 
     {
         let mut mural = base.mural.clone();
         mural.evidence = request.evidence.fingerprint.clone();
+        mural.direction = decision.direction;
         return Ok(Artifact {
             fingerprint: base.fingerprint.clone(),
             encoded: None,
@@ -727,9 +729,14 @@ mod tests {
     }
     fn direction() -> Direction {
         Direction {
-            scene: "An open workshop flows into a garden".into(),
-            anchors: vec!["One long shared table".into()],
-            change: "Extend the table into a sheltered garden".into(),
+            story: "A team struggles to decide who owns a decision".into(),
+            connections: vec![artist::VisualConnection {
+                thought_ids: vec![2],
+                depiction: "Colleagues hesitate over an unclaimed work item".into(),
+            }],
+            scene: "Colleagues pause over an unclaimed decision in a modern workspace".into(),
+            anchors: vec!["The shared project display".into()],
+            change: "Show the unresolved handoff, keeping the decision visibly pending".into(),
         }
     }
     fn setup() -> (Gallery, Receiver<Option<Request>>, Sender<Response>) {
