@@ -165,10 +165,11 @@ Original text, stable IDs, classifications, pinned placements, and the latest mo
 ## Development
 
 ```sh
-cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo fmt --all -- --check
+cargo test --locked --all-targets
+cargo test --locked --doc
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
 # Headless performance probe: synthetic map, zoom, art planning, frame archiving and replay.
 # Uses temporary storage; no network, microphone or real notebook access.
 cargo test --bin tacit performance_report -- --ignored --nocapture --test-threads=1
@@ -176,7 +177,29 @@ cargo test --bin tacit performance_report -- --ignored --nocapture --test-thread
 cargo run --example replay_fixture -- /tmp/tacit-replay-fixture
 ```
 
-Rune is pinned to a specific Git revision, and Cargo.lock is included with the project sources. The build and headless renderer have been tested on macOS. Linux uses Rune's Wayland/X11 backend and needs the associated native development libraries (including Wayland and xkbcommon); Linux execution has not yet been verified here.
+Rune is pinned to a specific Git revision, and Cargo.lock is included with the project sources. CI uses Rust 1.99.1. Install FFmpeg and FFprobe to run the video integration tests; without them, those tests can be skipped locally. Linux uses Rune's Wayland/X11 backend. On Ubuntu 24.04, install its build dependencies with:
+
+```sh
+sudo apt-get install pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+  libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev ffmpeg
+```
+
+On macOS use `brew install ffmpeg`; on Windows use `choco install ffmpeg` and the Rust MSVC toolchain with Visual Studio C++ build tools.
+
+### GitHub Actions and downloads
+
+The [CI workflow](https://github.com/patrickyoung/tacit/actions/workflows/ci.yml) runs formatting, Clippy with warnings treated as errors, unit/integration tests, documentation tests, and release builds. It runs on pull requests, pushes to `master`/`main`, `v*` tags, and **Run workflow** in GitHub Actions. Every platform installs and verifies FFmpeg and FFprobe so video tests cannot silently skip due to missing tools. Cloud-model evaluations and the ignored performance probe remain opt-in.
+
+| Build | Rust target | Runner | Download |
+| --- | --- | --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | Ubuntu 24.04 | `.tar.gz` |
+| macOS Apple Silicon | `aarch64-apple-darwin` | macOS 15 | `.tar.gz` |
+| macOS Intel | `x86_64-apple-darwin` | macOS 15 Intel | `.tar.gz` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | Windows Server 2025 | `.zip` |
+
+Open a successful CI run and download the matching **tacit-&lt;target&gt;** artifact. Each contains an archive with the executable and this README, plus a `.sha256` checksum. CI artifacts are retained for 14 days. Extract the archive and run `./tacit --demo` (Windows: `.\tacit.exe --demo`). Unix tarballs preserve executable permissions. These are unsigned executables, not installers or notarized macOS applications. The Linux binary targets systems with glibc 2.39 or newer and the Wayland/X11 libraries above; a working Vulkan driver is required. Windows uses DirectX 12 or Vulkan. Microphone recording remains macOS-only, as described in **Voice with Hex**.
+
+To prepare a versioned release, update `version` in Cargo.toml, refresh Cargo.lock with `cargo check`, commit those changes, then push the matching tag (for example, `git tag v0.1.0` followed by `git push origin v0.1.0`). The tag must exactly match `v` plus the package version. After all four builds pass, the workflow creates a **draft** [GitHub Release](https://github.com/patrickyoung/tacit/releases) containing all archives and checksums. Review the draft and publish it when ready. Builds need no repository secrets; the draft-release job uses GitHub's built-in token with write access limited to that job. Actions are pinned to commits and Dependabot checks for action updates weekly.
 
 Rune's headless tools use the same view and input runtime as the desktop app:
 
