@@ -1,5 +1,6 @@
 //! Voice-first workspace; the original renderer remains available for legacy replay.
 use super::*;
+use kit::Icon;
 use tacit::camera::Camera;
 
 impl State {
@@ -42,7 +43,14 @@ impl State {
     fn set_camera(&mut self, camera: Camera) {
         self.camera_zoom.set(camera.zoom);
         self.camera_pan.set(camera.pan);
-        self.camera_ready = true;
+        self.framing.set(Framing::Held);
+        self.read_out_zoom();
+    }
+    /// Tells the zoom control how large the map is drawn. Gestures zoom without rebuilding
+    /// the view, so the control cannot read the camera for itself.
+    fn read_out_zoom(&self) {
+        self.zoom_readout
+            .set(format!("{:.0}%", self.camera_zoom.get() * 100.0));
     }
     pub(super) fn zoom_center(&mut self, factor: f32) {
         if self.replay.is_some() {
@@ -55,35 +63,117 @@ impl State {
         );
         self.set_camera(camera);
     }
+    /// The camera that shows all of `content` in a canvas of `viewport` points.
+    fn frame(&self, content: [f32; 2], [w, h]: [f32; 2]) -> Camera {
+        let camera = self.camera();
+        if ![content[0], content[1], w, h]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.0)
+        {
+            return camera;
+        }
+        // A compact canvas trades part of its margin for larger ideas.
+        let slack = if w < 900.0 { 24.0 } else { 0.0 };
+        let above = |bottom: f32| {
+            let mut camera = camera;
+            camera.fit(content, [w + slack, h + slack - bottom]);
+            camera.pan = camera.pan.map(|p| p - slack / 2.0);
+            camera
+        };
+        // The ideas stay centered. The floating zoom controls sit in the bottom right corner:
+        // ideas with room to spare beside them take the whole canvas, and any others stop
+        // above the controls.
+        let whole = above(0.0);
+        if whole.pan[0] >= 200.0 {
+            whole
+        } else {
+            above((32.0 + slack / 2.0).min(h / 2.0))
+        }
+    }
     pub(super) fn fit_map(&mut self) {
         if self.replay.is_some() {
             return;
         }
-        let mut camera = self.camera();
-        camera.fit(self.map_size, self.map_viewport);
-        self.set_camera(camera);
+        self.set_camera(self.frame(self.map_size.get(), self.map_viewport));
+        self.framing.set(Framing::Follow);
+    }
+    /// Opens the composer on `stem`, ready for the rest of the thought.
+    fn start_thought(&mut self, stem: &str) {
+        if self.direction_mode && !self.input_mode_locked() {
+            self.toggle_direction();
+        }
+        if self.read_only || self.replay.is_some() || self.direction_mode {
+            return;
+        }
+        self.draft.replace_text(stem);
+        self.draft.focused = true;
+    }
+    /// The drawer's name field holds a name this session does not have yet.
+    fn can_rename(&self) -> bool {
+        let name = self.session_name_edit.text.trim();
+        !self.read_only && !name.is_empty() && name != self.session_name
     }
 }
 
+/// Who holds the map's camera.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Framing {
+    /// Nobody: the map keeps every idea in view as it grows.
+    Follow,
+    /// Someone chose this view, so it stays put.
+    Held,
+    /// A recorded view, which follows again only if it already shows every idea.
+    Restored,
+}
+
 pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
-    el().key("map")
+    // A recorded camera belongs to the recorded viewport: keep its view centered in this one.
+    let shift = if s.replay.is_some() && s.map_viewport.iter().all(|v| *v > 0.0) {
+        rune::memo::layout_size("map").map_or([0.0; 2], |live| {
+            [
+                (live[0] - s.map_viewport[0]) / 2.0,
+                (live[1] - s.map_viewport[1]) / 2.0,
+            ]
+        })
+    } else {
+        [0.0; 2]
+    };
+    s.map_size.set(size);
+    if s.replay.is_none() {
+        if s.framing.get() == Framing::Restored {
+            // A view that already shows every idea was never focused on a detail.
+            let (camera, [w, h]) = (s.camera(), s.map_viewport);
+            let whole = camera.pan.iter().all(|p| *p >= -1.0)
+                && camera.pan[0] + size[0] * camera.zoom <= w + 1.0
+                && camera.pan[1] + size[1] * camera.zoom <= h + 1.0;
+            s.framing.set(if whole {
+                Framing::Follow
+            } else {
+                Framing::Held
+            });
+        }
+        if s.framing.get() == Framing::Follow
+            && let Some(viewport) = rune::memo::layout_size("map")
+        {
+            let camera = s.frame(size, viewport);
+            s.camera_zoom.set(camera.zoom);
+            s.camera_pan.set(camera.pan);
+        }
+        s.read_out_zoom();
+    }
+    let mut map = kit::stage(el().key("map"))
         .help("Drag or scroll to pan. Pinch to zoom. Use Fit map to see every idea.")
         .w(0.0)
         .grow(1.0)
         .min_w(0.0)
         .h_full()
         .min_h(0.0)
-        .clip_rounded(16.0)
-        .on_layout_tx(move |s: &mut State, rect, tx| {
+        .clip_rounded(kit::CARD)
+        .on_layout_tx(|s: &mut State, rect, tx| {
             if s.replay.is_none() {
                 s.map_viewport = [rect[2], rect[3]];
-                s.map_size = size;
-                if !s.camera_ready {
+                if s.framing.get() == Framing::Follow {
                     s.fit_map();
-                    // Use a little more of a compact canvas without hiding its outer nodes.
-                    if s.camera_zoom.get() < 0.65 {
-                        s.zoom_center(1.1);
-                    }
                 }
                 tx.instant();
             }
@@ -100,6 +190,7 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
             } else {
                 let p = s.camera_pan.get();
                 s.camera_pan.set([p[0] + e.dx, p[1] + e.dy]);
+                s.framing.set(Framing::Held);
                 tx.live_only();
             }
             true
@@ -127,9 +218,14 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
                 rune::Phase::Move => {
                     s.camera_pan
                         .set([s.drag_pan[0] + d.dx, s.drag_pan[1] + d.dy]);
+                    s.framing.set(Framing::Held);
                 }
                 rune::Phase::Up if d.cancelled() => {
                     s.camera_pan.set(s.drag_pan);
+                    // A drag that never happened leaves a fitted view following the map.
+                    if s.frame(s.map_size.get(), s.map_viewport) == s.camera() {
+                        s.framing.set(Framing::Follow);
+                    }
                 }
                 _ => {}
             }
@@ -137,21 +233,39 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
         })
         .child(
             sheet
-                .absolute(0.0, 0.0)
+                .absolute(shift[0], shift[1])
                 .origin(0.0, 0.0)
                 .live_scale(&s.camera_zoom)
                 .live_offset(&s.camera_pan),
-        )
-}
-
-fn pill(title: &str, key: &str, active: bool, action: impl Fn(&mut State) + 'static) -> El {
-    button(title, key, action)
-        .py(10.0)
-        .radius(12.0)
-        .fill(if active { INK } else { WHITE })
-        .color(if active { WHITE } else { INK })
-        .hover(if active { INK } else { LINE })
-        .press_scale(0.97)
+        );
+    if s.replay.is_some() {
+        return map;
+    }
+    let concepts = s.projection.session.thoughts.len();
+    if concepts > 0 {
+        map = map.child(
+            // The count stays readable when ideas pass beneath it.
+            row()
+                .center_y()
+                .h(24.0)
+                .px(10.0)
+                .radius(12.0)
+                .fill(PAPER.alpha(0.9))
+                .pin(Some(10.0), None, None, Some(22.0))
+                .inert()
+                .child(kit::caption(
+                    if concepts == 1 {
+                        "1 concept".into()
+                    } else {
+                        format!("{concepts} concepts")
+                    },
+                    11.5,
+                    500.0,
+                    MUTED,
+                )),
+        );
+    }
+    map.child(navigation(s))
 }
 
 fn mode_controls(s: &State) -> El {
@@ -162,24 +276,21 @@ fn mode_controls(s: &State) -> El {
         .focus_group()
         .gap(2.0)
         .padding(3.0)
-        .radius(10.0)
-        .fill(PAPER);
+        .radius(20.0)
+        .fill(kit::wash(1.0));
     for (title, key, direction) in [
         ("Brainstorm", "mode-brainstorm", false),
         ("Direct the map", "mode-direct", true),
     ] {
         let active = s.direction_mode == direction;
         modes = modes.child(enabled(
-            button(title, key, move |s| {
+            kit::segment(title, key, active, move |s| {
                 if s.direction_mode != direction && !s.input_mode_locked() {
                     s.toggle_direction();
                 }
             })
             .role("tab")
             .focus_selected(active)
-            .fill(if active { WHITE } else { Color::TRANSPARENT })
-            .color(if active { INK } else { MUTED })
-            .hover(WHITE)
             .help(if s.input_mode_locked() {
                 "Finish the current recording or guidance before changing modes."
             } else if direction {
@@ -210,50 +321,42 @@ fn voice_controls(s: &State) -> El {
             None
         };
         if let Some(message) = idle {
-            return label(message, 13.0, MUTED)
-                .key("voice-progress")
-                .px(12.0)
-                .py(12.0);
+            return kit::notice(message, "voice-progress");
         }
     }
     let action = match s.voice_state {
-        VoiceState::Ready => pill(
+        VoiceState::Ready => kit::primary(
+            Some(Icon::Mic),
             if s.direction_mode {
-                "●  Speak guidance"
+                "Speak guidance"
             } else {
-                "●  Start recording"
+                "Start recording"
             },
             "voice-start",
-            true,
+            GREEN,
             |s| s.voice_command(VoiceCommand::Start),
         )
-        .fill(INK)
-        .font(TextStyle::new(14.0, 500.0))
-        .px(18.0)
-        .py(12.0)
         .help("Record your voice. Your typed draft is kept separately."),
-        VoiceState::Recording => pill(
+        VoiceState::Recording => kit::primary(
+            Some(Icon::Stop),
             if s.direction_mode {
-                "■  Stop & direct"
+                "Stop & direct"
             } else {
-                "■  Finish recording"
+                "Finish recording"
             },
             "voice-stop",
-            true,
+            RED,
             |s| s.voice_command(VoiceCommand::Finish),
+        ),
+        VoiceState::Unavailable => kit::primary(
+            Some(Icon::Retry),
+            "Reconnect Hex",
+            "voice-check",
+            INK,
+            |s| s.voice_command(VoiceCommand::Check),
         )
-        .fill(RED)
-        .font(TextStyle::new(14.0, 500.0))
-        .hover(RED)
-        .px(18.0)
-        .py(12.0),
-        VoiceState::Unavailable => pill("Reconnect Hex", "voice-check", true, |s| {
-            s.voice_command(VoiceCommand::Check)
-        })
-        .font(TextStyle::new(14.0, 500.0))
-        .py(12.0)
         .help("Open Hex with a local model loaded, then retry the connection."),
-        state => label(
+        state => kit::notice(
             match state {
                 VoiceState::Checking => "Connecting to Hex…",
                 VoiceState::Starting => "Opening microphone…",
@@ -261,27 +364,30 @@ fn voice_controls(s: &State) -> El {
                 VoiceState::Cancelling => "Discarding guidance…",
                 _ => unreachable!(),
             },
-            13.0,
-            MUTED,
-        )
-        .key("voice-progress")
-        .px(12.0)
-        .py(12.0),
+            "voice-progress",
+        ),
     };
-    let mut controls = row().gap(10.0).center_y();
+    let mut controls = row().gap(8.0).center_y();
     if s.voice_state == VoiceState::Recording {
         controls = controls.child(
-            label(format!("●  {}", time(s.voice_seconds * 1000)), 13.0, RED)
-                .key("recording-timer")
-                .label(format!(
-                    "Recording, {} elapsed",
-                    time(s.voice_seconds * 1000)
-                )),
+            row()
+                .center_y()
+                .gap(7.0)
+                .px(6.0)
+                .child(kit::pulse(RED))
+                .child(
+                    kit::caption(time(s.voice_seconds * 1000), 13.0, 600.0, RED)
+                        .key("recording-timer")
+                        .label(format!(
+                            "Recording, {} elapsed",
+                            time(s.voice_seconds * 1000)
+                        )),
+                ),
         );
     }
     controls = controls.child(action);
     if s.voice_state == VoiceState::Recording && s.direction_mode {
-        controls = controls.child(button("Cancel", "voice-cancel", |s| {
+        controls = controls.child(kit::tool(None, "Cancel", "voice-cancel", |s| {
             s.voice_command(VoiceCommand::Cancel)
         }));
     }
@@ -295,7 +401,7 @@ fn voice_feedback(s: &State) -> &str {
             return if s.direction_mode {
                 "Describe the change. Your guidance is applied when you finish."
             } else {
-                "Listening. Your words appear below as the map takes shape."
+                "Listening. Your words appear above as the map takes shape."
             };
         }
         return &s.voice_status;
@@ -311,7 +417,7 @@ fn voice_feedback(s: &State) -> &str {
         };
     }
     if s.voice_worker.is_none() {
-        return "Voice is available in the desktop app. You can type a thought below.";
+        return "Voice is available in the desktop app. You can type a thought instead.";
     }
     &s.voice_status
 }
@@ -321,76 +427,137 @@ fn drawer(s: &State) -> El {
         && s.queued_direction.is_none()
         && s.pending_recordings.is_empty()
         && !s.video_busy();
-    let mut list = col().gap(6.0).grow(1.0).min_h(0.0).scroll(ScrollSpec {
+    let mut list = col().gap(2.0).grow(1.0).min_h(0.0).scroll(ScrollSpec {
         stick_bottom: false,
     });
     for (index, entry) in s.session_entries.iter().enumerate() {
         let path = entry.path.clone();
         let current = s.path.as_ref() == Some(&path);
         list = list.child(enabled(
-            pill(
-                &entry.name,
-                &format!("session-{index}"),
-                current,
-                move |s| s.switch_session(path.clone()),
-            )
-            .w_full()
-            .wrap_anywhere(),
+            row()
+                .key(format!("session-{index}"))
+                .role("button")
+                .label(&entry.name)
+                .focusable(true)
+                .w_full()
+                .gap(9.0)
+                .px(10.0)
+                .py(9.0)
+                .radius(12.0)
+                .fill(if current {
+                    GREEN.alpha(0.10)
+                } else {
+                    Color::TRANSPARENT
+                })
+                .hover(if current {
+                    GREEN.alpha(0.10)
+                } else {
+                    kit::wash(1.4)
+                })
+                .press_scale(0.98)
+                .on_press(move |s: &mut State| s.switch_session(path.clone()))
+                .child(
+                    kit::dot(if current { GREEN } else { LINE })
+                        .mt(6.0)
+                        .min_w(7.0),
+                )
+                .child(
+                    label(&entry.name, 13.0, INK)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .wrap_anywhere(),
+                ),
             can_switch || current,
         ));
     }
-    col()
-        .key("session-drawer")
+    let mut naming = col()
+        .gap(6.0)
+        .child(kit::eyebrow("NAME THIS SESSION", MUTED).pl(6.0))
+        .child(enabled(
+            // A press anywhere on the pill lands in its one field.
+            row()
+                .role("textbox")
+                .center_y()
+                .h(40.0)
+                .px(12.0)
+                .radius(14.0)
+                .fill(kit::wash(1.0))
+                .child(
+                    text_input(&s.session_name_edit, TextStyle::new(13.5, 400.0))
+                        .key("session-name")
+                        .label("Rename this session")
+                        .help("Choose a name to keep instead of the automatic conversation title.")
+                        .single_line()
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .color(INK)
+                        .placeholder("Session name", MUTED)
+                        .on_edit(|s: &mut State| &mut s.session_name_edit)
+                        .on_submit(|s: &mut State, _| {
+                            if s.can_rename() {
+                                s.rename_session();
+                            }
+                        }),
+                ),
+            !s.read_only,
+        ));
+    if s.can_rename() {
+        // The confirmation appears with the edit it confirms, and leaves once the name is kept.
+        naming = naming.child(
+            kit::primary(
+                None,
+                "Rename current",
+                "session-rename",
+                GREEN,
+                State::rename_session,
+            )
+            .h(38.0)
+            .radius(19.0)
+            .justify_center(),
+        );
+    }
+    kit::card(col().key("session-drawer"))
         .w(250.0)
         .min_w(250.0)
-        .h_full()
-        .padding(16.0)
-        .gap(14.0)
-        .fill(WHITE)
-        .radius(16.0)
+        .padding(14.0)
+        .gap(12.0)
         .transition(rune::Transition::offset(-250.0, 0.0))
         .child(
             row()
                 .center_y()
-                .child(label("Your sessions", 18.0, INK).grow(1.0))
-                .child(button("Close", "sessions-back", |s| {
-                    s.sessions_open = false
-                })),
+                .pl(6.0)
+                .child(kit::caption("Your sessions", 16.0, 600.0, INK).grow(1.0))
+                .child(kit::icon_button(
+                    Icon::Close,
+                    "Close",
+                    "sessions-back",
+                    |s| s.sessions_open = false,
+                )),
         )
         .child(enabled(
-            pill("+  New session", "session-create", false, |s| {
+            kit::tool(Some(Icon::Plus), "New session", "session-create", |s| {
                 s.session_name_edit = TextEdit::new("");
                 s.create_session();
             })
-            .fill(PAPER),
+            .h(38.0)
+            .radius(19.0)
+            .fill(kit::wash(1.0)),
             can_switch,
         ))
         .child(list)
+        .child(naming)
         .child(
-            text_input(&s.session_name_edit, TextStyle::new(14.0, 400.0))
-                .key("session-name")
-                .label("Rename this session")
-                .help("Choose a name to keep instead of the automatic conversation title.")
-                .h(40.0)
-                .color(INK)
-                .placeholder("Session name", MUTED)
-                .on_edit(|s: &mut State| &mut s.session_name_edit),
+            label(
+                if can_switch {
+                    "Each session keeps its audio, transcript and map history."
+                } else {
+                    "Finish recording, transcription, guidance or export before switching sessions."
+                },
+                11.0,
+                MUTED,
+            )
+            .px(6.0),
         )
-        .child(enabled(
-            button("Rename current", "session-rename", State::rename_session),
-            !s.read_only
-                && !s.session_name_edit.text.trim().is_empty()
-                && s.session_name_edit.text.trim() != s.session_name,
-        ))
-        .child(label(
-            if can_switch {
-                "Each session keeps its audio, transcript and map history."
-            } else {
-                "Finish recording, transcription, guidance or export before switching sessions."
-            },
-            11.0,
-            MUTED,
-        ))
 }
 fn time(ms: u64) -> String {
     format!("{:02}:{:02}", ms / 60_000, ms / 1000 % 60)
@@ -560,10 +727,25 @@ fn selected(s: &State) -> Option<El> {
     );
     if s.replay.is_none() && !s.read_only && retired.is_none() {
         controls = controls
-            .child(button("Move to next branch", "move", State::move_selected))
-            .child(button("Remove", "remove", State::remove_selected));
+            .child(kit::tool(
+                Some(Icon::Branch),
+                "Move to next branch",
+                "move",
+                State::move_selected,
+            ))
+            .child(kit::tool(
+                Some(Icon::Trash),
+                "Remove",
+                "remove",
+                State::remove_selected,
+            ));
         if t.pinned {
-            controls = controls.child(button("Allow AI to revise", "unpin", State::unpin_selected));
+            controls = controls.child(kit::tool(
+                Some(Icon::Spark),
+                "Allow AI to revise",
+                "unpin",
+                State::unpin_selected,
+            ));
         }
     }
     let mut detail = col()
@@ -584,41 +766,59 @@ fn selected(s: &State) -> Option<El> {
                 .wrap_anywhere()
                 .selectable(true),
         );
+    // Every other idea this one leads to is a pill that selects it.
+    let link = |glyph, title: &str, key: &str, id| {
+        kit::tool(glyph, title, key, move |s| s.selected = Some(id)).fill(kit::wash(1.0))
+    };
     if let Some(r) = retired {
         detail = detail.child(label(r.reason.clone(), 13.0, MUTED));
-        for id in &r.replaced_by {
-            let id = *id;
-            detail = detail.child(button(
-                &format!("Now: {}", short_label(concept_label(s, id))),
-                &format!("replacement-{id}"),
-                move |s| s.selected = Some(id),
-            ));
+        if !r.replaced_by.is_empty() {
+            let mut now = row().gap(6.0).flex_wrap();
+            for id in &r.replaced_by {
+                now = now.child(link(
+                    Some(Icon::Spark),
+                    &format!("Now: {}", short_label(concept_label(s, *id))),
+                    &format!("replacement-{id}"),
+                    *id,
+                ));
+            }
+            detail = detail.child(now);
         }
     }
     if retired.is_some() {
-        detail = detail.child(label("MAP HISTORY", 10.0, MUTED));
+        let mut history = row().gap(6.0).flex_wrap();
         for r in s.projection.session.retired.iter().rev() {
             let id = r.thought.id;
-            detail = detail.child(button(
+            history = history.child(link(
+                None,
                 r.thought.map_label(),
                 &format!("retired-{id}"),
-                move |s| s.selected = Some(id),
+                id,
             ));
         }
+        detail = detail
+            .child(kit::eyebrow("MAP HISTORY", MUTED).mt(4.0))
+            .child(history);
     }
     // Keep semantic cross-links discoverable after removing the right inspector.
     if let Some(i) = &s.projection.session.interpretation {
-        for r in i
-            .relationships
-            .iter()
-            .filter(|r| r.from == t.id || r.to == t.id)
-        {
-            let id = if r.from == t.id { r.to } else { r.from };
-            detail = detail.child(button(
-                &format!("{} → {}", r.label, short_label(concept_label(s, id))),
-                &format!("connection-{id}"),
-                move |s| s.selected = Some(id),
-            ));
+        let related = || {
+            i.relationships
+                .iter()
+                .filter(|r| r.from == t.id || r.to == t.id)
+        };
+        if related().next().is_some() {
+            let mut links = row().gap(6.0).flex_wrap();
+            for r in related() {
+                let id = if r.from == t.id { r.to } else { r.from };
+                links = links.child(link(
+                    Some(Icon::Branch),
+                    &format!("{} → {}", r.label, short_label(concept_label(s, id))),
+                    &format!("connection-{id}"),
+                    id,
+                ));
+            }
+            detail = detail.child(links);
         }
     }
     Some(detail)
@@ -634,79 +834,71 @@ fn has_transcript(s: &State) -> bool {
 fn dock(s: &State) -> El {
     let selected = selected(s);
     let inspecting = selected.is_some();
-    let mut dock = col()
-        .key("composer")
-        .gap(12.0)
-        .padding(16.0)
-        .fill(WHITE)
-        .radius(16.0)
-        .border(1.0, LINE.alpha(0.6));
-
-    if s.replay.is_none() {
-        dock = dock.child(
-            row()
-                .gap(12.0)
-                .center_y()
-                .child(if s.read_only { el() } else { mode_controls(s) })
-                .child(el().grow(1.0))
-                .child(voice_controls(s)),
-        );
-        if !s.read_only {
-            dock = dock.child(
-                label(voice_feedback(s), 12.0, MUTED)
-                    .key("voice-feedback")
-                    .wrap_anywhere(),
-            );
-        }
-    }
+    let mut dock = kit::card(col().key("composer")).gap(10.0).padding(14.0);
 
     if inspecting || has_transcript(s) || s.voice_in_progress() {
         let mut tabs = row()
-            .gap(6.0)
+            .gap(4.0)
             .center_y()
+            .min_h(32.0)
             .child(if inspecting {
-                button("← Transcript", "show-transcript", |s| s.selected = None)
+                kit::tool(Some(Icon::Back), "Transcript", "show-transcript", |s| {
+                    s.selected = None
+                })
             } else {
-                label("Transcript", 12.0, MUTED).px(6.0)
+                kit::caption("Transcript", 12.0, 600.0, MUTED).px(6.0)
             })
             .child(el().grow(1.0));
         if let Some(r) = s.projection.session.retired.last() {
             let id = r.thought.id;
-            tabs = tabs.child(button("Prior concepts", "concept-history", move |s| {
-                s.selected = Some(id)
-            }));
+            tabs = tabs.child(kit::tool(
+                None,
+                "Prior concepts",
+                "concept-history",
+                move |s| s.selected = Some(id),
+            ));
         }
         if !inspecting && s.replay.is_none() {
             if !s.transcript_following {
+                let title = if s.voice_state == VoiceState::Recording {
+                    "Jump to live"
+                } else {
+                    "Jump to latest"
+                };
                 tabs = tabs.child(
-                    label(
-                        if s.voice_state == VoiceState::Recording {
-                            "Jump to live ↓"
-                        } else {
-                            "Jump to latest ↓"
-                        },
-                        12.0,
-                        GREEN,
-                    )
-                    .key("transcript-follow")
-                    .role("button")
-                    .focusable(true)
-                    .px(12.0)
-                    .py(8.0)
-                    .radius(7.0)
-                    .hover(PAPER)
-                    .on_press_tx(|s: &mut State, tx| {
-                        s.transcript_following = true;
-                        tx.scroll_to_instant("transcript-scroll", 0.0, 1_000_000_000.0);
-                    }),
+                    row()
+                        .key("transcript-follow")
+                        .role("button")
+                        .label(title)
+                        .focusable(true)
+                        .center_y()
+                        .gap(4.0)
+                        .pl(12.0)
+                        .pr(8.0)
+                        .h(28.0)
+                        .radius(14.0)
+                        .fill(GREEN.alpha(0.10))
+                        .hover(GREEN.alpha(0.18))
+                        .press_scale(0.96)
+                        .on_press_tx(|s: &mut State, tx| {
+                            s.transcript_following = true;
+                            tx.scroll_to_instant("transcript-scroll", 0.0, 1_000_000_000.0);
+                        })
+                        .child(kit::caption(title, 12.0, 600.0, GREEN))
+                        .child(kit::icon(Icon::Down, 13.0, GREEN)),
                 );
             } else if s.voice_state == VoiceState::Recording {
-                tabs = tabs.child(label("Following live", 11.0, GREEN).px(8.0));
+                tabs = tabs.child(kit::caption("Following live", 11.5, 500.0, GREEN).px(8.0));
             }
         }
         if s.replay.is_none() {
             tabs = tabs.child(
-                button(
+                kit::tool(
+                    Some(if s.transcript_expanded {
+                        Icon::Down
+                    } else {
+                        Icon::Up
+                    }),
                     if s.transcript_expanded {
                         "Collapse"
                     } else {
@@ -725,6 +917,9 @@ fn dock(s: &State) -> El {
                 (s.viewport[1] * 0.30).clamp(150.0, 320.0)
             } else if inspecting {
                 104.0
+            } else if s.viewport[1] < 700.0 {
+                // A short window keeps only the latest line, so the map keeps its room.
+                32.0
             } else {
                 64.0
             })
@@ -746,132 +941,234 @@ fn dock(s: &State) -> El {
             .scroll(ScrollSpec {
                 stick_bottom: !inspecting && s.transcript_following,
             });
-        dock = dock.child(col().gap(4.0).child(tabs).child(content));
+        dock = dock.child(
+            col()
+                .key("dock-detail")
+                .gap(4.0)
+                // The card opens first, then its transcript arrives in the room it made.
+                .enter_delay(0.12)
+                .child(tabs)
+                .child(content),
+        );
+    }
+    if s.replay.is_some() {
+        return dock;
     }
 
-    if s.replay.is_none() && !s.read_only {
+    // One bar for everything you can say to the map: how, typed, or spoken.
+    // Keyed, so the bar stays itself when the transcript first appears above it.
+    let mut bar = row().key("dock-bar").gap(10.0).items_end();
+    if s.read_only {
+        bar = bar.child(el().grow(1.0));
+    } else {
         let draft = if s.direction_mode {
             &s.direction_draft
         } else {
             &s.draft
         };
+        let style = TextStyle::new(14.0, 400.0);
+        let field = text_input(draft, style)
+            .key("thought-input")
+            .label(if s.direction_mode {
+                "Type map guidance"
+            } else {
+                "Type a thought"
+            })
+            .w_full()
+            .color(INK)
+            .placeholder(
+                if s.direction_mode {
+                    "Or type map guidance…"
+                } else {
+                    "Or type a thought…"
+                },
+                MUTED,
+            )
+            .help("Enter to submit. Shift+Enter for a new line.")
+            .on_edit(|s: &mut State| {
+                if s.direction_mode {
+                    &mut s.direction_draft
+                } else {
+                    &mut s.draft
+                }
+            })
+            .on_submit(|s: &mut State, _| {
+                if s.can_submit_draft() {
+                    s.capture();
+                }
+            });
+        // The pill grows with a long thought for a few lines, then scrolls.
         let mut input = row()
-            .gap(10.0)
-            .center_y()
-            .px(12.0)
+            .gap(6.0)
+            .items_end()
+            .grow(1.0)
+            .min_w(0.0)
+            .min_h(40.0)
+            .pl(16.0)
+            .pr(4.0)
             .py(4.0)
-            .radius(9.0)
-            .fill(PAPER)
+            .radius(20.0)
+            .fill(kit::wash(1.0))
             .child(
-                text_input(draft, TextStyle::new(14.0, 400.0))
-                    .key("thought-input")
-                    .label(if s.direction_mode {
-                        "Type map guidance"
-                    } else {
-                        "Type a thought"
-                    })
+                rune::auto_grow(field, 1, 4)
+                    .key("thought-lines")
+                    .w(0.0)
                     .grow(1.0)
                     .min_w(0.0)
-                    .h(32.0)
-                    .color(INK)
-                    .placeholder(
-                        if s.direction_mode {
-                            "Or type map guidance…"
-                        } else {
-                            "Or type a thought…"
-                        },
-                        MUTED,
-                    )
-                    .help("Enter to submit. Shift+Enter for a new line.")
-                    .on_edit(|s: &mut State| {
-                        if s.direction_mode {
-                            &mut s.direction_draft
-                        } else {
-                            &mut s.draft
-                        }
-                    })
-                    .on_submit(|s: &mut State, _| {
-                        if s.can_submit_draft() {
-                            s.capture();
-                        }
-                    }),
+                    // One line sits centered beside the round send button.
+                    .my((32.0 - style.line_px()) / 2.0),
             );
         if !draft.text.trim().is_empty() {
             input = input.child(enabled(
-                button(
+                kit::round(
+                    Icon::Send,
                     if s.direction_mode {
-                        "Apply guidance ↵"
+                        "Apply guidance"
                     } else {
-                        "Add thought ↵"
+                        "Add thought"
                     },
                     "capture",
+                    INK,
                     |s| {
                         if s.can_submit_draft() {
                             s.capture();
                         }
                     },
-                ),
+                )
+                .help("Enter"),
                 s.can_submit_draft(),
             ));
         }
-        dock = dock.child(input);
+        bar = bar.child(mode_controls(s)).child(input);
+    }
+    dock = dock.child(bar.child(voice_controls(s)));
+    if !s.read_only {
+        dock = dock.child(
+            label(voice_feedback(s), 11.5, MUTED)
+                .key("voice-feedback")
+                .px(6.0)
+                .wrap_anywhere(),
+        );
     }
     dock
 }
 
-fn empty_map() -> El {
-    col()
-        .key("empty-map")
+/// The opening words of a thought in each of the map's four lenses.
+pub(super) const STARTERS: [(Role, &str, &str); 4] = [
+    (Role::Observation, "starter-noticing", "I keep noticing "),
+    (Role::Question, "starter-wondering", "Why do we "),
+    (Role::Tension, "starter-tension", "But what about "),
+    (Role::Possibility, "starter-possibility", "What if "),
+];
+
+fn empty_map(s: &State) -> El {
+    // Three ideas finding each other: the whole product in one small drawing.
+    let mark = Shape::new()
+        .view_box(120.0, 84.0)
+        .stroke(
+            vec![[26.0, 60.0], [42.0, 34.0], [60.0, 24.0]],
+            2.0,
+            GREEN.alpha(0.45),
+        )
+        .stroke(
+            vec![[60.0, 24.0], [80.0, 40.0], [96.0, 62.0]],
+            2.0,
+            GOLD.alpha(0.5),
+        )
+        .stroke(vec![[26.0, 60.0], [96.0, 62.0]], 2.0, BLUE.alpha(0.3));
+    let stage = kit::stage(col().key("empty-map"))
         .w_full()
         .h_full()
         .center()
         .gap(12.0)
         .padding(32.0)
         .child(
-            label("A little space to think.", 30.0, INK)
-                .font(TextStyle::new(30.0, 500.0).tracking(-0.7)),
+            el().size(120.0, 84.0)
+                .child(rune::canvas(mark).size(120.0, 84.0))
+                .child(
+                    kit::dot(GREEN)
+                        .size(18.0, 18.0)
+                        .radius(9.0)
+                        .absolute(17.0, 51.0),
+                )
+                .child(
+                    kit::dot(GOLD)
+                        .size(22.0, 22.0)
+                        .radius(11.0)
+                        .absolute(49.0, 13.0),
+                )
+                .child(
+                    kit::dot(BLUE)
+                        .size(14.0, 14.0)
+                        .radius(7.0)
+                        .absolute(89.0, 55.0),
+                ),
         )
         .child(
-            label(
-                "Speak a thought. Follow a question. Let the connections take shape.",
-                16.0,
-                MUTED,
-            )
-            .max_w(400.0),
+            label("A little space to think.", 30.0, INK)
+                .font(TextStyle::new(30.0, 600.0).tracking(-0.8)),
         )
+        .child(
+            // Each line is its own label, so both sit centered beneath the heading.
+            col()
+                .items_center()
+                .gap(2.0)
+                .child(label("Speak a thought. Follow a question.", 15.0, MUTED))
+                .child(label("Let the connections take shape.", 15.0, MUTED)),
+        );
+    // A recording or queued guidance holds its mode, and then a starter could not open a thought.
+    if s.read_only || s.direction_mode && s.input_mode_locked() {
+        return stage;
+    }
+    let mut starters = row()
+        .key("starters")
+        .label("Ways to begin")
+        .flex_wrap()
+        .justify_center()
+        .gap(8.0)
+        .mt(12.0);
+    for (role, key, stem) in STARTERS {
+        starters = starters.child(
+            kit::seed(
+                color(role),
+                &format!("{}…", stem.trim_end()),
+                key,
+                move |s| s.start_thought(stem),
+            )
+            .help(role.label()),
+        );
+    }
+    stage.child(starters)
 }
 
 fn navigation(s: &State) -> El {
-    row()
-        .key("map-navigation")
+    kit::card(row().key("map-navigation"))
+        .pin(None, None, Some(12.0), Some(12.0))
         .center_y()
-        .gap(4.0)
+        .gap(2.0)
+        .padding(4.0)
+        .radius(20.0)
         .child(
-            label(
-                format!("{} concepts", s.projection.session.thoughts.len()),
-                11.0,
-                MUTED,
-            )
-            .grow(1.0),
+            kit::icon_button(Icon::Minus, "Zoom out", "zoom-out", |s| {
+                s.zoom_center(1.0 / 1.2)
+            })
+            .help("Zoom out · Command/Ctrl −"),
         )
         .child(
-            button("−", "zoom-out", |s| s.zoom_center(1.0 / 1.2))
-                .label("Zoom out")
-                .help("Zoom out · Command/Ctrl −"),
-        )
-        .child(
-            button("Actual size", "zoom-reset", |s| {
+            // The zoom itself, which is also the way back to actual size.
+            kit::readout(&s.zoom_readout, "100%", "Actual size", "zoom-reset", |s| {
                 s.zoom_center(1.0 / s.camera_zoom.get())
             })
             .help("Reset to 100% · Command/Ctrl 0"),
         )
         .child(
-            button("+", "zoom-in", |s| s.zoom_center(1.2))
-                .label("Zoom in")
+            kit::icon_button(Icon::Plus, "Zoom in", "zoom-in", |s| s.zoom_center(1.2))
                 .help("Zoom in · Command/Ctrl +"),
         )
+        .child(el().w(1.0).h(16.0).mx(4.0).fill(LINE))
         .child(
-            button("Fit map", "zoom-fit", State::fit_map).help("Show every idea · Command/Ctrl *"),
+            kit::icon_button(Icon::Fit, "Fit map", "zoom-fit", State::fit_map)
+                .help("Show every idea · Command/Ctrl *"),
         )
 }
 
@@ -883,20 +1180,44 @@ fn status(s: &State) -> El {
     } else {
         &s.organizer_status
     };
-    let mut status = row().gap(8.0).center_y().child(
-        label(format!("{} · {}", s.status, organization), 10.0, MUTED)
+    let unsaved = s.status.starts_with("Not saved:");
+    let mut status = row()
+        .key("status-bar")
+        .gap(8.0)
+        .center_y()
+        .min_h(32.0)
+        .pl(8.0)
+        .child(kit::dot(if unsaved {
+            RED
+        } else if s.busy {
+            GOLD
+        } else {
+            GREEN
+        }))
+        .child(
+            label(
+                if organization.is_empty() {
+                    s.status.clone()
+                } else {
+                    format!("{} · {}", s.status, organization)
+                },
+                11.0,
+                MUTED,
+            )
             .key("session-status")
             .help(&s.organizer_status)
             .grow(1.0)
             .min_w(0.0)
             .wrap_anywhere(),
-    );
+        );
     if s.replay.is_none() && !s.read_only {
-        if s.art_style != Style::Off && s.gallery.is_working() {
-            status = status.child(label("Artwork updating…", 10.0, MUTED).key("art-progress"));
-        }
-        if s.path.is_some() && s.status.starts_with("Not saved:") {
-            status = status.child(button("Retry save", "save", State::save));
+        if s.path.is_some() && unsaved {
+            status = status.child(kit::tool(
+                Some(Icon::Retry),
+                "Retry save",
+                "save",
+                State::save,
+            ));
         }
         if s.voice_worker.is_some()
             && s.journal.is_some()
@@ -908,39 +1229,201 @@ fn status(s: &State) -> El {
                     .any(|(id, _, _)| id == &a.id)
             })
         {
-            status = status.child(button(
+            status = status.child(kit::tool(
+                Some(Icon::Retry),
                 "Retry transcript",
                 "retry-transcript",
                 State::retry_transcript,
             ));
         }
     }
-    status.child(session_video_controls(s))
+    status.child(session_video_controls(s).key("session-video"))
 }
 
-pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
-    if s.replay.is_some() {
-        cx.reduced_motion(s.reduced_motion);
-    }
-    let reduced_motion = cx.is_reduced_motion();
-    let empty = s.projection.session.thoughts.is_empty()
-        && s.projection.session.categories.is_empty()
-        && s.draft.text.trim().is_empty();
-    let mut header = row()
-        .gap(12.0)
+/// Where every screen starts: the mark, the way to the other sessions, and this one's name.
+fn header(s: &State) -> El {
+    row()
+        .gap(6.0)
         .center_y()
-        .child(label("tacit", 25.0, INK).font(TextStyle::new(25.0, 500.0).tracking(-1.0)))
+        .min_h(36.0)
+        .pl(6.0)
+        .child(kit::brand())
         .child(sessions_button(s))
         .child(
             label(&s.session_name, 13.0, MUTED)
                 .help(&s.session_name)
                 .grow(1.0)
                 .min_w(0.0)
+                .ml(4.0)
                 .truncate(),
+        )
+}
+
+/// Artwork is made when someone asks for it. The header offers the ask while the conversation
+/// holds something the mural does not show, says when a scene is on its way, and can put the
+/// mural out of sight.
+fn artwork(s: &State, mut header: El) -> El {
+    let shown = s.art_style != Style::Off;
+    let mural = s.gallery.has_mural();
+    if shown && s.gallery.is_working() {
+        header = header.child(kit::progress("Composing artwork…", "art-progress"));
+    } else if (shown || !mural)
+        && !s.read_only
+        && s.gallery.worker.is_some()
+        && s.gallery.is_behind()
+    {
+        header = header.child(
+            kit::tool(
+                Some(Icon::Spark),
+                if mural {
+                    "Update artwork"
+                } else {
+                    "Create artwork"
+                },
+                "art-compose",
+                |s| {
+                    s.art_style = Style::Ink;
+                    s.gallery.compose();
+                },
+            )
+            .help(if mural {
+                "Add what has been said since to the mural"
+            } else {
+                "Draw this conversation as a mural"
+            }),
         );
+    }
+    if !s.gallery.layers.is_empty() {
+        header = header.child(kit::tool(
+            Some(Icon::Image),
+            if shown {
+                "Hide artwork"
+            } else {
+                "Show artwork"
+            },
+            "art-style",
+            |s| s.art_style = s.art_style.toggle(),
+        ));
+    }
+    header
+}
+
+/// The window around a screen's column, with the sessions drawer beside it or over it.
+fn window(s: &State, cx: &mut Cx<State>, center: El) -> El {
+    let reduced_motion = cx.is_reduced_motion();
+    // The drawer belongs to this window, whatever size a replayed session was recorded at.
+    let roomy = cx.layout_size("root").map_or(s.viewport[0], |size| size[0]) >= 1080.0;
+    let mut root = row()
+        .key("root")
+        .w_full()
+        .h_full()
+        .padding(16.0)
+        .gap(14.0)
+        .fill(PAPER)
+        .on_layout(move |s: &mut State, rect| {
+            if s.replay.is_none() {
+                s.viewport = [rect[2], rect[3]];
+                s.reduced_motion = reduced_motion;
+            }
+        });
+    if s.sessions_open && roomy {
+        root = root.child(drawer(s).h_full());
+    }
+    root = root.child(center);
+    if s.sessions_open && !roomy {
+        // Too narrow to share the window: the drawer floats over a dimmed workspace, and a
+        // press outside it or Escape puts it away.
+        root = root
+            .child(
+                el().key("sessions-scrim")
+                    .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                    .fill(INK.alpha(0.16))
+                    .inert()
+                    .transition(rune::Transition::opacity()),
+            )
+            .child(
+                drawer(s)
+                    .pin(Some(16.0), Some(16.0), None, Some(16.0))
+                    .shadow(24.0, 60.0, INK.alpha(0.22))
+                    .modal(true, |s: &mut State| s.sessions_open = false),
+            );
+    }
+    root
+}
+
+/// A saved session's original pixels, framed the way its map would be.
+pub(super) fn video(s: &State, cx: &mut Cx<State>) -> El {
+    let picture = if let Some((_, image)) = &s.pixel_image {
+        el().pixels_fit(image.pixels(), rune::SurfaceFit::Fit)
+            .w_full()
+            .h(0.0)
+            .grow(1.0)
+            .min_h(0.0)
+    } else {
+        col()
+            .key("video-gap")
+            .w_full()
+            .grow(1.0)
+            .center()
+            .gap(10.0)
+            .padding(24.0)
+            .child(kit::icon(Icon::Film, 28.0, MUTED.alpha(0.7)))
+            .child(label(
+                "No original pixels were captured at this time.",
+                14.0,
+                MUTED,
+            ))
+    };
+    let center = col()
+        .key("workspace")
+        .w(0.0)
+        .grow(1.0)
+        .min_w(0.0)
+        .h_full()
+        .gap(12.0)
+        .child(
+            header(s).child(
+                row()
+                    .center_y()
+                    .gap(7.0)
+                    .pr(8.0)
+                    .child(kit::icon(Icon::Film, 16.0, GREEN))
+                    .child(kit::eyebrow("SESSION VIDEO", GREEN)),
+            ),
+        )
+        .child(
+            kit::stage(col())
+                .w_full()
+                .h(0.0)
+                .grow(1.0)
+                .min_h(0.0)
+                .clip_rounded(kit::CARD)
+                .child(picture),
+        )
+        .child(replay_controls(s))
+        .child(status(s));
+    window(s, cx, center)
+}
+
+pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
+    if s.replay.is_some() {
+        cx.reduced_motion(s.reduced_motion);
+    }
+    let empty = s.projection.session.thoughts.is_empty()
+        && s.projection.session.categories.is_empty()
+        && s.draft.text.trim().is_empty();
+    let mut header = header(s);
     if s.replay.is_none() {
+        // The tools that come and go most sit furthest left, so the rest keep still for them.
+        if !s.story {
+            header = artwork(s, header);
+        }
+        if !s.read_only && (!s.history.is_empty() || s.queued_direction.is_some()) {
+            header = header.child(kit::tool(Some(Icon::Undo), "Undo", "undo", State::undo));
+        }
         if !empty || s.story {
-            header = header.child(button(
+            header = header.child(kit::tool(
+                Some(if s.story { Icon::Map } else { Icon::Thread }),
                 if s.story {
                     "Back to map"
                 } else {
@@ -950,30 +1433,20 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
                 |s| s.story = !s.story,
             ));
         }
-        if !s.story && (s.gallery.worker.is_some() || !s.gallery.layers.is_empty()) {
-            header = header.child(button(
-                if s.art_style == Style::Off {
-                    "Show artwork"
-                } else {
-                    "Hide artwork"
-                },
-                "art-style",
-                |s| s.art_style = s.art_style.toggle(),
-            ));
-        }
-        if !s.read_only && (!s.history.is_empty() || s.queued_direction.is_some()) {
-            header = header.child(button("Undo", "undo", State::undo));
-        }
     }
     let main = if s.story {
-        col()
-            .key("story")
+        kit::stage(col().key("story"))
             .grow(1.0)
             .min_h(0.0)
-            .padding(24.0)
-            .gap(16.0)
-            .child(label("THE THREAD SO FAR", 11.0, GREEN))
-            .child(label(s.projection.session.narrative(), 23.0, INK).selectable(true))
+            .px(36.0)
+            .py(30.0)
+            .gap(14.0)
+            .child(kit::eyebrow("THE THREAD SO FAR", GREEN))
+            .child(
+                label(s.projection.session.narrative(), 21.0, INK)
+                    .max_w(760.0)
+                    .selectable(true),
+            )
             .on_scroll_offset({
                 let offset = s.story_scroll.clone();
                 move |p| {
@@ -984,22 +1457,21 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
                 stick_bottom: false,
             })
     } else if empty && s.replay.is_none() {
-        empty_map()
+        empty_map(s)
     } else {
         tree(s, cx)
     };
+    // Keyed, so the workspace slides aside for the drawer instead of being rebuilt beside it.
     let mut center = col()
+        .key("workspace")
         .w(0.0)
         .grow(1.0)
         .min_w(0.0)
         .h_full()
-        .gap(10.0)
+        .gap(12.0)
         .child(header)
-        .child(row().h(0.0).grow(1.0).min_h(0.0).child(main));
-    if !s.story && !empty && s.replay.is_none() {
-        center = center.child(navigation(s));
-    }
-    center = center.child(dock(s));
+        .child(row().h(0.0).grow(1.0).min_h(0.0).child(main))
+        .child(dock(s));
     if s.replay.is_some() {
         center = center.child(replay_controls(s));
     } else if s.art_style != Style::Off
@@ -1007,43 +1479,39 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
         && !s.gallery.status.is_empty()
         && !s.gallery.status.starts_with("Art ·")
     {
-        // Keep failures visible; Retry is useful only when the mural needs recovery.
+        // Nothing tries again by itself, so a failure stays until someone retries it or puts
+        // it away.
         center = center.child(
             row()
-                .gap(8.0)
+                .key("art-notice")
+                .gap(4.0)
                 .center_y()
+                .pl(14.0)
+                .pr(6.0)
+                .py(4.0)
+                .radius(20.0)
+                .fill(GOLD.alpha(0.09))
                 .child(
-                    label(&s.gallery.status, 12.0, MUTED)
+                    label(&s.gallery.status, 12.0, INK)
                         .grow(1.0)
                         .min_w(0.0)
+                        .mr(4.0)
                         .wrap_anywhere(),
                 )
                 .child(enabled(
-                    button("Retry art", "retry-art", |s| s.gallery.retry()),
+                    kit::tool(Some(Icon::Retry), "Retry art", "retry-art", |s| {
+                        s.gallery.compose()
+                    }),
                     !s.read_only,
+                ))
+                .child(kit::icon_button(
+                    Icon::Close,
+                    "Dismiss",
+                    "art-dismiss",
+                    |s| s.gallery.status.clear(),
                 )),
         );
     }
     center = center.child(status(s));
-    let mut root = row()
-        .key("root")
-        .w_full()
-        .h_full()
-        .padding(20.0)
-        .gap(16.0)
-        .fill(PAPER)
-        .on_layout(move |s: &mut State, rect| {
-            if s.replay.is_none() {
-                s.viewport = [rect[2], rect[3]];
-                s.reduced_motion = reduced_motion;
-            }
-        });
-    if s.sessions_open && s.viewport[0] >= 1080.0 {
-        root = root.child(drawer(s));
-    }
-    root = root.child(center);
-    if s.sessions_open && s.viewport[0] < 1080.0 {
-        root = root.child(drawer(s).absolute(20.0, 20.0));
-    }
-    root
+    window(s, cx, center)
 }

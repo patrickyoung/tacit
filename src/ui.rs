@@ -1,3 +1,4 @@
+mod kit;
 mod workspace;
 use rune::{
     Color, Cx, El, Key, KeyEvent, LineCap, Path, ScrollSpec, Shape, TextEdit, TextStyle, Tx,
@@ -13,58 +14,61 @@ use tacit::{
     voice::{self, Command as VoiceCommand, Event as VoiceEvent},
 };
 
+// Linear-light values. sRGB: paper #F4F1EA, ink #17211C, muted #5A645E, line #DDD7CA,
+// surface #FFFDF8, green #17794A, gold #B45F0E, blue #2F5FD6, red #D0323E. Every text
+// colour keeps at least 4.5:1 against the surface.
 const PAPER: Color = Color {
-    r: 0.911408,
-    g: 0.890005,
-    b: 0.807346,
+    r: 0.904661,
+    g: 0.879622,
+    b: 0.822786,
     a: 1.0,
 };
 const INK: Color = Color {
-    r: 0.033105,
-    g: 0.043234,
-    b: 0.039682,
+    r: 0.008568,
+    g: 0.015209,
+    b: 0.011612,
     a: 1.0,
 };
 const MUTED: Color = Color {
-    r: 0.154872,
-    g: 0.162647,
-    b: 0.132868,
+    r: 0.102242,
+    g: 0.127438,
+    b: 0.111932,
     a: 1.0,
 };
 const LINE: Color = Color {
-    r: 0.673860,
-    g: 0.673860,
-    b: 0.570482,
+    r: 0.723055,
+    g: 0.679542,
+    b: 0.590619,
     a: 1.0,
 };
 const WHITE: Color = Color {
-    r: 0.977402,
-    g: 0.955105,
-    b: 0.890005,
+    r: 1.0,
+    g: 0.982251,
+    b: 0.938686,
     a: 1.0,
 };
 const GREEN: Color = Color {
-    r: 0.024,
-    g: 0.31,
-    b: 0.14,
+    r: 0.008568,
+    g: 0.191202,
+    b: 0.068478,
     a: 1.0,
 };
 const GOLD: Color = Color {
-    r: 0.72,
-    g: 0.25,
-    b: 0.015,
+    r: 0.456411,
+    g: 0.114435,
+    b: 0.004391,
     a: 1.0,
 };
 const BLUE: Color = Color {
-    r: 0.035,
-    g: 0.2,
-    b: 0.62,
+    r: 0.028426,
+    g: 0.114435,
+    b: 0.672443,
     a: 1.0,
 };
 const RED: Color = Color {
-    r: 0.65,
-    g: 0.035,
-    b: 0.1,
+    r: 0.630757,
+    g: 0.031896,
+    b: 0.048172,
     a: 1.0,
 };
 
@@ -109,8 +113,9 @@ pub struct State {
     modern_ui: bool,
     camera_zoom: rune::Live<f32>,
     camera_pan: rune::Live<[f32; 2]>,
-    map_size: [f32; 2],
-    camera_ready: bool,
+    zoom_readout: rune::LiveText,
+    map_size: std::cell::Cell<[f32; 2]>,
+    framing: std::cell::Cell<workspace::Framing>,
     drag_pan: [f32; 2],
     transcript_expanded: bool,
     transcript_following: bool,
@@ -421,8 +426,9 @@ impl State {
             modern_ui: true,
             camera_zoom: rune::Live::new(1.0),
             camera_pan: rune::Live::new([0.0; 2]),
-            map_size: [1100.0, 600.0],
-            camera_ready: false,
+            zoom_readout: rune::LiveText::new("100%"),
+            map_size: std::cell::Cell::new([1100.0, 600.0]),
+            framing: std::cell::Cell::new(workspace::Framing::Follow),
             drag_pan: [0.0; 2],
             transcript_expanded: false,
             transcript_following: true,
@@ -1248,7 +1254,7 @@ impl State {
         if let Some(w) = &scene.workspace {
             self.camera_zoom.set(w.camera.zoom);
             self.camera_pan.set(w.camera.pan);
-            self.camera_ready = true;
+            self.framing.set(workspace::Framing::Restored);
             self.transcript_expanded = w.expanded;
             self.transcript_following = w.following;
             self.transcript_scroll.set(w.transcript_scroll);
@@ -1902,8 +1908,8 @@ fn button(content: &str, key: &str, action: impl Fn(&mut State) + 'static) -> El
         .focusable(true)
         .px(12.0)
         .py(8.0)
-        .radius(7.0)
-        .hover(LINE)
+        .radius(16.0)
+        .hover(kit::wash(1.6))
         .on_press(action)
 }
 fn enabled(control: El, available: bool) -> El {
@@ -2023,6 +2029,22 @@ fn short_label(text: &str) -> String {
     } else {
         format!("{}…", flat.chars().take(55).collect::<String>())
     }
+}
+/// A title as one line, or as two of similar length that can each be centered.
+fn balanced(title: &str) -> Vec<String> {
+    let words: Vec<&str> = title.split_whitespace().collect();
+    let total = title.chars().count();
+    if total <= 28 || words.len() < 2 {
+        return vec![title.into()];
+    }
+    let mut seen = 0;
+    let split = (1..words.len())
+        .min_by_key(|&at| {
+            seen += words[at - 1].chars().count() + 1;
+            (2 * seen).abs_diff(total + 1)
+        })
+        .unwrap_or(1);
+    vec![words[..split].join(" "), words[split..].join(" ")]
 }
 fn curve(mut shape: Shape, start: [f32; 2], end: [f32; 2], ink: Color, thick: f32) -> Shape {
     let dx = end[0] - start[0];
@@ -2211,31 +2233,57 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
     let leaf_w = (width * 0.27).min(255.0);
     let mural_w = (width - 2.0 * (leaf_w + indent + 80.0)).clamp(360.0, 640.0);
     let mural_h = mural_w * 2.0 / 3.0;
-    let reserve_art = mural
-        && s.replay.is_none()
+    let mural_art = mural
         && s.art_style != Style::Off
         && s.gallery.layers.iter().any(|l| {
             l.key == generated_art::CENTRAL_KEY
                 && l.mural.is_some()
-                && l.opacity(s.gallery.now) > 0.0
+                && if cx.is_reduced_motion() {
+                    l.retired.is_none()
+                } else {
+                    l.opacity(s.gallery.now) > 0.0
+                }
         });
+    let reserve_art = mural_art && s.replay.is_none();
+    // Where the lowest idea ends: framing follows the ideas, not the paper beneath them.
+    let extent = counts
+        .iter()
+        .enumerate()
+        .map(|(group, count)| offsets[group / 2] + (*count).max(1) as f32 * 72.0 - 18.0)
+        .fold(0.0, f32::max);
+    // Until a mural arrives, the central idea is the hub every theme grows from.
+    let hub = (mural && !mural_art).then(|| {
+        [
+            center[0],
+            if counts.is_empty() {
+                center[1]
+            } else {
+                (9.0 + extent) / 2.0
+            },
+        ]
+    });
     let mut drawing = Shape::new();
     let mut labels = Vec::new();
     for (group, (_, name, role)) in groups.iter().enumerate() {
         let role = *role;
         let left = group % 2 == 0;
+        // Toward the middle of the map, where every branch comes from.
+        let inward = if left { 1.0 } else { -1.0 };
         let first_y = offsets[group / 2];
         let top = first_y < center[1];
         let ink = color(role);
         let n = counts[group].max(1);
-        let fork_y = first_y + ((n - 1) as f32 * 72.0) / 2.0 + 54.0;
+        let fork_y = first_y + ((n - 1) as f32 * 72.0) / 2.0 + 27.0;
         let fork_x = if left {
             leaf_w + 55.0 + indent
         } else {
             width - leaf_w - 55.0 - indent
         };
-        let start = if reserve_art {
-            // Transparent faces and objects must not expose branch strokes.
+        let start = if let Some(hub) = hub {
+            hub
+        } else if reserve_art {
+            // Transparent faces and objects must not expose branch strokes: each theme buds
+            // beside the mural, level with its own ideas.
             [
                 center[0]
                     + if left {
@@ -2243,7 +2291,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                     } else {
                         mural_w / 2.0 + 12.0
                     },
-                center[1],
+                fork_y,
             ]
         } else if mural {
             center
@@ -2259,77 +2307,82 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         } else {
             width - leaf_w - 12.0 - indent
         };
-        let heading_x = if left { leaf_x + 10.0 } else { leaf_x };
-        labels.push(
-            row()
-                .key(format!(
-                    "theme-heading-{}",
-                    groups[group]
-                        .0
-                        .clone()
-                        .unwrap_or_else(|| format!("lens-{group}"))
-                ))
-                .absolute(heading_x, first_y - 45.0)
-                .gap(8.0)
-                .center_y()
-                .child(if mural {
-                    el()
-                } else {
-                    canvas(illustration(role)).size(38.0, 34.0)
-                })
-                .child(
-                    label(name, 20.0, ink)
-                        .font(TextStyle::new(20.0, 600.0))
-                        .max_w(leaf_w - if mural { 8.0 } else { 44.0 }),
-                ),
-        );
+        let mut heading = row()
+            .key(format!(
+                "theme-heading-{}",
+                groups[group]
+                    .0
+                    .clone()
+                    .unwrap_or_else(|| format!("lens-{group}"))
+            ))
+            .absolute(leaf_x, first_y - 46.0)
+            .gap(8.0)
+            .center_y();
+        if !mural {
+            heading = heading.child(canvas(illustration(role)).size(38.0, 34.0));
+        }
+        labels.push(heading.child(kit::chip(
+            name,
+            ink,
+            leaf_w - if mural { 0.0 } else { 46.0 },
+        )));
+        // Each card meets its twig at a bud on the edge that faces the middle of the map.
+        let port = |x: f32, y: f32| [if left { x + leaf_w + 4.0 } else { x - 4.0 }, y + 27.0];
+        let bud = |shape: Shape, at: [f32; 2], size: f32, ink: Color| {
+            shape.line(
+                [at[0] - 0.25, at[1]],
+                [at[0] + 0.25, at[1]],
+                size,
+                LineCap::Round,
+                ink,
+            )
+        };
+        // Twigs bend inside the clear channel beside their parent's cards, then run straight
+        // to their own, so no stroke ever crosses a neighbor's paper.
+        let twig = |shape: Shape, (from, reach): ([f32; 2], f32), to: [f32; 2], ink, thick| {
+            let knee = [from[0] - inward * reach, to[1]];
+            let shape = curve(shape, from, knee, ink, thick);
+            if (knee[0] - to[0]).abs() < 0.5 {
+                shape
+            } else {
+                shape.line(knee, to, thick * 0.37, LineCap::Round, ink)
+            }
+        };
+        let fork = ([fork_x, fork_y], 39.0);
         let entries = &entries[group];
         let mut anchors = std::collections::HashMap::new();
         if let Some(id) = &groups[group].0 {
-            anchors.insert(id.clone(), [fork_x, fork_y]);
+            anchors.insert(id.clone(), fork);
         }
         if entries.is_empty() {
             labels.push(
-                label("Let a thought take root…", 13.0, MUTED)
+                row()
                     .key(format!("empty-branch-{group}"))
+                    .absolute(leaf_x, first_y)
                     .w(leaf_w)
-                    .absolute(leaf_x, first_y + 12.0),
+                    .h(54.0)
+                    .px(14.0)
+                    .center_y()
+                    .radius(14.0)
+                    .fill(ink.alpha(0.05))
+                    .border(1.0, ink.alpha(0.16))
+                    .child(label("Let a thought take root…", 13.0, MUTED)),
             );
-            drawing = curve(
-                drawing,
-                [fork_x, fork_y],
-                [
-                    if left {
-                        leaf_x + 15.0
-                    } else {
-                        leaf_x + leaf_w - 15.0
-                    },
-                    first_y + 54.0,
-                ],
-                ink.alpha(0.4),
-                2.5,
-            );
+            drawing = twig(drawing, fork, port(leaf_x, first_y), ink.alpha(0.4), 2.5);
         }
         for (index, entry) in entries.iter().enumerate() {
             let id = entry.id;
             let words = &entry.words;
-            let leaf_x = leaf_x + if left { -1.0 } else { 1.0 } * entry.depth as f32 * 88.0;
+            let leaf_x = leaf_x - inward * entry.depth as f32 * 88.0;
             let y = first_y + index as f32 * 72.0;
-            let end = [
-                if left {
-                    leaf_x + leaf_w - 5.0
-                } else {
-                    leaf_x + 5.0
-                },
-                y + 54.0,
-            ];
+            let end = port(leaf_x, y);
             let parent = entry
                 .parent
                 .as_ref()
                 .and_then(|id| anchors.get(id))
                 .copied()
-                .unwrap_or([fork_x, fork_y]);
-            drawing = curve(
+                .unwrap_or(fork);
+            drawing = twig(
                 drawing,
                 parent,
                 end,
@@ -2343,91 +2396,86 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 },
             );
             if let Some(theme) = &entry.theme {
-                anchors.insert(theme.clone(), end);
-                drawing = drawing.line(
-                    [leaf_x + 8.0, y + 54.0],
-                    [leaf_x + leaf_w - 8.0, y + 54.0],
-                    2.0,
-                    LineCap::Round,
-                    ink,
-                );
+                // Its own thoughts peel off the incoming branch just before it lands.
+                anchors.insert(theme.clone(), ([end[0] + inward * 30.0, end[1]], 30.0));
+                drawing = bud(drawing, end, 9.0, ink);
                 labels.push(
-                    col()
-                        .key(format!("theme-heading-{theme}"))
-                        .absolute(leaf_x, y)
-                        .w(leaf_w)
-                        .h(53.0)
-                        .px(8.0)
-                        .gap(2.0)
-                        .child(label(words, 17.0, ink).font(TextStyle::new(17.0, 600.0)))
-                        .child(label(
-                            if entry.depth == 1 {
-                                "SUBTHEME"
-                            } else {
-                                "CONCEPT GROUP"
-                            },
-                            9.0,
-                            ink,
-                        )),
+                    kit::bough(
+                        col()
+                            .key(format!("theme-heading-{theme}"))
+                            .absolute(leaf_x, y)
+                            .w(leaf_w)
+                            .h(54.0)
+                            .px(14.0)
+                            .gap(1.0)
+                            .justify_center(),
+                        ink,
+                    )
+                    .child(kit::eyebrow(
+                        if entry.depth == 1 {
+                            "SUBTHEME"
+                        } else {
+                            "CONCEPT GROUP"
+                        },
+                        ink.alpha(0.72),
+                    ))
+                    .child(kit::caption(words, 15.0, 600.0, ink).truncate()),
                 );
                 continue;
             }
-            drawing = drawing.line(
-                [leaf_x + 8.0, y + 54.0],
-                [leaf_x + leaf_w - 8.0, y + 54.0],
-                1.6,
-                LineCap::Round,
-                ink,
-            );
+            drawing = bud(drawing, end, 7.0, ink);
             let selected = id.is_some() && id == s.selected;
-            let mut node = col()
-                .key(id.map_or_else(|| "draft-preview".into(), |id| format!("thought-{id}")))
-                .absolute(leaf_x, y)
-                .w(leaf_w)
-                .h(53.0)
-                .px(8.0)
-                .py(3.0)
-                .gap(2.0)
-                .radius(8.0)
-                .fill(if selected {
-                    ink.alpha(0.10)
+            let pinned = id.is_some_and(|id| {
+                s.projection
+                    .session
+                    .thoughts
+                    .iter()
+                    .any(|t| t.id == id && t.pinned)
+            });
+            let note = match id {
+                None => "Growing · Enter to keep".to_string(),
+                Some(_) if s.modern_ui => String::from(if pinned { "Pinned" } else { "" }),
+                Some(id) => format!("{:02}{}", id, if pinned { " · pinned" } else { "" }),
+            };
+            let mut node = kit::leaf(
+                col()
+                    .key(id.map_or_else(|| "draft-preview".into(), |id| format!("thought-{id}")))
+                    // A kept draft becomes its thought where it grew, instead of trading places
+                    // with a copy of itself.
+                    .matched(format!(
+                        "thought-{}",
+                        id.unwrap_or(s.projection.session.next_id)
+                    ))
+                    .absolute(leaf_x, y)
+                    .w(leaf_w)
+                    .h(54.0)
+                    .px(14.0)
+                    .gap(1.0)
+                    .justify_center(),
+                ink,
+                if selected {
+                    1.0
+                } else if id.is_none() {
+                    0.45
                 } else {
-                    ink.alpha((1.0 - s.settling) * 0.13)
-                })
-                .hover(ink.alpha(0.08))
-                .role("button")
-                .focusable(id.is_some())
-                .child(
-                    label(
-                        short_label(words),
-                        14.0,
-                        if id.is_some() { INK } else { MUTED },
-                    )
-                    .wrap_anywhere(),
+                    (1.0 - s.settling) * 0.6
+                },
+            )
+            .role("button")
+            .focusable(id.is_some())
+            .child(
+                label(
+                    short_label(words),
+                    13.5,
+                    if id.is_some() { INK } else { MUTED },
                 )
-                .child(label(
-                    id.map_or_else(
-                        || "Growing · Enter to keep".into(),
-                        |id| {
-                            let pinned = s
-                                .projection
-                                .session
-                                .thoughts
-                                .iter()
-                                .any(|t| t.id == id && t.pinned);
-                            if s.modern_ui {
-                                return if pinned {
-                                    "Pinned".into()
-                                } else {
-                                    String::new()
-                                };
-                            }
-                            format!("{:02}{}", id, if pinned { " · pinned" } else { "" })
-                        },
-                    ),
-                    10.0,
-                    ink,
-                ));
+                .font(TextStyle::new(13.5, 500.0))
+                .wrap_anywhere()
+                .max_lines(2),
+            );
+            if !note.is_empty() {
+                node = node.child(kit::caption(note, 10.0, 600.0, ink));
+            }
             if let Some(id) = id {
                 node = node.on_press(move |s: &mut State| {
                     if s.replay.is_none() {
@@ -2648,18 +2696,53 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
     for node in labels {
         sheet = sheet.child(node);
     }
-    sheet = sheet.child(if mural {
+    let seeking = s.busy && !cx.is_reduced_motion();
+    let eyebrow = row()
+        .gap(6.0)
+        .center_y()
+        .child(kit::icon(kit::Icon::Spark, 11.0, GOLD))
+        .child(kit::eyebrow(
+            if s.busy {
+                "FINDING CONNECTIONS"
+            } else {
+                "THE CENTRAL IDEA"
+            },
+            GOLD,
+        ))
+        .opacity(if seeking { 0.55 + 0.45 * s.pulse } else { 1.0 });
+    sheet = sheet.child(if let Some(hub) = hub {
+        // The card hugs its title; the box around it only centres the card on the hub.
+        let mut card = col()
+            .px(26.0)
+            .py(15.0)
+            .gap(3.0)
+            .center()
+            .radius(26.0)
+            .fill(WHITE)
+            .border(1.5, GOLD.alpha(0.55))
+            .shadow(1.0, 2.0, INK.alpha(0.05))
+            .shadow(10.0, 30.0, GOLD.alpha(0.22))
+            .child(eyebrow.mb(3.0));
+        for line in balanced(&short_label(&s.projection.session.title)) {
+            card = card.child(kit::caption(line, 18.0, 600.0, INK).truncate());
+        }
+        col()
+            .key("central-idea")
+            .absolute(hub[0] - 190.0, hub[1] - 60.0)
+            .size(380.0, 120.0)
+            .center()
+            .child(card.max_w(380.0))
+    } else if mural {
         col()
             .key("central-idea")
             .absolute(center[0] - mural_w / 2.0, center[1] - mural_h / 2.0 - 76.0)
             .size(mural_w, 60.0)
             .center()
-            .gap(8.0)
+            .gap(6.0)
             .child(
-                label(short_label(&s.projection.session.title), 20.0, INK)
-                    .font(TextStyle::new(20.0, 600.0)),
+                kit::caption(short_label(&s.projection.session.title), 20.0, 600.0, INK).truncate(),
             )
-            .child(label("THE CENTRAL IDEA", 9.0, GOLD))
+            .child(eyebrow)
     } else {
         col()
             .key("central-idea")
@@ -2691,7 +2774,15 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             )
     });
     if s.modern_ui {
-        return workspace::canvas(s, sheet, [width, height]);
+        // Frame the ideas and what they grow from, not the unused paper below them.
+        let focus = if let Some(hub) = hub {
+            extent.max(hub[1] + 60.0) + 9.0
+        } else if mural {
+            extent.max(center[1] + mural_h / 2.0) + 9.0
+        } else {
+            height
+        };
+        return workspace::canvas(s, sheet, [width, focus.min(height)]);
     }
     let map = col()
         .key("map")
@@ -2730,7 +2821,8 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
 fn save_video_button(s: &State) -> El {
     let has_video = s.first_video_frame_ms().is_some();
     enabled(
-        button(
+        kit::tool(
+            Some(kit::Icon::Save),
             if s.video_export.is_some() {
                 "Saving video…"
             } else {
@@ -2750,7 +2842,8 @@ fn save_video_button(s: &State) -> El {
 }
 fn saved_video_button(s: &State) -> El {
     if let Some(path) = &s.saved_video {
-        button(
+        kit::tool(
+            Some(kit::Icon::Folder),
             if cfg!(target_os = "macos") {
                 "Show in Finder"
             } else {
@@ -2769,10 +2862,11 @@ fn session_video_controls(s: &State) -> El {
         return el();
     }
     row()
-        .gap(4.0)
+        .gap(2.0)
         .center_y()
         .child(enabled(
-            button(
+            kit::tool(
+                Some(kit::Icon::Play),
                 if s.first_video_frame_ms().is_some() {
                     "Play video"
                 } else {
@@ -2793,83 +2887,139 @@ fn session_video_controls(s: &State) -> El {
 }
 fn replay_controls(s: &State) -> El {
     let replay = s.replay.as_ref().unwrap();
-    col()
-        .gap(8.0)
+    let end = s.journal.as_ref().map_or(0, |j| j.duration());
+    // How much of the session has played, as a share of the track.
+    let played = if end == 0 {
+        0.0
+    } else {
+        (replay.at_ms as f32 / end as f32).clamp(0.0, 1.0)
+    };
+    let transport = row()
+        .gap(4.0)
+        .center_y()
+        .child(kit::tool(
+            Some(kit::Icon::Rewind),
+            "−10s",
+            "replay-back",
+            |s| s.seek_replay(-10000),
+        ))
+        .child(kit::primary(
+            Some(if replay.playing {
+                kit::Icon::Pause
+            } else {
+                kit::Icon::Play
+            }),
+            if replay.playing { "Pause" } else { "Play" },
+            "replay-play",
+            INK,
+            |s| {
+                let end = s.journal.as_ref().map_or(0, |j| j.duration());
+                let start = s.replay_start_ms();
+                if let Some(r) = &mut s.replay {
+                    if r.at_ms >= end {
+                        r.at_ms = start;
+                    }
+                    r.playing = !r.playing;
+                    r.last_tick = None;
+                }
+            },
+        ))
+        .child(kit::tool(
+            Some(kit::Icon::Forward),
+            "+10s",
+            "replay-forward",
+            |s| s.seek_replay(10000),
+        ))
+        .child(kit::tool(
+            Some(kit::Icon::Next),
+            "Next event",
+            "replay-next",
+            State::next_replay_event,
+        ))
+        .child(
+            kit::caption(
+                format!(
+                    "{} / {}",
+                    tacit::timeline::timestamp(replay.at_ms),
+                    tacit::timeline::timestamp(end)
+                ),
+                12.5,
+                600.0,
+                INK,
+            )
+            .ml(8.0),
+        );
+    let actions = row()
+        .gap(2.0)
+        .center_y()
+        .child(if s.first_video_frame_ms().is_some() {
+            kit::tool(
+                Some(kit::Icon::Film),
+                if s.pixel_replay {
+                    "Scene replay"
+                } else {
+                    "Video playback"
+                },
+                "replay-renderer",
+                |s| {
+                    s.pixel_replay = !s.pixel_replay;
+                    s.seek_replay(0);
+                    if let Some(replay) = &mut s.replay {
+                        replay.last_projected = None;
+                    }
+                },
+            )
+        } else {
+            kit::caption("Scene playback · no recorded video", 11.5, 500.0, MUTED).px(8.0)
+        })
+        .child(save_video_button(s))
+        .child(saved_video_button(s))
+        .child(if s.archive_only {
+            kit::caption("Saved archive", 11.5, 500.0, MUTED).px(8.0)
+        } else {
+            enabled(
+                kit::tool(
+                    Some(kit::Icon::Back),
+                    "Back to live",
+                    "back-live",
+                    State::toggle_replay,
+                ),
+                !s.video_busy(),
+            )
+        });
+    kit::card(col().key("replay-controls"))
+        .gap(10.0)
+        .padding(12.0)
         .child(
             row()
                 .gap(8.0)
-                .child(button("−10s", "replay-back", |s| s.seek_replay(-10000)))
-                .child(button(
-                    if replay.playing { "Pause" } else { "Play" },
-                    "replay-play",
-                    |s| {
-                        let end = s.journal.as_ref().map_or(0, |j| j.duration());
-                        let start = s.replay_start_ms();
-                        if let Some(r) = &mut s.replay {
-                            if r.at_ms >= end {
-                                r.at_ms = start;
-                            }
-                            r.playing = !r.playing;
-                            r.last_tick = None;
-                        }
-                    },
-                ))
-                .child(button("+10s", "replay-forward", |s| s.seek_replay(10000)))
-                .child(button(
-                    "Next event",
-                    "replay-next",
-                    State::next_replay_event,
-                ))
-                .child(label(
-                    format!(
-                        "{} / {}",
-                        tacit::timeline::timestamp(replay.at_ms),
-                        tacit::timeline::timestamp(s.journal.as_ref().map_or(0, |j| j.duration()))
-                    ),
-                    12.0,
-                    INK,
-                )),
+                .center_y()
+                .flex_wrap()
+                .child(transport)
+                .child(el().grow(1.0))
+                .child(actions),
         )
-        .child(label(s.replay_caption(), 11.0, MUTED).wrap_anywhere())
         .child(
             row()
-                .gap(8.0)
-                .child(if s.first_video_frame_ms().is_some() {
-                    button(
-                        if s.pixel_replay {
-                            "Scene replay"
-                        } else {
-                            "Video playback"
-                        },
-                        "replay-renderer",
-                        |s| {
-                            s.pixel_replay = !s.pixel_replay;
-                            s.seek_replay(0);
-                            if let Some(replay) = &mut s.replay {
-                                replay.last_projected = None;
-                            }
-                        },
-                    )
-                } else {
-                    label("Scene playback · no recorded video", 11.0, MUTED)
-                })
-                .child(save_video_button(s))
-                .child(saved_video_button(s))
-                .child(if s.archive_only {
-                    label("Saved archive", 11.0, MUTED)
-                } else {
-                    enabled(
-                        button("Back to live", "back-live", State::toggle_replay),
-                        !s.video_busy(),
-                    )
-                }),
+                .h(4.0)
+                .mx(6.0)
+                .radius(2.0)
+                .fill(kit::wash(1.6))
+                .clip_rounded(2.0)
+                .child(el().w(0.0).grow(played).h_full().fill(GREEN))
+                .child(el().w(0.0).grow(1.0 - played)),
+        )
+        .child(
+            label(s.replay_caption(), 11.5, MUTED)
+                .px(6.0)
+                .wrap_anywhere(),
         )
 }
 fn sessions_button(s: &State) -> El {
     if s.library_base.is_none() {
         return el();
     }
-    button("Sessions", "sessions", |s| {
+    kit::tool(Some(kit::Icon::Sidebar), "Sessions", "sessions", |s| {
         if !s.read_only
             && s.replay.is_none()
             && let Some(journal) = &mut s.journal
@@ -2948,43 +3098,6 @@ fn sessions_view(s: &State) -> El {
 fn legacy_view(s: &State, cx: &mut Cx<State>) -> El {
     if s.sessions_open {
         return sessions_view(s);
-    }
-    if s.replay.is_some() && s.pixel_replay {
-        let picture = if let Some((_, image)) = &s.pixel_image {
-            el().pixels_fit(image.pixels(), rune::SurfaceFit::Fit)
-                .w_full()
-                .h(0.0)
-                .grow(1.0)
-                .min_h(0.0)
-        } else {
-            label("No original pixels were captured at this time.", 18.0, INK).grow(1.0)
-        };
-        return col()
-            .w_full()
-            .h_full()
-            .fill(PAPER)
-            .child(
-                row()
-                    .padding(12.0)
-                    .gap(12.0)
-                    .center_y()
-                    .child(label("SESSION VIDEO", 11.0, GREEN))
-                    .child(
-                        label(&s.session_name, 14.0, INK)
-                            .grow(1.0)
-                            .min_w(0.0)
-                            .truncate(),
-                    )
-                    .child(sessions_button(s)),
-            )
-            .child(picture)
-            .child(replay_controls(s).padding(12.0))
-            .child(
-                label(s.status.clone(), 11.0, MUTED)
-                    .px(12.0)
-                    .py(8.0)
-                    .wrap_anywhere(),
-            );
     }
     if s.replay.is_some() {
         cx.reduced_motion(s.reduced_motion);
@@ -3294,7 +3407,11 @@ fn legacy_view(s: &State, cx: &mut Cx<State>) -> El {
                 .grow(1.0),
             )
             .child(if s.gallery.worker.is_some() {
-                button("Retry art", "retry-art", |s| s.gallery.retry())
+                button("Retry art", "retry-art", |s| {
+                    if s.replay.is_none() {
+                        s.gallery.compose()
+                    }
+                })
             } else {
                 el()
             })
@@ -3619,7 +3736,9 @@ fn compact_inspector(s: &State) -> El {
     }
 }
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
-    if !s.modern_ui || (s.replay.is_some() && s.pixel_replay) {
+    if s.replay.is_some() && s.pixel_replay {
+        workspace::video(s, cx)
+    } else if !s.modern_ui {
         legacy_view(s, cx)
     } else {
         workspace::view(s, cx)
@@ -4965,6 +5084,107 @@ mod tests {
         rt.frame(1.0);
     }
     #[test]
+    fn the_session_video_keeps_the_frame_of_the_scene_it_stands_in_for() {
+        let place = |rt: &Runtime<State>, key: &str| {
+            rt.elements()
+                .iter()
+                .find(|e| e.key.as_deref() == Some(key) && !e.exiting)
+                .map(|e| e.target)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+        for size in [(820.0, 640.0), (1280.0, 860.0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut rt = video_runtime(dir.path(), size);
+            click(&mut rt, "replay");
+            rt.frame(1.0);
+            click(&mut rt, "replay-play");
+            rt.frame(1.0);
+            assert!(rt.state.pixel_replay);
+            assert!(!rt.state.replay.as_ref().unwrap().playing);
+            // Trading the video for the scene moves neither the controls nor the status.
+            let chrome = ["replay-play", "status-bar"];
+            let video = chrome.map(|key| place(&rt, key));
+            click(&mut rt, "replay-renderer");
+            rt.frame(1.0);
+            assert!(!rt.state.pixel_replay);
+            assert_eq!(chrome.map(|key| place(&rt, key)), video, "{size:?}");
+            click(&mut rt, "replay-renderer");
+            rt.frame(1.0);
+            // The sessions arrive over the video the way they do over the map.
+            rt.state.sessions_open = true;
+            rt.invalidate();
+            rt.frame(1.0);
+            rt.frame(1.0);
+            let drawer = place(&rt, "session-drawer");
+            assert!(
+                drawer[0] >= 0.0 && drawer[0] + drawer[2] <= size.0,
+                "{drawer:?}"
+            );
+            assert_eq!(rt.find("sessions-scrim").is_some(), size.0 < 1080.0);
+            click(&mut rt, "sessions-back");
+            assert!(!rt.state.sessions_open);
+            rt.frame(1.0);
+            // A stretch with no captured pixels says so from the middle of the stage.
+            rt.state.pixel_image = None;
+            rt.invalidate();
+            rt.frame(1.0);
+            let gap = place(&rt, "video-gap");
+            let words = rt
+                .elements()
+                .iter()
+                .find(|e| {
+                    e.text.as_deref() == Some("No original pixels were captured at this time.")
+                })
+                .map(|e| e.target)
+                .unwrap();
+            let middle = |r: [f32; 4]| [r[0] + r[2] / 2.0, r[1] + r[3] / 2.0];
+            assert!(
+                (middle(words)[0] - middle(gap)[0]).abs() < 1.0,
+                "{words:?} {gap:?}"
+            );
+            assert!(
+                words[1] > gap[1] && words[1] + words[3] < gap[1] + gap[3],
+                "{words:?} {gap:?}"
+            );
+            assert!(gap[1] + gap[3] <= place(&rt, "replay-play")[1], "{gap:?}");
+        }
+    }
+    #[test]
+    fn a_long_thought_grows_the_composer_and_keeps_send_within_reach() {
+        let mut rt = runtime((820.0, 640.0));
+        click(&mut rt, "thought-input");
+        let rect = |rt: &Runtime<State>, key: &str| {
+            rt.elements()
+                .iter()
+                .find(|e| e.key.as_deref() == Some(key))
+                .map(|e| e.rect)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+        let line = rect(&rt, "thought-lines")[3];
+        rt.key(KeyEvent {
+            key: Key::Text("What if every recurring meeting had to earn its place? ".repeat(12)),
+            mods: Mods::default(),
+        });
+        rt.frame(1.0);
+        rt.frame(1.0);
+        let lines = rect(&rt, "thought-lines");
+        assert!(
+            lines[3] > line * 3.5 && lines[3] <= line * 4.0 + 0.5,
+            "a long thought shows four lines, then scrolls: {line} -> {}",
+            lines[3]
+        );
+        let map = rect(&rt, "map");
+        assert!(map[3] >= 200.0, "the map keeps its room: {map:?}");
+        let send = rect(&rt, "capture");
+        assert!(send[1] + send[3] <= 640.0 && send[0] + send[2] <= 820.0);
+        click(&mut rt, "capture");
+        assert_eq!(rt.state.projection.session.thoughts.len(), 7);
+        assert!(rt.state.draft.text.is_empty());
+        rt.frame(1.0);
+        assert!((rect(&rt, "thought-lines")[3] - line).abs() < 0.5);
+    }
+
+    #[test]
     fn typing_previews_then_enter_captures_without_losing_original_words() {
         let mut rt = runtime((1280.0, 860.0));
         click(&mut rt, "thought-input");
@@ -4988,6 +5208,59 @@ mod tests {
         assert!(rt.state.draft.text.is_empty());
         click(&mut rt, "undo");
         assert_eq!(rt.state.projection.session.thoughts.len(), 6);
+    }
+    #[test]
+    fn a_starter_opens_the_first_thought_in_its_lens() {
+        let open = |state: State, size| {
+            let mut rt = Runtime::new(
+                state,
+                view,
+                size,
+                Env {
+                    system_dark: false,
+                    scale: 1.0,
+                },
+            );
+            rt.poll = Some(poll);
+            rt.frame(0.0);
+            rt
+        };
+        for (role, _, stem) in workspace::STARTERS {
+            assert_eq!(tacit::model::classify(stem), role, "{stem:?}");
+        }
+        for size in [(820.0, 640.0), (1280.0, 860.0)] {
+            let mut rt = open(State::empty(), size);
+            assert!(rt.find("empty-map").is_some());
+            // Guidance has nothing to organize yet, so a starter returns to brainstorming.
+            click(&mut rt, "mode-direct");
+            assert!(rt.state.direction_mode);
+            click(&mut rt, "starter-possibility");
+            assert!(!rt.state.direction_mode);
+            assert_eq!(rt.state.draft.text, "What if ");
+            assert!(rt.find("empty-map").is_none());
+            assert!(rt.find("draft-preview").is_some());
+            // The composer holds the keyboard, so the thought continues without another click.
+            rt.key(KeyEvent {
+                key: Key::Text("we met outside?".into()),
+                mods: Mods::default(),
+            });
+            rt.key(KeyEvent {
+                key: Key::Enter,
+                mods: Mods::default(),
+            });
+            rt.frame(1.0);
+            let thoughts = &rt.state.projection.session.thoughts;
+            assert_eq!(thoughts.len(), 1);
+            assert_eq!(thoughts[0].text, "What if we met outside?");
+            assert_eq!(thoughts[0].role, Role::Possibility);
+        }
+        let archive = State {
+            read_only: true,
+            ..State::empty()
+        };
+        let rt = open(archive, (820.0, 640.0));
+        assert!(rt.find("empty-map").is_some());
+        assert!(rt.find("starters").is_none());
     }
     #[test]
     fn selection_correction_delete_and_undo_work_at_minimum_size() {
@@ -5100,11 +5373,133 @@ mod tests {
         assert_eq!(fast_requests.try_recv().unwrap().revision, 2);
     }
     #[test]
+    fn artwork_is_composed_only_when_someone_asks() {
+        let mut rt = runtime((820.0, 640.0));
+        let title = |rt: &Runtime<State>, key: &str| {
+            rt.elements()
+                .iter()
+                .find(|e| e.key.as_deref() == Some(key) && !e.exiting)
+                .and_then(|e| e.label.clone())
+        };
+        // With no way to compose and nothing composed, there is no artwork to offer.
+        for key in ["art-compose", "art-progress", "art-style"] {
+            assert!(rt.find(key).is_none(), "{key}");
+        }
+        let (send, requests) = std::sync::mpsc::channel();
+        let (responses, receive) = std::sync::mpsc::channel();
+        rt.state.gallery.worker = Some(generated_art::Worker { send, receive });
+        rt.invalidate();
+        // Hiding the artwork withdraws whatever was asked, which the worker hears as well.
+        let sent = || requests.try_iter().flatten().next();
+        let failure = |request: &generated_art::Request| generated_art::Response {
+            id: request.id,
+            result: Err("Mural generation failed; check image model, credits and key".into()),
+        };
+        // A conversation composes nothing by itself, however long it is left.
+        rt.frame(1.0);
+        rt.frame(120.0);
+        assert!(sent().is_none());
+        assert_eq!(title(&rt, "art-compose").as_deref(), Some("Create artwork"));
+        assert!(rt.find("art-style").is_none());
+        click(&mut rt, "art-compose");
+        assert!(rt.find("art-progress").is_some() && rt.find("art-compose").is_none());
+        rt.frame(1.0);
+        let request = sent().unwrap();
+        assert!(request.base.is_none());
+        // One ask is one composition, however long it takes.
+        rt.frame(120.0);
+        assert!(sent().is_none());
+        assert!(rt.find("art-progress").is_some());
+        let image = rt.state.image_cache.rgba(1, 1, vec![100, 160, 200, 255]);
+        image.wait().unwrap();
+        responses
+            .send(generated_art::Response {
+                id: request.id,
+                result: Ok(generated_art::Update {
+                    artifact: generated_art::Artifact {
+                        fingerprint: "first-scene".into(),
+                        encoded: Some(std::sync::Arc::new(vec![0])),
+                        mural: tacit::artist::Mural {
+                            identity: request.identity.clone(),
+                            content: request.evidence.content.clone(),
+                            render_policy: request.render_policy.clone(),
+                            artist_model: request.artist_model.clone(),
+                            image_model: request.model.clone(),
+                            parent: None,
+                            ..mural_fixture()
+                        },
+                    },
+                    image: Some(image),
+                }),
+            })
+            .unwrap();
+        rt.frame(1.0);
+        // The scene shows everything said so far, so all that is left is to put it away.
+        for key in ["art-compose", "art-progress"] {
+            assert!(rt.find(key).is_none(), "{key}");
+        }
+        assert_eq!(title(&rt, "art-style").as_deref(), Some("Hide artwork"));
+        click(&mut rt, "thought-input");
+        rt.key(KeyEvent {
+            key: Key::Text("A greenhouse on the roof".into()),
+            mods: Mods::default(),
+        });
+        rt.key(KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        });
+        rt.frame(1.0);
+        rt.frame(120.0);
+        // The conversation has moved past the mural, which waits to be asked again.
+        assert!(sent().is_none());
+        assert_eq!(title(&rt, "art-compose").as_deref(), Some("Update artwork"));
+        // Artwork that is out of sight has nothing to bring up to date.
+        click(&mut rt, "art-style");
+        assert_eq!(title(&rt, "art-style").as_deref(), Some("Show artwork"));
+        assert!(rt.find("art-compose").is_none());
+        click(&mut rt, "art-style");
+        click(&mut rt, "art-compose");
+        rt.frame(1.0);
+        let request = sent().unwrap();
+        assert_eq!(request.base.as_ref().unwrap().fingerprint, "first-scene");
+        // A failure keeps the mural, says what happened, and leaves the next move to a person.
+        responses.send(failure(&request)).unwrap();
+        rt.frame(1.0);
+        rt.frame(120.0);
+        assert!(sent().is_none());
+        assert!(rt.find("art-notice").is_some() && rt.find("art-progress").is_none());
+        assert_eq!(title(&rt, "art-compose").as_deref(), Some("Update artwork"));
+        click(&mut rt, "retry-art");
+        assert!(rt.find("art-notice").is_none() && rt.find("art-progress").is_some());
+        rt.frame(1.0);
+        responses.send(failure(&sent().unwrap())).unwrap();
+        rt.frame(1.0);
+        click(&mut rt, "art-dismiss");
+        assert!(rt.find("art-notice").is_none());
+        rt.frame(120.0);
+        assert!(sent().is_none());
+        assert_eq!(rt.state.gallery.layers.len(), 1);
+        // A session that cannot be changed is not offered new artwork either.
+        rt.state.read_only = true;
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(rt.find("art-compose").is_none() && rt.find("art-style").is_some());
+    }
+    #[test]
     fn ink_art_toggles_without_changing_the_map() {
         let mut rt = runtime((820.0, 640.0));
-        let (send, _requests) = std::sync::mpsc::channel();
-        let (_responses, receive) = std::sync::mpsc::channel();
-        rt.state.gallery.worker = Some(generated_art::Worker { send, receive });
+        let image = rt.state.image_cache.rgba(1, 1, vec![100, 160, 200, 255]);
+        image.wait().unwrap();
+        rt.state.gallery.layers.push(generated_art::Layer {
+            mural: Some(mural_fixture()),
+            encoded: None,
+            key: generated_art::CENTRAL_KEY.into(),
+            fingerprint: "fixture".into(),
+            slot: 0,
+            image,
+            born: -10.0,
+            retired: None,
+        });
         rt.invalidate();
         let before = rt.state.projection.session.clone();
         let ids = rt
@@ -5328,6 +5723,152 @@ mod tests {
         assert_eq!(rt.state.selected, Some(1));
     }
     #[test]
+    fn the_zoom_control_says_how_large_the_map_is_drawn() {
+        let mut rt = runtime((820.0, 640.0));
+        rt.check_live_only(false);
+        // A small window takes one more pass to settle: the map is first laid out for a larger one.
+        rt.frame(1.0);
+        rt.frame(1.0);
+        let shown = |rt: &Runtime<State>| rt.state.zoom_readout.get().to_string();
+        let drawn = |rt: &Runtime<State>| format!("{:.0}%", rt.state.camera_zoom.get() * 100.0);
+        // Fitted into a small window, the demo is drawn smaller than life and says so.
+        assert_eq!(shown(&rt), drawn(&rt));
+        assert_ne!(shown(&rt), "100%");
+        // A pinch does not rebuild the view, and the control keeps up with it all the same.
+        let (fitted, commits) = (shown(&rt), rt.stats.commits);
+        let (x, y) = rt.find("map").unwrap();
+        rt.magnify_event(rune::MagnifyEvent::new(0.25).at(x, y));
+        rt.frame(1.0 / 60.0);
+        assert_eq!(rt.stats.commits, commits);
+        assert_eq!(shown(&rt), drawn(&rt));
+        assert_ne!(shown(&rt), fitted);
+        let pinched = shown(&rt);
+        click(&mut rt, "zoom-out");
+        assert_eq!(shown(&rt), drawn(&rt));
+        assert_ne!(shown(&rt), pinched);
+        // The reading is also the way back to actual size.
+        click(&mut rt, "zoom-reset");
+        assert_eq!(rt.state.camera_zoom.get(), 1.0);
+        assert_eq!(shown(&rt), "100%");
+        click(&mut rt, "zoom-fit");
+        assert_eq!(shown(&rt), fitted);
+    }
+    #[test]
+    fn the_map_keeps_every_idea_in_view_until_someone_chooses_a_view() {
+        // The ideas that are not wholly inside the map.
+        let cut_off = |rt: &Runtime<State>| {
+            let elements = rt.elements();
+            let map = elements
+                .iter()
+                .find(|e| e.key.as_deref() == Some("map"))
+                .unwrap()
+                .rect;
+            elements
+                .iter()
+                .filter(|e| {
+                    !e.exiting
+                        && e.key
+                            .as_deref()
+                            .and_then(|key| key.strip_prefix("thought-"))
+                            .is_some_and(|id| id.parse::<u64>().is_ok())
+                })
+                .filter(|e| {
+                    e.rect[0] < map[0] - 0.5
+                        || e.rect[1] < map[1] - 0.5
+                        || e.rect[0] + e.rect[2] > map[0] + map[2] + 0.5
+                        || e.rect[1] + e.rect[3] > map[1] + map[3] + 0.5
+                })
+                .filter_map(|e| e.key.clone())
+                .collect::<Vec<_>>()
+        };
+        let say = |rt: &mut Runtime<State>, words: &str| {
+            click(rt, "thought-input");
+            rt.key(KeyEvent {
+                key: Key::Text(words.into()),
+                mods: Mods::default(),
+            });
+            rt.key(KeyEvent {
+                key: Key::Enter,
+                mods: Mods::default(),
+            });
+            rt.frame(1.0);
+            rt.frame(1.0);
+        };
+        for size in [(820.0, 640.0), (1280.0, 860.0)] {
+            let mut rt = runtime(size);
+            // Rune's debug stale-view audit deliberately commits some live-only events.
+            rt.check_live_only(false);
+            rt.frame(1.0);
+            assert_eq!(cut_off(&rt), Vec::<String>::new());
+            // Left alone, the camera pulls back as the map grows.
+            for words in [
+                "Could the standup become a shared note instead?",
+                "Nobody remembers what last week's review decided",
+                "Protect two mornings a week for deep work",
+            ] {
+                say(&mut rt, words);
+                assert_eq!(cut_off(&rt), Vec::<String>::new(), "after {words:?}");
+            }
+            // A view someone chose stays where they put it, whatever arrives.
+            let (x, y) = rt.find("map").unwrap();
+            rt.wheel_event(rune::WheelEvent::new(-260.0, -140.0).at(x, y).precise(true));
+            rt.frame(1.0);
+            assert_ne!(cut_off(&rt), Vec::<String>::new());
+            let held = rt.state.camera();
+            say(&mut rt, "What would we lose without the weekly sync?");
+            assert!(rt.state.camera() == held);
+            // Fit map shows everything again, and goes back to following.
+            click(&mut rt, "zoom-fit");
+            assert_eq!(cut_off(&rt), Vec::<String>::new());
+            say(&mut rt, "Try one meeting-free Friday as an experiment");
+            assert_eq!(cut_off(&rt), Vec::<String>::new());
+            assert!(rt.state.camera() != held);
+        }
+    }
+    #[test]
+    fn the_fitted_map_sits_mid_canvas_and_clear_of_the_zoom_control() {
+        // A short, wide canvas has room beside the zoom control. The map must not lean into it.
+        for size in [
+            (820.0, 640.0),
+            (1280.0, 700.0),
+            (1280.0, 860.0),
+            (1680.0, 1000.0),
+        ] {
+            let mut rt = runtime(size);
+            rt.check_live_only(false);
+            rt.frame(1.0);
+            rt.frame(1.0);
+            let elements = rt.elements();
+            let rect = |key: &str| {
+                elements
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(key))
+                    .unwrap()
+                    .rect
+            };
+            let (map, hub, zoom) = (rect("map"), rect("central-idea"), rect("map-navigation"));
+            assert!(
+                (hub[0] + hub[2] / 2.0 - map[0] - map[2] / 2.0).abs() < 1.0,
+                "{size:?}: {hub:?} is off the middle of {map:?}"
+            );
+            for idea in elements.iter().filter(|e| {
+                e.key.as_deref().is_some_and(|key| {
+                    key == "central-idea"
+                        || key
+                            .strip_prefix("thought-")
+                            .is_some_and(|id| id.parse::<u64>().is_ok())
+                })
+            }) {
+                let [x, y, w, h] = idea.rect;
+                assert!(
+                    x + w <= zoom[0] || y + h <= zoom[1],
+                    "{size:?}: {:?} runs under the zoom control",
+                    idea.key
+                );
+            }
+        }
+    }
+    #[test]
     fn displayed_pixels_and_presentation_commit_once_and_replay_together() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.json");
@@ -5400,6 +5941,255 @@ mod tests {
     }
 
     #[test]
+    fn sessions_float_over_a_narrow_window_and_sit_beside_a_wide_one() {
+        let rect = |rt: &Runtime<State>, key: &str| {
+            rt.elements()
+                .iter()
+                .find(|e| e.key.as_deref() == Some(key))
+                .map(|e| e.rect)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+        let open = |rt: &mut Runtime<State>| {
+            rt.state.sessions_open = true;
+            rt.invalidate();
+            rt.frame(1.0);
+            rt.frame(1.0);
+        };
+        let mut rt = runtime((820.0, 640.0));
+        rt.frame(1.0);
+        let map = rect(&rt, "map");
+        open(&mut rt);
+        let drawer = rect(&rt, "session-drawer");
+        assert!(
+            drawer[0] >= 0.0 && drawer[0] + drawer[2] <= 820.0,
+            "{drawer:?}"
+        );
+        assert!(
+            drawer[1] >= 0.0 && drawer[1] + drawer[3] <= 640.0,
+            "{drawer:?}"
+        );
+        let beneath = rect(&rt, "map");
+        assert!(
+            map.iter().zip(beneath).all(|(a, b)| (a - b).abs() < 0.5),
+            "a floating drawer leaves the map alone: {map:?} -> {beneath:?}"
+        );
+        rt.key(KeyEvent {
+            key: Key::Escape,
+            mods: Mods::default(),
+        });
+        rt.frame(1.0);
+        assert!(!rt.state.sessions_open, "Escape puts the sessions away");
+        open(&mut rt);
+        let selected = rt.state.selected;
+        let (x, y) = (drawer[0] + drawer[2] + 120.0, drawer[1] + drawer[3] / 2.0);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0);
+        assert!(!rt.state.sessions_open, "so does a press beside them");
+        assert_eq!(
+            rt.state.selected, selected,
+            "which reaches nothing underneath"
+        );
+
+        let mut rt = runtime((1280.0, 860.0));
+        open(&mut rt);
+        let (drawer, workspace) = (rect(&rt, "session-drawer"), rect(&rt, "workspace"));
+        assert!(
+            workspace[0] >= drawer[0] + drawer[2],
+            "a wide window has room for both: {drawer:?} {workspace:?}"
+        );
+        assert!(rt.find("sessions-scrim").is_none());
+    }
+
+    #[test]
+    fn a_new_session_name_is_offered_once_typed_and_kept_with_enter() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("session.json");
+        let mut rt = runtime((820.0, 640.0));
+        rt.state = State::open_session(base.clone()).unwrap();
+        rt.state.library_base = Some(base);
+        rt.state.refresh_sessions();
+        rt.invalidate();
+        click(&mut rt, "sessions");
+        assert!(rt.state.sessions_open);
+        assert!(
+            rt.find("session-rename").is_none(),
+            "the name it already has needs no confirming"
+        );
+        rt.state.session_name_edit = TextEdit::new("Quarterly retro");
+        rt.invalidate();
+        rt.frame(1.0);
+        assert!(rt.find("session-rename").is_some());
+        click(&mut rt, "session-name");
+        rt.key(KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        });
+        rt.frame(1.0);
+        assert_eq!(rt.state.session_name, "Quarterly retro");
+        assert!(
+            rt.state
+                .session_entries
+                .iter()
+                .any(|e| e.name == "Quarterly retro")
+        );
+        assert!(
+            rt.find("session-rename").is_none(),
+            "the confirmation leaves once the name is kept"
+        );
+    }
+
+    #[test]
+    fn the_first_thought_opens_the_dock_without_moving_what_was_there() {
+        let mut rt = Runtime::new(
+            State::empty(),
+            view,
+            (1280.0, 860.0),
+            Env {
+                system_dark: false,
+                scale: 1.0,
+            },
+        );
+        rt.poll = Some(poll);
+        rt.frame(0.0);
+        rt.frame(1.0);
+        let rect = |rt: &Runtime<State>, key: &str| {
+            rt.elements()
+                .iter()
+                .find(|e| e.key.as_deref() == Some(key))
+                .map(|e| e.rect)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+        let path = |rt: &Runtime<State>, key: &str| {
+            rt.elements()
+                .iter()
+                .find(|e| e.key.as_deref() == Some(key))
+                .map(|e| e.path.clone())
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+        click(&mut rt, "thought-input");
+        rt.key(KeyEvent {
+            key: Key::Text("What if we met less?".into()),
+            mods: Mods::default(),
+        });
+        rt.frame(1.0);
+        rt.frame(1.0);
+        assert!(rt.find("dock-detail").is_none());
+        assert!(rt.find("undo").is_none());
+        let (bar, bar_path) = (rect(&rt, "dock-bar"), path(&rt, "dock-bar"));
+        let story = rect(&rt, "toggle-story");
+        rt.key(KeyEvent {
+            key: Key::Enter,
+            mods: Mods::default(),
+        });
+        rt.frame(1.0);
+        rt.frame(1.0);
+        assert_eq!(rt.state.projection.session.thoughts.len(), 1);
+        // The transcript arrives above the bar, which stays the element it was.
+        assert!(rt.find("dock-detail").is_some());
+        assert_eq!(path(&rt, "dock-bar"), bar_path);
+        let after = rect(&rt, "dock-bar");
+        assert!(
+            bar.iter().zip(after).all(|(a, b)| (a - b).abs() < 0.5),
+            "the composer bar keeps its place: {bar:?} -> {after:?}"
+        );
+        // Undo joins the header before the tools already there, so none of them move.
+        let (undo, now) = (rect(&rt, "undo"), rect(&rt, "toggle-story"));
+        assert!(undo[0] + undo[2] <= now[0], "{undo:?} {now:?}");
+        assert!(
+            story.iter().zip(now).all(|(a, b)| (a - b).abs() < 0.5),
+            "{story:?} -> {now:?}"
+        );
+    }
+
+    #[test]
+    fn the_header_keeps_every_tool_whole_in_the_smallest_window() {
+        const NAME: &str = "A conversation whose name is far too long to sit beside every tool";
+        // The widths of the header's tools, left to right, which must follow one another inside
+        // the window.
+        let row = |rt: &Runtime<State>, keys: &[&str]| {
+            let elements = rt.elements();
+            let rect = |key: &str| {
+                elements
+                    .iter()
+                    .find(|e| e.key.as_deref() == Some(key) && !e.exiting)
+                    .map(|e| e.rect)
+                    .unwrap_or_else(|| panic!("missing {key}"))
+            };
+            let window = rect("workspace");
+            let name = elements
+                .iter()
+                .find(|e| e.text.as_deref() == Some(NAME))
+                .map(|e| e.rect)
+                .unwrap();
+            let sessions = rect("sessions");
+            // The name gives way to the tools, and still says which conversation this is.
+            assert!(name[0] >= sessions[0] + sessions[2] && name[2] >= 48.0);
+            let mut edge = name[0] + name[2];
+            keys.iter()
+                .map(|key| {
+                    let tool = rect(key);
+                    assert!(tool[0] >= edge - 0.5, "{key} is over its neighbor");
+                    edge = tool[0] + tool[2];
+                    assert!(
+                        edge <= window[0] + window[2] + 0.5,
+                        "{key} leaves the window"
+                    );
+                    tool[2]
+                })
+                .collect::<Vec<_>>()
+        };
+        // Everything the header can hold at once: a thought the mural does not show and that can
+        // be undone, artwork to hide, the other sessions, and a name too long to sit beside them.
+        let widths = |size| {
+            let mut rt = runtime(size);
+            let (send, _requests) = std::sync::mpsc::channel();
+            let (_responses, receive) = std::sync::mpsc::channel();
+            rt.state.gallery.worker = Some(generated_art::Worker { send, receive });
+            let image = rt.state.image_cache.rgba(1, 1, vec![100, 160, 200, 255]);
+            image.wait().unwrap();
+            rt.state.gallery.layers.push(generated_art::Layer {
+                mural: Some(mural_fixture()),
+                encoded: Some(std::sync::Arc::new(vec![0])),
+                key: generated_art::CENTRAL_KEY.into(),
+                fingerprint: "fixture".into(),
+                slot: 0,
+                image,
+                born: -10.0,
+                retired: None,
+            });
+            rt.state.library_base = Some(PathBuf::from("unused-library/session.json"));
+            rt.state.session_name = NAME.into();
+            rt.invalidate();
+            click(&mut rt, "thought-input");
+            rt.key(KeyEvent {
+                key: Key::Text("One more idea".into()),
+                mods: Mods::default(),
+            });
+            rt.key(KeyEvent {
+                key: Key::Enter,
+                mods: Mods::default(),
+            });
+            rt.frame(1.0);
+            rt.frame(1.0);
+            let mut all = row(&rt, &["art-compose", "art-style", "undo", "toggle-story"]);
+            click(&mut rt, "art-compose");
+            rt.frame(1.0);
+            all.extend(row(
+                &rt,
+                &["art-progress", "art-style", "undo", "toggle-story"],
+            ));
+            all
+        };
+        // No tool is squeezed to make room in a small window.
+        let (small, roomy) = (widths((820.0, 640.0)), widths((1280.0, 860.0)));
+        assert!(
+            small.iter().zip(&roomy).all(|(a, b)| (a - b).abs() < 0.5),
+            "{small:?} {roomy:?}"
+        );
+    }
+
+    #[test]
     fn unavailable_guidance_preserves_the_draft_and_explains_the_requirement() {
         let mut rt = runtime((820.0, 640.0));
         let before = rt.state.projection.session.clone();
@@ -5444,8 +6234,12 @@ mod tests {
             "capture",
             "save",
             "undo",
+            "art-compose",
+            "art-progress",
             "art-style",
+            "art-notice",
             "retry-art",
+            "art-dismiss",
             "voice-check",
         ] {
             assert!(
@@ -5461,9 +6255,11 @@ mod tests {
 
         rt.state.path = Some(PathBuf::from("unused-recovery-path.json"));
         rt.state.status = "Not saved: disk full. Use Retry save.".into();
+        rt.invalidate();
         rt.frame(1.0);
         assert!(rt.find("save").is_some());
         rt.state.read_only = true;
+        rt.invalidate();
         rt.frame(1.0);
         assert!(rt.find("save").is_none());
         assert!(rt.find("thought-input").is_none());

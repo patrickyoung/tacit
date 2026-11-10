@@ -1,4 +1,5 @@
-//! One evolving mural. Art direction and image editing run off the UI thread.
+//! One mural per session, composed when someone asks for it. Art direction and image editing
+//! run off the UI thread.
 use crate::{
     art::Style,
     artist::{self, Action, Decision, Direction, Evidence, Mural},
@@ -25,7 +26,7 @@ const IMAGE_QUALITY: &str = "high";
 const DRAW: &str = "Draw a fresh composition from this session's art direction and fictional design cues. Make its specific story immediately recognizable. This session has its own cast; there are no recurring Tacit characters. Return the complete mural with alpha transparency.";
 const EDIT: &str = "Edit the supplied mural IN PLACE using the direction's change instructions. Preserve only the specified useful anchors and distinctive characters from THIS session. Simplify weak details as needed; narrative accuracy and visual clarity take priority over keeping obsolete scenery. Return the complete updated mural with alpha transparency.";
 
-/// A prompt or rendering change must reach existing sessions even without new speech.
+/// A prompt or rendering change leaves existing murals behind, even without new speech.
 fn render_policy() -> String {
     blake3::hash(
         format!(
@@ -38,8 +39,7 @@ fn render_policy() -> String {
     .to_string()
 }
 const MAX_BYTES: usize = 16 * 1024 * 1024;
-const INITIAL_DELAY: f64 = 8.0;
-const UPDATE_INTERVAL: f64 = 30.0;
+const COMPOSING: &str = "Art · composing the mural…";
 
 #[derive(Clone, Debug)]
 pub struct Brief {
@@ -386,10 +386,9 @@ pub struct Gallery {
     render_policy: String,
     planned_for: Option<(Session, Style, String, String)>,
     input: Option<Evidence>,
+    /// Someone asked for artwork and the request has not gone out yet.
+    asked: bool,
     pending: Option<Request>,
-    attempted: Option<(String, String, String)>,
-    due: Option<f64>,
-    last_request: Option<f64>,
     serial: u64,
     active: bool,
 }
@@ -408,18 +407,32 @@ impl Default for Gallery {
             render_policy: render_policy(),
             planned_for: None,
             input: None,
+            asked: false,
             pending: None,
-            attempted: None,
-            due: None,
-            last_request: None,
             serial: 0,
             active: false,
         }
     }
 }
 impl Gallery {
+    /// Artwork was asked for and has not arrived.
     pub fn is_working(&self) -> bool {
-        self.pending.is_some()
+        self.asked || self.pending.is_some()
+    }
+    /// The conversation holds something the mural does not show: there is artwork to ask for.
+    pub fn is_behind(&self) -> bool {
+        self.input.as_ref().is_some_and(|input| !self.shows(input))
+    }
+    /// A scene has been composed, so the next one continues it rather than starting the mural.
+    pub fn has_mural(&self) -> bool {
+        self.current().is_some()
+    }
+    /// Asks for a mural of the conversation as it stands. Nothing is composed without this.
+    pub fn compose(&mut self) {
+        if self.worker.is_some() {
+            self.asked = true;
+            self.status = COMPOSING.into();
+        }
     }
     /// Called once after restoring a session. Archived identity survives moves and
     /// renames; new sessions get an opaque key without sending their local path.
@@ -435,27 +448,74 @@ impl Gallery {
                     .to_string()
             });
     }
-    pub fn retry(&mut self) {
-        self.attempted = None;
-        self.due = Some(self.now);
-    }
-    /// Replay/off invalidate publication, including an already-running request.
+    /// Replay/off withdraw the ask and invalidate publication, including an already-running
+    /// request.
     pub fn suspend(&mut self) {
+        self.cancel();
+        self.asked = false;
+        self.planned_for = None;
+    }
+    fn cancel(&mut self) {
         if let Some(pending) = self.pending.take() {
             pending.cancelled.store(true, Ordering::Release);
         }
         if let Some(worker) = &self.worker {
             let _ = worker.send.send(None);
         }
-        self.attempted = None;
-        self.due = None;
-        self.planned_for = None;
     }
     fn current(&self) -> Option<&Layer> {
         self.layers
             .iter()
             .rev()
             .find(|l| l.key == CENTRAL_KEY && l.retired.is_none() && l.mural.is_some())
+    }
+    /// The mural on screen depicts `input`. Titles, theme names and other wording around the
+    /// same content leave it current, so nobody is offered a scene they already have.
+    fn shows(&self, input: &Evidence) -> bool {
+        self.current()
+            .and_then(|l| l.mural.as_ref())
+            .is_some_and(|m| {
+                m.content == input.content
+                    && m.image_model == self.model
+                    && m.artist_model == self.artist_model
+                    && m.render_policy == self.render_policy
+                    && m.identity == self.identity
+            })
+    }
+    /// Sends `input` to the artist as the next scene of the mural on screen, and says how
+    /// that went. A mural whose pixels are gone is kept rather than restarted from nothing.
+    fn request(&mut self, input: Evidence) -> String {
+        let base = match self.current() {
+            Some(layer) => match &layer.encoded {
+                Some(encoded) => Some(Base {
+                    encoded: encoded.clone(),
+                    fingerprint: layer.fingerprint.clone(),
+                    mural: layer.mural.clone().unwrap(),
+                }),
+                None => return "Previous mural pixels unavailable; artwork retained".into(),
+            },
+            None => None,
+        };
+        self.serial += 1;
+        let request = Request {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            id: self.serial,
+            evidence: input,
+            model: self.model.clone(),
+            artist_model: self.artist_model.clone(),
+            identity: self.identity.clone(),
+            render_policy: self.render_policy.clone(),
+            base,
+        };
+        let sent = self
+            .worker
+            .as_ref()
+            .is_some_and(|w| w.send.send(Some(request.clone())).is_ok());
+        if !sent {
+            return "Mural worker unavailable".into();
+        }
+        self.pending = Some(request);
+        COMPOSING.into()
     }
     pub fn update(
         &mut self,
@@ -480,22 +540,22 @@ impl Gallery {
                 });
         let mut changed = false;
         if replan {
-            self.input = if style == Style::Off {
-                None
-            } else {
-                Evidence::from_session(session)
-            };
-            if self.input.is_none()
-                || self.pending.as_ref().is_some_and(|p| {
-                    p.model != self.model
-                        || p.artist_model != self.artist_model
-                        || !self
-                            .input
-                            .as_ref()
-                            .is_some_and(|i| p.evidence.still_supported_by(i))
-                })
-            {
+            self.input = Evidence::from_session(session);
+            if style == Style::Off || self.input.is_none() {
                 self.suspend();
+                self.status.clear();
+            } else if self.pending.as_ref().is_some_and(|p| {
+                p.model != self.model
+                    || p.artist_model != self.artist_model
+                    || !self
+                        .input
+                        .as_ref()
+                        .is_some_and(|i| p.evidence.still_supported_by(i))
+            }) {
+                // The scene under way describes a conversation that has since been corrected.
+                // The ask still stands, so it is asked again of the conversation as it is now.
+                self.cancel();
+                self.asked = true;
             }
             self.planned_for = Some((
                 session.clone(),
@@ -510,9 +570,6 @@ impl Gallery {
                     layer.retired = Some(now);
                 }
             }
-            if self.input.is_none() {
-                self.status.clear();
-            }
             changed = true;
         }
         while let Some(response) = self.worker.as_ref().and_then(|w| w.receive.try_recv().ok()) {
@@ -520,6 +577,7 @@ impl Gallery {
                 continue;
             }
             let request = self.pending.take().unwrap();
+            changed = true;
             let same_parent = self.current().map(|l| &l.fingerprint)
                 == request.base.as_ref().map(|b| &b.fingerprint);
             if !same_parent
@@ -530,6 +588,8 @@ impl Gallery {
                     .as_ref()
                     .is_some_and(|i| request.evidence.still_supported_by(i))
             {
+                // Whatever left this scene behind, the ask for one still stands.
+                self.asked = true;
                 continue;
             }
             match response.result {
@@ -552,7 +612,7 @@ impl Gallery {
                         retired: None,
                         mural: Some(artifact.mural),
                     });
-                    self.status = "Art · mural evolving with the conversation".into();
+                    self.status = "Art · mural composed".into();
                 }
                 Ok(Update {
                     artifact,
@@ -570,89 +630,21 @@ impl Gallery {
                 }
                 Err(error) => self.status = error,
             }
-            changed = true;
         }
-        if let Some(input) = &self.input {
-            let attempted = self
-                .attempted
-                .as_ref()
-                .is_some_and(|(evidence, model, artist)| {
-                    evidence == &input.fingerprint
-                        && model == &self.model
-                        && artist == &self.artist_model
-                });
-            let done = self
-                .current()
-                .and_then(|l| l.mural.as_ref())
-                .is_some_and(|m| {
-                    m.evidence == input.fingerprint
-                        && m.image_model == self.model
-                        && m.artist_model == self.artist_model
-                        && m.render_policy == self.render_policy
-                        && m.identity == self.identity
-                        && m.content == input.content
-                });
-            if done || attempted {
-                self.due = None;
-            } else if self.pending.is_none() {
-                let due = *self.due.get_or_insert_with(|| {
-                    (now + INITIAL_DELAY)
-                        .max(self.last_request.map_or(now, |t| t + UPDATE_INTERVAL))
-                });
-                if !organizing && now >= due {
-                    let base = self
-                        .current()
-                        .map(|l| {
-                            l.encoded
-                                .clone()
-                                .map(|encoded| Base {
-                                    encoded,
-                                    fingerprint: l.fingerprint.clone(),
-                                    mural: l.mural.clone().unwrap(),
-                                })
-                                .ok_or("Previous mural pixels unavailable; artwork retained")
-                        })
-                        .transpose();
-                    self.attempted = Some((
-                        input.fingerprint.clone(),
-                        self.model.clone(),
-                        self.artist_model.clone(),
-                    ));
-                    self.due = None;
-                    match base {
-                        Ok(base) => {
-                            self.serial += 1;
-                            let request = Request {
-                                cancelled: Arc::new(AtomicBool::new(false)),
-                                id: self.serial,
-                                evidence: input.clone(),
-                                model: self.model.clone(),
-                                artist_model: self.artist_model.clone(),
-                                identity: self.identity.clone(),
-                                render_policy: self.render_policy.clone(),
-                                base,
-                            };
-                            if self
-                                .worker
-                                .as_ref()
-                                .unwrap()
-                                .send
-                                .send(Some(request.clone()))
-                                .is_ok()
-                            {
-                                self.pending = Some(request);
-                                self.last_request = Some(now);
-                                self.status = "Art · composing the next scene…".into();
-                            } else {
-                                self.status = "Mural worker unavailable".into();
-                            }
-                        }
-                        Err(error) => self.status = error.into(),
-                    }
-                    changed = true;
-                } else if !organizing {
-                    tx.wake_after(Duration::from_secs_f64((due - now).max(0.01)));
-                }
+        // Nothing is composed until someone asks, and then only once the map has settled.
+        self.asked &= style != Style::Off;
+        if self.asked && self.pending.is_none() {
+            if organizing {
+                tx.wake_after(Duration::from_millis(250));
+            } else {
+                self.asked = false;
+                self.status = match self.input.clone() {
+                    Some(input) if !self.shows(&input) => self.request(input),
+                    // Nothing new to show: the mural already there answers the ask.
+                    Some(_) => "Art · mural up to date".into(),
+                    None => String::new(),
+                };
+                changed = true;
             }
         }
         let animating = self
@@ -927,50 +919,72 @@ mod tests {
             }),
         }
     }
+    /// Asks for artwork and returns the composition that goes to the worker because of it.
+    fn ask(g: &mut Gallery, s: &Session, q: &Receiver<Option<Request>>, now: f64) -> Request {
+        g.compose();
+        tick(g, s, now);
+        q.try_recv().unwrap().unwrap()
+    }
+    /// The next composition sent to the worker, past any cancellations ahead of it.
+    fn sent(q: &Receiver<Option<Request>>) -> Option<Request> {
+        q.try_iter().flatten().next()
+    }
     fn initial(g: &mut Gallery, s: &Session, q: &Receiver<Option<Request>>, r: &Sender<Response>) {
         tick(g, s, 0.);
-        tick(g, s, 8.);
-        let request = q.try_recv().unwrap().unwrap();
+        let request = ask(g, s, q, 1.);
         assert!(request.base.is_none());
         r.send(success(&request, "first-scene")).unwrap();
-        tick(g, s, 9.);
+        tick(g, s, 2.);
     }
     #[test]
-    fn one_mural_without_themes_coalesces_and_deduplicates() {
-        let (mut g, q, _) = setup();
+    fn nothing_is_composed_until_someone_asks() {
+        let (mut g, q, _r) = setup();
         let mut s = Session::default();
         s.add("We need space to think");
         tick(&mut g, &s, 0.);
         s.add("And a garden to meet in");
-        tick(&mut g, &s, 7.);
+        tick(&mut g, &s, 1.);
+        tick(&mut g, &s, 600.);
         assert!(q.try_recv().is_err());
-        g.update(&s, Style::Ink, true, 8., &mut rune::Tx::default());
+        assert!(g.is_behind() && !g.is_working());
+        g.compose();
+        assert!(g.is_working());
+        // The ask waits for the organizer, so the scene is drawn from the settled map.
+        g.update(&s, Style::Ink, true, 601., &mut rune::Tx::default());
         assert!(q.try_recv().is_err());
-        tick(&mut g, &s, 9.);
+        assert!(g.is_working());
+        tick(&mut g, &s, 602.);
         let request = q.try_recv().unwrap().unwrap();
         assert_eq!(request.evidence, Evidence::from_session(&s).unwrap());
-        tick(&mut g, &s, 100.);
+        assert!(request.base.is_none());
+        // One ask is one composition, however long it takes.
+        tick(&mut g, &s, 1200.);
+        assert!(g.is_working());
         assert!(q.try_recv().is_err());
+        // Without a worker there is nobody to ask.
+        let mut offline = Gallery::default();
+        offline.compose();
+        assert!(!offline.is_working());
     }
     #[test]
     fn edits_use_actual_previous_pixels_and_direction() {
         let (mut g, q, r) = setup();
         let mut s = Session::demo();
         initial(&mut g, &s, &q, &r);
-        tick(&mut g, &s, 15.);
-        assert!(q.try_recv().is_err());
+        assert!(!g.is_behind() && !g.is_working());
         s.add("A new garden");
         tick(&mut g, &s, 16.);
-        tick(&mut g, &s, 37.);
+        tick(&mut g, &s, 600.);
+        // The conversation has moved past the mural, which waits to be asked for.
         assert!(q.try_recv().is_err());
-        tick(&mut g, &s, 38.);
-        let request = q.try_recv().unwrap().unwrap();
+        assert!(g.is_behind() && !g.is_working());
+        let request = ask(&mut g, &s, &q, 601.);
         let base = request.base.as_ref().unwrap();
         assert_eq!(base.fingerprint, "first-scene");
         assert_eq!(base.encoded, bytes());
         assert_eq!(base.mural.direction, direction());
         r.send(success(&request, "second-scene")).unwrap();
-        tick(&mut g, &s, 40.);
+        tick(&mut g, &s, 603.);
         assert_eq!(
             g.current()
                 .unwrap()
@@ -981,7 +995,8 @@ mod tests {
                 .as_deref(),
             Some("first-scene")
         );
-        tick(&mut g, &s, 500.);
+        assert!(!g.is_behind() && !g.is_working());
+        tick(&mut g, &s, 1200.);
         assert_eq!(g.layers.len(), 1);
         assert!(q.try_recv().is_err());
     }
@@ -990,15 +1005,17 @@ mod tests {
         let (mut g, q, r) = setup();
         let mut s = Session::demo();
         tick(&mut g, &s, 0.);
-        tick(&mut g, &s, 8.);
-        let first = q.try_recv().unwrap().unwrap();
+        let first = ask(&mut g, &s, &q, 1.);
         s.add("Another idea during generation");
-        tick(&mut g, &s, 10.);
+        tick(&mut g, &s, 3.);
         r.send(success(&first, "first-scene")).unwrap();
-        tick(&mut g, &s, 12.);
+        tick(&mut g, &s, 5.);
         assert!(g.current().is_some());
-        tick(&mut g, &s, 38.);
-        let next = q.try_recv().unwrap().unwrap();
+        // The scene that was asked for arrives; the idea after it waits for the next ask.
+        tick(&mut g, &s, 600.);
+        assert!(q.try_recv().is_err());
+        assert!(g.is_behind() && !g.is_working());
+        let next = ask(&mut g, &s, &q, 601.);
         assert_eq!(next.evidence, Evidence::from_session(&s).unwrap());
         assert_eq!(next.base.unwrap().fingerprint, "first-scene");
     }
@@ -1009,17 +1026,26 @@ mod tests {
             let mut s = Session::demo();
             initial(&mut g, &s, &q, &r);
             s.add("A greenhouse");
-            tick(&mut g, &s, 16.);
-            tick(&mut g, &s, 38.);
-            let request = q.try_recv().unwrap().unwrap();
+            let request = ask(&mut g, &s, &q, 16.);
             if removal {
                 s.thoughts.pop();
             } else {
                 s.thoughts.last_mut().unwrap().text = "Actually, a mountain".into();
             }
             r.send(success(&request, "obsolete")).unwrap();
-            tick(&mut g, &s, 40.);
+            tick(&mut g, &s, 18.);
+            assert!(request.cancelled.load(Ordering::Acquire));
             assert_eq!(g.current().unwrap().fingerprint, "first-scene");
+            // A corrected idea is still worth its scene, so the ask carries over to the new
+            // words. A withdrawn idea leaves the conversation as the mural already shows it.
+            let again = sent(&q);
+            assert_eq!(again.is_some(), !removal);
+            assert_eq!(g.is_working(), !removal);
+            assert_eq!(g.is_behind(), !removal);
+            if let Some(again) = again {
+                assert_eq!(again.evidence, Evidence::from_session(&s).unwrap());
+                assert_eq!(again.base.unwrap().fingerprint, "first-scene");
+            }
         }
     }
     #[test]
@@ -1028,72 +1054,67 @@ mod tests {
             let (mut g, q, r) = setup();
             let s = Session::demo();
             tick(&mut g, &s, 0.);
-            tick(&mut g, &s, 8.);
-            let request = q.try_recv().unwrap().unwrap();
+            let request = ask(&mut g, &s, &q, 1.);
             match mode {
                 0 => {
-                    g.update(&s, Style::Off, false, 9., &mut rune::Tx::default());
+                    g.update(&s, Style::Off, false, 2., &mut rune::Tx::default());
                 }
                 1 => g.suspend(),
                 _ => g.model = "different-model".into(),
             }
             r.send(success(&request, "obsolete")).unwrap();
-            tick(&mut g, &s, 10.);
+            tick(&mut g, &s, 3.);
             assert!(request.cancelled.load(Ordering::Acquire));
             assert!(g.current().is_none());
+            // Hiding the artwork or leaving for replay withdraws the ask. Another model does
+            // not: the same scene is asked of the model now chosen.
+            let again = sent(&q);
+            assert_eq!(again.is_some(), mode == 2);
+            assert_eq!(g.is_working(), mode == 2);
+            if let Some(again) = again {
+                assert_eq!(again.model, "different-model");
+                assert!(again.base.is_none());
+            }
+            tick(&mut g, &s, 600.);
+            assert!(q.try_recv().is_err());
         }
     }
     #[test]
-    fn failure_keeps_pixels_and_does_not_loop_until_retry() {
+    fn failure_keeps_pixels_and_does_not_loop_until_asked_again() {
         let (mut g, q, r) = setup();
         let mut s = Session::demo();
         initial(&mut g, &s, &q, &r);
         s.add("A new garden");
-        tick(&mut g, &s, 16.);
-        tick(&mut g, &s, 38.);
-        let request = q.try_recv().unwrap().unwrap();
+        let request = ask(&mut g, &s, &q, 16.);
         r.send(Response {
             id: request.id,
             result: Err("Unavailable".into()),
         })
         .unwrap();
-        tick(&mut g, &s, 40.);
-        tick(&mut g, &s, 500.);
+        tick(&mut g, &s, 18.);
+        tick(&mut g, &s, 600.);
+        assert_eq!(g.status, "Unavailable");
         assert_eq!(g.current().unwrap().fingerprint, "first-scene");
         assert!(q.try_recv().is_err());
-        g.retry();
-        tick(&mut g, &s, 501.);
-        assert!(q.try_recv().unwrap().unwrap().base.is_some());
+        assert!(g.is_behind() && !g.is_working());
+        assert!(ask(&mut g, &s, &q, 601.).base.is_some());
     }
     #[test]
-    fn artist_can_acknowledge_a_change_without_repainting() {
+    fn rewording_around_the_same_ideas_leaves_the_mural_current() {
         let (mut g, q, r) = setup();
         let mut s = Session::demo();
         initial(&mut g, &s, &q, &r);
         let born = g.current().unwrap().born;
         s.title = "A refined title".into();
         tick(&mut g, &s, 16.);
-        tick(&mut g, &s, 38.);
-        let request = q.try_recv().unwrap().unwrap();
-        assert!(request.can_keep_previous());
-        let mut mural = request.base.unwrap().mural;
-        mural.evidence = request.evidence.fingerprint;
-        r.send(Response {
-            id: request.id,
-            result: Ok(Update {
-                image: None,
-                artifact: Artifact {
-                    fingerprint: "first-scene".into(),
-                    encoded: None,
-                    mural,
-                },
-            }),
-        })
-        .unwrap();
-        tick(&mut g, &s, 40.);
-        tick(&mut g, &s, 500.);
-        assert_eq!(g.current().unwrap().born, born);
+        assert!(!g.is_behind());
+        // Asking anyway is answered by the mural already there, without a cloud call.
+        g.compose();
+        tick(&mut g, &s, 17.);
+        tick(&mut g, &s, 600.);
         assert!(q.try_recv().is_err());
+        assert!(!g.is_working());
+        assert_eq!(g.current().unwrap().born, born);
     }
     #[test]
     fn missing_archived_pixels_never_silently_restarts_the_scene() {
@@ -1102,10 +1123,12 @@ mod tests {
         initial(&mut g, &s, &q, &r);
         g.layers[0].encoded = None;
         s.add("A new garden");
+        g.compose();
         tick(&mut g, &s, 16.);
-        tick(&mut g, &s, 38.);
+        tick(&mut g, &s, 600.);
         assert!(g.status.contains("pixels unavailable"));
         assert!(q.try_recv().is_err());
+        assert!(!g.is_working());
         assert_eq!(g.current().unwrap().fingerprint, "first-scene");
     }
     #[test]
@@ -1117,8 +1140,7 @@ mod tests {
         let s = Session::demo();
         initial(&mut a, &s, &qa, &ra);
         tick(&mut b, &s, 0.);
-        tick(&mut b, &s, 8.);
-        let request = qb.try_recv().unwrap().unwrap();
+        let request = ask(&mut b, &s, &qb, 1.);
         assert!(request.base.is_none());
         assert_ne!(a.identity, request.identity);
         let da = artist::visual_identity(&a.identity);
@@ -1134,7 +1156,7 @@ mod tests {
         assert_eq!(a.identity, saved);
     }
     #[test]
-    fn old_rendering_policy_refreshes_without_new_thoughts_and_cannot_be_kept() {
+    fn old_rendering_policy_leaves_the_mural_behind_and_cannot_be_kept() {
         for obsolete in ["", "previous-rendering-policy"] {
             let (mut g, q, r) = setup();
             let s = Session::demo();
@@ -1143,16 +1165,20 @@ mod tests {
             g.suspend(); // reopening / returning from replay
             let _ = q.try_recv();
             tick(&mut g, &s, 16.);
-            tick(&mut g, &s, 38.);
-            let request = q.try_recv().unwrap().unwrap();
+            tick(&mut g, &s, 600.);
+            // Without new thoughts there is a newer rendering to ask for, and only to ask for.
+            assert!(q.try_recv().is_err());
+            assert!(g.is_behind() && !g.is_working());
+            let request = ask(&mut g, &s, &q, 601.);
             assert!(request.base.is_some());
             assert!(!request.can_keep_previous());
             // Old pixels remain visible until a successful replacement arrives.
             assert_eq!(g.current().unwrap().fingerprint, "first-scene");
             r.send(success(&request, "refreshed-scene")).unwrap();
-            tick(&mut g, &s, 40.);
-            tick(&mut g, &s, 500.);
+            tick(&mut g, &s, 603.);
+            tick(&mut g, &s, 1200.);
             assert_eq!(g.current().unwrap().fingerprint, "refreshed-scene");
+            assert!(!g.is_behind() && !g.is_working());
             assert!(q.try_recv().is_err());
         }
     }
@@ -1162,9 +1188,7 @@ mod tests {
         let mut s = Session::demo();
         initial(&mut g, &s, &q, &r);
         s.add("We are considering a different approach");
-        tick(&mut g, &s, 16.);
-        tick(&mut g, &s, 38.);
-        let mut request = q.try_recv().unwrap().unwrap();
+        let mut request = ask(&mut g, &s, &q, 16.);
         assert!(!request.can_keep_previous());
         for (action, expects_pixels) in [(Action::Edit, true), (Action::Redraw, false)] {
             let brief = request.brief(&Decision {

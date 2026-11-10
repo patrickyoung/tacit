@@ -280,7 +280,11 @@ pub async fn review(
         .messages(vec![
             Message::new(
                 MessageRole::System,
-                format!("{system}\n{}", crate::organizer::CATEGORY_GUIDANCE),
+                format!(
+                    "{system}\n{} {}",
+                    crate::organizer::CATEGORY_GUIDANCE,
+                    crate::organizer::BALANCE_GUIDANCE
+                ),
             ),
             Message::new(MessageRole::User, input.to_string()),
         ])
