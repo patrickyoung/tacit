@@ -92,7 +92,7 @@ pub struct Direction {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Mural {
-    /// Missing on historical artwork. Live sessions refresh it; replay stays exact.
+    /// Missing on historical artwork. Live sessions offer to refresh it; replay stays exact.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub render_policy: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
