@@ -2,6 +2,7 @@
 use super::*;
 use kit::Icon;
 use tacit::camera::Camera;
+use tacit::model::ParkKind;
 
 impl State {
     pub(super) fn voice_in_progress(&self) -> bool {
@@ -18,7 +19,7 @@ impl State {
         self.read_only
             || self.replay.is_some()
             || self.voice_in_progress()
-            || self.directing
+            || self.directing()
             || self.queued_direction.is_some()
     }
 
@@ -26,7 +27,7 @@ impl State {
         !self.read_only
             && self.replay.is_none()
             && if self.direction_mode {
-                self.director.is_some()
+                self.agent.is_some()
                     && !self.direction_draft.text.trim().is_empty()
                     && !self.input_mode_locked()
             } else {
@@ -243,6 +244,16 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
     }
     let concepts = s.projection.session.thoughts.len();
     if concepts > 0 {
+        let mut count = if concepts == 1 {
+            "1 concept".into()
+        } else {
+            format!("{concepts} concepts")
+        };
+        // What waits beside the map is counted, so nothing said seems to have gone missing.
+        let parked = s.projection.session.parked.len();
+        if parked > 0 {
+            count = format!("{count} · {parked} parked");
+        }
         map = map.child(
             // The count stays readable when ideas pass beneath it.
             row()
@@ -253,16 +264,7 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
                 .fill(PAPER.alpha(0.9))
                 .pin(Some(10.0), None, None, Some(22.0))
                 .inert()
-                .child(kit::caption(
-                    if concepts == 1 {
-                        "1 concept".into()
-                    } else {
-                        format!("{concepts} concepts")
-                    },
-                    11.5,
-                    500.0,
-                    MUTED,
-                )),
+                .child(kit::caption(count, 11.5, 500.0, MUTED)),
         );
     }
     map.child(navigation(s))
@@ -309,11 +311,12 @@ fn voice_controls(s: &State) -> El {
     if !s.voice_in_progress() {
         let idle = if s.read_only {
             Some("Read-only session")
-        } else if s.directing {
+        } else if s.directing() || (s.queued_direction.is_some() && s.pending_recordings.is_empty())
+        {
             Some("Applying guidance…")
         } else if s.queued_direction.is_some() {
             Some("Finishing captured thoughts…")
-        } else if s.direction_mode && s.director.is_none() {
+        } else if s.direction_mode && s.agent.is_none() {
             Some("Map guidance unavailable")
         } else if s.voice_worker.is_none() {
             Some("Voice unavailable")
@@ -410,7 +413,7 @@ fn voice_feedback(s: &State) -> &str {
         return &s.voice_status;
     }
     if s.direction_mode {
-        return if s.director.is_none() {
+        return if s.agent.is_none() {
             "Map guidance needs OpenRouter. You can still capture ideas in Brainstorm."
         } else {
             &s.direction_status
@@ -423,7 +426,7 @@ fn voice_feedback(s: &State) -> &str {
 }
 fn drawer(s: &State) -> El {
     let can_switch = !s.voice_in_progress()
-        && !s.directing
+        && !s.directing()
         && s.queued_direction.is_none()
         && s.pending_recordings.is_empty()
         && !s.video_busy();
@@ -700,32 +703,84 @@ fn concept_label(s: &State, id: u64) -> &str {
         .thoughts
         .iter()
         .chain(s.projection.session.retired.iter().map(|r| &r.thought))
+        .chain(s.projection.session.parked.iter().map(|p| &p.thought))
         .find(|t| t.id == id)
         .map_or("Related thought", |t| t.map_label())
 }
 
 fn selected(s: &State) -> Option<El> {
-    let t = s
-        .projection
-        .session
-        .thoughts
+    let session = &s.projection.session;
+    let parked = session
+        .parked
         .iter()
-        .chain(s.projection.session.retired.iter().map(|r| &r.thought))
-        .find(|t| Some(t.id) == s.selected)?;
-    let retired = s
-        .projection
-        .session
+        .find(|p| Some(p.thought.id) == s.selected);
+    let t = match parked {
+        Some(p) => &p.thought,
+        None => session
+            .thoughts
+            .iter()
+            .chain(session.retired.iter().map(|r| &r.thought))
+            .find(|t| Some(t.id) == s.selected)?,
+    };
+    let retired = session
         .retired
         .iter()
-        .find(|r| r.thought.id == t.id);
+        .find(|r| parked.is_none() && r.thought.id == t.id);
+    // Where the thought is: its branch, or why it waits beside the map.
+    let (place, tone) = match parked {
+        Some(p) => {
+            let mut place = format!("Parked · {}", p.kind.label());
+            // Parked with no subject of its own, a thought is filed under its kind alone.
+            if p.topic != p.kind.label() {
+                place = format!("{place} · {}", p.topic);
+            }
+            if p.held {
+                place.push_str(" · kept by you");
+            }
+            (place, MUTED)
+        }
+        None => (session.placement_path(t), color(t.role)),
+    };
     let mut controls = row().gap(6.0).center_y().child(
-        label(s.projection.session.placement_path(t), 11.0, color(t.role))
-            .help(s.projection.session.placement_path(t))
+        label(place.clone(), 11.0, tone)
+            .key("selected-place")
+            .help(place)
             .grow(1.0)
             .min_w(0.0)
             .truncate(),
     );
-    if s.replay.is_none() && !s.read_only && retired.is_none() {
+    let remove = || {
+        kit::tool(
+            Some(Icon::Trash),
+            "Remove",
+            "remove",
+            State::remove_selected,
+        )
+    };
+    let editable = s.replay.is_none() && !s.read_only && retired.is_none();
+    if let Some(p) = parked.filter(|_| editable) {
+        controls = controls.child(
+            kit::tool(
+                Some(Icon::Map),
+                "Bring back",
+                "revive",
+                State::revive_selected,
+            )
+            .help("Return this thought to the map."),
+        );
+        if !p.held {
+            controls = controls.child(
+                kit::tool(
+                    Some(Icon::Park),
+                    "Keep parked",
+                    "hold",
+                    State::hold_selected,
+                )
+                .help("Keep this off the map until you bring it back yourself."),
+            );
+        }
+        controls = controls.child(remove());
+    } else if editable {
         controls = controls
             .child(kit::tool(
                 Some(Icon::Branch),
@@ -733,12 +788,11 @@ fn selected(s: &State) -> Option<El> {
                 "move",
                 State::move_selected,
             ))
-            .child(kit::tool(
-                Some(Icon::Trash),
-                "Remove",
-                "remove",
-                State::remove_selected,
-            ));
+            .child(
+                kit::tool(Some(Icon::Park), "Park", "park", State::park_selected)
+                    .help("Set this beside the map. It can come back whenever you like."),
+            )
+            .child(remove());
         if t.pinned {
             controls = controls.child(kit::tool(
                 Some(Icon::Spark),
@@ -800,6 +854,45 @@ fn selected(s: &State) -> Option<El> {
             .child(kit::eyebrow("MAP HISTORY", MUTED).mt(4.0))
             .child(history);
     }
+    if let Some(p) = parked {
+        detail = detail.child(label(p.reason.clone(), 13.0, MUTED).key("parked-reason"));
+        // The whole lot, kept the way a facilitator keeps one: by why each thing waits.
+        for kind in [ParkKind::Later, ParkKind::OffTopic, ParkKind::Aside] {
+            let mut lot: Vec<_> = session.parked.iter().filter(|o| o.kind == kind).collect();
+            if lot.is_empty() {
+                continue;
+            }
+            // Newest first, with one subject's thoughts side by side.
+            lot.sort_by_cached_key(|o| session.parked.iter().rposition(|n| n.topic == o.topic));
+            lot.reverse();
+            let mut pills = row().gap(6.0).flex_wrap().grow(1.0).min_w(0.0);
+            for other in &lot {
+                let id = other.thought.id;
+                let name = short_label(other.thought.map_label());
+                // A subject is named only where the thought and its kind do not say it already.
+                let said = name.to_lowercase().starts_with(&other.topic.to_lowercase());
+                let title = if said || other.topic == kind.label() {
+                    name
+                } else {
+                    format!("{} › {name}", other.topic)
+                };
+                let pill = link(None, &title, &format!("parked-{id}"), id).help(&*other.reason);
+                pills = pills.child(if id == t.id {
+                    pill.fill(kit::wash(2.6))
+                } else {
+                    pill
+                });
+            }
+            // Each kind is one line, so all three can be read without scrolling.
+            let heading = format!("{} · {}", kind.label().to_uppercase(), lot.len());
+            let heading = row()
+                .w(96.0)
+                .h(32.0)
+                .center_y()
+                .child(kit::eyebrow(heading, MUTED));
+            detail = detail.child(row().gap(8.0).child(heading).child(pills));
+        }
+    }
     // Keep semantic cross-links discoverable after removing the right inspector.
     if let Some(i) = &s.projection.session.interpretation {
         let related = || {
@@ -828,12 +921,15 @@ fn has_transcript(s: &State) -> bool {
         || !s.projection.speech_segments.is_empty()
         || !s.projection.session.thoughts.is_empty()
         || !s.projection.session.retired.is_empty()
+        || !s.projection.session.parked.is_empty()
         || !s.live_text.is_empty()
 }
 
 fn dock(s: &State) -> El {
     let selected = selected(s);
     let inspecting = selected.is_some();
+    // The parking lot is a list as well as a thought, so it opens with the room to read it.
+    let lot = (s.projection.session.parked.iter()).any(|p| Some(p.thought.id) == s.selected);
     let mut dock = kit::card(col().key("composer")).gap(10.0).padding(14.0);
 
     if inspecting || has_transcript(s) || s.voice_in_progress() {
@@ -857,6 +953,18 @@ fn dock(s: &State) -> El {
                 "concept-history",
                 move |s| s.selected = Some(id),
             ));
+        }
+        if let Some(p) = s.projection.session.parked.last() {
+            let (id, count) = (p.thought.id, s.projection.session.parked.len());
+            tabs = tabs.child(
+                kit::tool(
+                    Some(Icon::Park),
+                    &format!("Parked · {count}"),
+                    "parking-lot",
+                    move |s| s.selected = Some(id),
+                )
+                .help("Thoughts kept beside the map: not yet, off topic, or asides."),
+            );
         }
         if !inspecting && s.replay.is_none() {
             if !s.transcript_following {
@@ -891,7 +999,7 @@ fn dock(s: &State) -> El {
                 tabs = tabs.child(kit::caption("Following live", 11.5, 500.0, GREEN).px(8.0));
             }
         }
-        if s.replay.is_none() {
+        if s.replay.is_none() && !lot {
             tabs = tabs.child(
                 kit::tool(
                     Some(if s.transcript_expanded {
@@ -913,7 +1021,7 @@ fn dock(s: &State) -> El {
         }
         let content = col()
             .key("transcript-scroll")
-            .h(if s.transcript_expanded {
+            .h(if s.transcript_expanded || lot {
                 (s.viewport[1] * 0.30).clamp(150.0, 320.0)
             } else if inspecting {
                 104.0
@@ -1418,7 +1526,8 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
         if !s.story {
             header = artwork(s, header);
         }
-        if !s.read_only && (!s.history.is_empty() || s.queued_direction.is_some()) {
+        if !s.read_only && (!s.history.is_empty() || s.queued_direction.is_some() || s.directing())
+        {
             header = header.child(kit::tool(Some(Icon::Undo), "Undo", "undo", State::undo));
         }
         if !empty || s.story {

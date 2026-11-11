@@ -60,7 +60,7 @@ fn live_content_equals_replay_without_any_presentation_track() {
             50,
             Event::SessionChanged {
                 change: SessionEvent::Restored {
-                    session: corrected.session.clone(),
+                    session: Box::new(corrected.session.clone()),
                     reason: "undo".into(),
                 },
             },
@@ -234,7 +234,7 @@ fn undo_does_not_reuse_historical_thought_ids() {
     .unwrap();
     p.apply(&Event::SessionChanged {
         change: SessionEvent::Restored {
-            session: initial,
+            session: Box::new(initial),
             reason: "undo".into(),
         },
     })

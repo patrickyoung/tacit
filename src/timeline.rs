@@ -244,6 +244,7 @@ impl Projection {
             .thoughts
             .iter()
             .chain(self.session.retired.iter().map(|r| &r.thought))
+            .chain(self.session.parked.iter().map(|p| &p.thought))
         {
             if t.evidence.is_empty() {
                 sources
@@ -259,7 +260,12 @@ impl Projection {
         sources
     }
     fn remember_sources(&mut self) {
-        for t in &self.session.thoughts {
+        let session = &self.session;
+        for t in session
+            .thoughts
+            .iter()
+            .chain(session.parked.iter().map(|p| &p.thought))
+        {
             if t.evidence.is_empty() {
                 self.source_words
                     .entry(format!("thought-{}", t.id))
@@ -652,7 +658,7 @@ impl Journal {
                 0,
                 Event::SessionChanged {
                     change: SessionEvent::Restored {
-                        session: legacy,
+                        session: Box::new(legacy),
                         reason: "initial/import".into(),
                     },
                 },

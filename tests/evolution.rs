@@ -173,7 +173,7 @@ fn source_ledger_survives_split_remove_and_restore() {
     .unwrap();
     p.apply(&Event::SessionChanged {
         change: SessionEvent::Restored {
-            session: original,
+            session: Box::new(original),
             reason: "undo".into(),
         },
     })

@@ -136,8 +136,6 @@ pub struct State {
     direction_mode: bool,
     direction_draft: TextEdit,
     queued_direction: Option<String>,
-    director: Option<tacit::direction::Worker>,
-    directing: bool,
     direction_status: String,
     selected: Option<u64>,
     history: Vec<Session>,
@@ -146,12 +144,10 @@ pub struct State {
     status: String,
     read_only: bool,
     story: bool,
+    /// The map agent, when OpenRouter is configured; `worker` is the local model otherwise.
+    agent: Option<tacit::agent::Worker>,
+    pace: tacit::agent::pace::Pace,
     worker: Option<tacit::organizer::Worker>,
-    reviewer: Option<tacit::evolution::Worker>,
-    review_requested: Option<u64>,
-    review_applied: Option<u64>,
-    fast_finished: Option<u64>,
-    review_due: f64,
     settling: f32,
     settled_at: f64,
     busy: bool,
@@ -164,7 +160,7 @@ pub struct State {
     previewed_draft: String,
     revealed_selection: Option<u64>,
     recording_worker: Option<tacit::recording::Worker>,
-    pending_recordings: std::collections::HashSet<u64>,
+    pending_recordings: std::collections::BTreeSet<u64>,
     voice_worker: Option<voice::Worker>,
     voice_state: VoiceState,
     voice_status: String,
@@ -323,7 +319,7 @@ impl State {
                 | VoiceState::Cancelling
         ) || !self.pending_recordings.is_empty()
             || self.video_busy()
-            || self.directing
+            || self.directing()
             || self.queued_direction.is_some()
         {
             self.status =
@@ -449,8 +445,6 @@ impl State {
             direction_mode: false,
             direction_draft: TextEdit::new(""),
             queued_direction: None,
-            director: None,
-            directing: false,
             direction_status: "Guide the categories, structure, and placement of your ideas".into(),
             selected: None,
             history: vec![],
@@ -459,12 +453,9 @@ impl State {
             status: "Demo · changes are not saved".into(),
             read_only: false,
             story: false,
+            agent: None,
+            pace: Default::default(),
             worker: None,
-            reviewer: None,
-            review_requested: None,
-            review_applied: None,
-            fast_finished: None,
-            review_due: 3.0,
             settling: 1.0,
             settled_at: -10.0,
             busy: false,
@@ -539,6 +530,74 @@ impl State {
         s.art = Garden::settled(&s.projection.session);
         s
     }
+    /// A map as the agent leaves it: keyword labels, a repeat combined with the thought it
+    /// repeats, cross-links, a thread to read, and a parking lot of each kind.
+    pub fn mapped_demo() -> Self {
+        let mut s = Self::demo();
+        let session = &mut s.projection.session;
+        for text in [
+            "We spend too long in meetings.",
+            "We could collect updates beforehand so that time is used for decisions.",
+            "On another topic, our hosting costs have doubled.",
+            "We should audit unused servers.",
+            "Coming back to meetings, having one owner for each decision would help too.",
+            "Hybrid days might change all of this.",
+            "Hang on, is this still recording?",
+        ] {
+            session.add(text);
+        }
+        let place = |thought: u64, branch: &str, concept: &str, role: &str| {
+            serde_json::json!({"op": "place", "thought": thought, "branch": branch,
+                "concept": concept, "role": role})
+        };
+        let park = |thought: u64, kind: &str, topic: &str, concept: &str, reason: &str| {
+            serde_json::json!({"op": "park", "thought": thought, "kind": kind, "topic": topic,
+                "concept": concept, "reason": reason})
+        };
+        let ops = serde_json::json!([
+            {"op": "focus", "focus": "Making room for meaningful work",
+                "principle": "What crowds the week, then what would give the time back"},
+            {"op": "branch", "id": "load", "name": "Meeting load"},
+            {"op": "branch", "id": "inclusion", "name": "Inclusion"},
+            {"op": "branch", "id": "ownership", "name": "Decision ownership"},
+            {"op": "branch", "id": "preparation", "name": "Preparation"},
+            place(1, "load", "Calendars fill up", "Observation"),
+            place(7, "load", "Meetings run long", "Observation"),
+            place(5, "inclusion", "Everyone invited", "Observation"),
+            place(3, "inclusion", "Need to feel included", "Tension"),
+            place(2, "ownership", "Who decides?", "Question"),
+            place(4, "ownership", "One owner per decision", "Possibility"),
+            place(6, "preparation", "Input before meetings", "Possibility"),
+            place(8, "preparation", "Updates beforehand", "Possibility"),
+            {"op": "combine", "into": 4, "from": [11], "concept": "One owner per decision"},
+            park(9, "off_topic", "Hosting costs", "Hosting costs doubled",
+                "A different subject from how the team meets and decides."),
+            park(10, "off_topic", "Hosting costs", "Audit unused servers",
+                "A different subject from how the team meets and decides."),
+            park(12, "later", "Hybrid days", "Hybrid days",
+                "No branch is about where people work yet."),
+            park(13, "aside", "Recording check", "Recording check",
+                "Housekeeping, with nothing to map."),
+            {"op": "links", "links": [
+                {"from": 5, "to": 3, "label": "driven by"},
+                {"from": 2, "to": 4, "label": "answered by"}]},
+            {"op": "narrative", "narrative": "Meetings take more of the week than they give \
+                back [1][7], partly because everyone is invited just in case [5] so that nobody \
+                feels left out [3]. Two things would give the time back: settling who decides \
+                [2][4], and doing the preparation beforehand [6][8]."},
+        ]);
+        let ops: Vec<tacit::agent::Op> = serde_json::from_value(ops).expect("scene edits");
+        *session = tacit::agent::replay(session, &ops).expect("scene map");
+        s.organizer_status = "✦ Combined a repeated call for one owner per decision".into();
+        s.art = Garden::settled(&s.projection.session);
+        s
+    }
+    /// The same map with the parking lot open on what was parked last.
+    pub fn parked_demo() -> Self {
+        let mut s = Self::mapped_demo();
+        s.selected = s.projection.session.parked.last().map(|p| p.thought.id);
+        s
+    }
     pub fn generated_demo() -> Self {
         let mut s = Self::themed_demo();
         s.gallery.load_demo(&s.projection.session);
@@ -575,7 +634,7 @@ impl State {
             ),
             VoiceCommand::Start => {
                 self.voice_state == VoiceState::Ready
-                    && !self.directing
+                    && !self.directing()
                     && self.queued_direction.is_none()
             }
             VoiceCommand::Retry(_) => matches!(
@@ -960,91 +1019,139 @@ impl State {
         }
         self.direction_mode = !self.direction_mode;
     }
+    /// The map agent is carrying out something the user asked of the map.
+    fn directing(&self) -> bool {
+        self.agent.is_some() && self.pace.flying(tacit::agent::Tier::Direct)
+    }
+    /// Queue what the user asked of the map. The next frame hands it to the agent, once
+    /// nothing spoken is still on its way to becoming a thought.
     fn submit_direction(&mut self) {
-        if self.read_only || self.replay.is_some() || self.directing {
+        if self.read_only || self.replay.is_some() || self.directing() {
             return;
         }
         let instruction = self.direction_draft.text.trim().to_owned();
         if instruction.is_empty() {
             return;
         }
-        self.queued_direction = Some(instruction);
-        self.start_queued_direction();
-    }
-    fn start_queued_direction(&mut self) {
-        if self.read_only || self.replay.is_some() || self.directing {
-            return;
-        }
-        if self.queued_direction.is_none() {
-            return;
-        }
-        if !self.pending_recordings.is_empty() {
-            self.direction_status =
-                "Finishing captured thoughts, then applying your guidance…".into();
-            return;
-        }
-        let instruction = self.queued_direction.take().unwrap();
-        let request = tacit::direction::Request {
-            session: self.projection.session.clone(),
-            instruction,
-        };
-        if self
-            .director
-            .as_ref()
-            .is_some_and(|w| w.send.send(request).is_ok())
-        {
-            self.directing = true;
-            self.direction_status = "Applying your guidance to the map…".into();
-        } else {
+        if self.agent.is_none() {
             self.direction_status =
                 "Map direction needs OpenRouter; your instruction is kept here".into();
+            return;
         }
+        self.queued_direction = Some(instruction);
+        self.direction_status = if self.pending_recordings.is_empty() {
+            "Applying your guidance to the map…"
+        } else {
+            "Finishing captured thoughts, then applying your guidance…"
+        }
+        .into();
     }
-    fn receive_direction(&mut self, response: tacit::direction::Response, now: f64) {
-        self.directing = false;
-        if self.read_only || self.replay.is_some() {
-            return;
+    /// Ask the agent for a turn of `tier` on the map as it stands. False: the agent is gone.
+    fn ask(&mut self, tier: tacit::agent::Tier, instruction: Option<String>, now: f64) -> bool {
+        // A directed turn is awaited under the epoch its own asking opens.
+        self.pace.sent(tier, &self.projection.session, now);
+        let request = tacit::agent::worker::Request {
+            epoch: self.pace.epoch(),
+            session: self.projection.session.clone(),
+            holds: self.pending_recordings.clone(),
+            instruction,
+        };
+        if self.agent.as_ref().is_some_and(|a| a.ask(tier, request)) {
+            return true;
         }
-        if tacit::timeline::content_hash(&self.projection.session)
-            .ok()
-            .as_ref()
-            != Some(&response.fingerprint)
+        self.pace.dropped(tier);
+        self.agent = None;
+        self.organizer_status = "Map agent stopped · editing by hand remains available".into();
+        false
+    }
+    /// Hand the queued instruction to the agent. True when it left the queue.
+    fn start_queued_direction(&mut self, now: f64) -> bool {
+        if self.read_only
+            || self.replay.is_some()
+            || self.directing()
+            || !self.pending_recordings.is_empty()
         {
-            self.direction_status = "The map changed while planning. Apply the instruction again to use the latest map.".into();
+            return false;
+        }
+        let Some(instruction) = self.queued_direction.take() else {
+            return false;
+        };
+        if self.ask(tacit::agent::Tier::Direct, Some(instruction), now) {
+            self.direction_status = "Applying your guidance to the map…".into();
+            self.organizer_status = "✦ Following your guidance…".into();
+        } else {
+            self.direction_status = "The map agent stopped; your instruction is kept here".into();
+        }
+        true
+    }
+    /// The agent's answer to an instruction. Whatever the user did by hand meanwhile stands:
+    /// the answer's edits are tried on the map as it is now.
+    fn receive_direction(&mut self, response: tacit::agent::worker::Response, now: f64) {
+        use tacit::agent::{self, Tier};
+        // Cancelled by an undo, or not the instruction now in flight: nobody waits for it.
+        if !self.pace.awaited(response.epoch) {
             return;
         }
-        match response.result {
-            Ok(plan) => {
-                if !plan.edits.is_empty() {
-                    let change = SessionEvent::Directed {
-                        instruction: response.instruction.clone(),
-                        edits: plan.edits,
-                    };
-                    if let Err(error) = change.reduce(&self.projection.session) {
-                        self.direction_status = error;
-                        return;
-                    }
-                    self.checkpoint();
-                    if let Err(error) = self.dispatch_session(change) {
-                        self.direction_status = error;
-                        return;
-                    }
-                    // Explicit edits remain stable until new brainstorming content arrives.
-                    self.requested = Some(self.revision);
-                    self.review_requested = Some(self.revision);
-                    self.review_applied = Some(self.revision);
-                    self.busy = false;
-                    self.settled_at = now;
-                    self.settling = 0.0;
-                    if self.direction_draft.text.trim() == response.instruction {
-                        self.direction_draft = TextEdit::new("");
-                    }
-                    self.save();
-                }
-                self.direction_status = plan.explanation;
+        let turn = match response.result {
+            Ok(turn) => turn,
+            Err(error) => {
+                self.pace.failed(Tier::Direct, now);
+                self.direction_status = error;
+                self.organizer_status = AGENT_IDLE.into();
+                return;
             }
-            Err(error) => self.direction_status = error,
+        };
+        let instruction = response.instruction.unwrap_or_default();
+        let outcome = agent::apply(
+            &self.projection.session,
+            &turn.ops,
+            Tier::Direct,
+            &self.pending_recordings,
+        );
+        let unmet = turn.unmet + outcome.rejected.len();
+        let changed = !outcome.ops.is_empty();
+        // Guidance that changes nothing today is still journaled when it says how the map is
+        // to be kept from now on.
+        if changed || turn.remember {
+            self.checkpoint();
+            let change = SessionEvent::Guided {
+                instruction: instruction.clone(),
+                ops: outcome.ops,
+                note: turn.note.clone(),
+            };
+            if let Err(error) = self.dispatch_session(change) {
+                self.history.pop();
+                self.pace.failed(Tier::Direct, now);
+                self.direction_status = error;
+                self.organizer_status = AGENT_IDLE.into();
+                return;
+            }
+            (self.settled_at, self.settling) = (now, 0.0);
+            if self.direction_draft.text.trim() == instruction {
+                self.direction_draft = TextEdit::new("");
+            }
+            self.save();
         }
+        // What the user asked for stands until new brainstorming content arrives.
+        self.pace
+            .landed(Tier::Direct, &self.projection.session, false, now);
+        let mut said = match (turn.note.trim(), changed, turn.remember) {
+            ("", true, _) => "Guidance applied to the map".to_owned(),
+            ("", false, true) => "Noted for how the map is kept from now on".to_owned(),
+            ("", false, false) => "Nothing on the map needed to change".to_owned(),
+            (note, ..) => note.to_owned(),
+        };
+        if unmet > 0 {
+            let edits = if unmet == 1 { "edit" } else { "edits" };
+            said += &format!(" · {unmet} {edits} did not fit the map");
+        }
+        self.direction_status = said;
+        self.organizer_status = if changed {
+            "✦ Map follows your guidance"
+        } else {
+            AGENT_IDLE
+        }
+        .into();
     }
     fn schedule_recording_split(&mut self, id: u64, words: &str) {
         let mut context = self.projection.session.clone();
@@ -1080,6 +1187,10 @@ impl State {
             return;
         };
         match response.result {
+            // Already one thought: nothing to split, and nothing for undo to step over.
+            Ok(chunks) if chunks.len() == 1 && chunks[0] == response.text => {
+                self.voice_status = "Recording saved as one thought".into();
+            }
             Ok(chunks)
                 if !chunks.is_empty()
                     && chunks.iter().all(|c| !c.trim().is_empty())
@@ -1402,7 +1513,7 @@ impl State {
             && (self.replay.is_some() || !self.read_only)
             && !self.voice_in_progress()
             && self.pending_recordings.is_empty()
-            && !self.directing
+            && !self.directing()
             && self.queued_direction.is_none()
             && !self.video_busy()
     }
@@ -1605,7 +1716,7 @@ impl State {
                 | VoiceState::Finishing
                 | VoiceState::Cancelling
         ) || !self.pending_recordings.is_empty()
-            || self.directing
+            || self.directing()
             || self.queued_direction.is_some()
         {
             return;
@@ -1738,7 +1849,7 @@ impl State {
             && let Some(j) = &self.journal
             && let Some((_, _, text)) = j.projection.transcripts.iter().rev().find(|(id, _, text)| {
                 j.projection.direction_recordings.contains(id) && !j.entries.iter().flat_map(|e| e.event.leaves()).any(|e| {
-                    matches!(e, tacit::timeline::Event::SessionChanged { change: SessionEvent::Directed { instruction, .. } } if instruction.trim() == text.trim())
+                    matches!(e, tacit::timeline::Event::SessionChanged { change: SessionEvent::Directed { instruction, .. } | SessionEvent::Guided { instruction, .. } } if instruction.trim() == text.trim())
                 })
             }) {
                 self.direction_mode = true;
@@ -1840,23 +1951,41 @@ impl State {
             if self.dispatch_session(change).is_err() {
                 return;
             }
+            self.pace.take_over(&self.projection.session);
             self.save();
         }
     }
-    fn unpin_selected(&mut self) {
+    /// One edit of the user's own to the selected thought. `own`: it changes the map itself,
+    /// so the agent's turns in flight no longer speak for it.
+    fn edit_selected(&mut self, change: impl FnOnce(u64) -> SessionEvent, own: bool) {
         if self.read_only {
             return;
         }
         if let Some(id) = self.selected {
             self.checkpoint();
-            if self
-                .dispatch_session(SessionEvent::Unpinned { id })
-                .is_err()
-            {
+            if self.dispatch_session(change(id)).is_err() {
                 return;
+            }
+            if own {
+                self.pace.take_over(&self.projection.session);
             }
             self.save();
         }
+    }
+    fn unpin_selected(&mut self) {
+        self.edit_selected(|id| SessionEvent::Unpinned { id }, false);
+    }
+    /// Set the selected thought beside the map. It stays selected, so it can come straight back.
+    fn park_selected(&mut self) {
+        self.edit_selected(|id| SessionEvent::Parked { id }, true);
+    }
+    /// Return a parked thought to the map, where the agent finds it a branch.
+    fn revive_selected(&mut self) {
+        self.edit_selected(|id| SessionEvent::Revived { id }, true);
+    }
+    /// Keep a parked thought off the map until the user says otherwise.
+    fn hold_selected(&mut self) {
+        self.edit_selected(|id| SessionEvent::Held { id }, false);
     }
     fn remove_selected(&mut self) {
         if self.read_only {
@@ -1867,6 +1996,7 @@ impl State {
             if self.dispatch_session(SessionEvent::Removed { id }).is_err() {
                 return;
             }
+            self.pace.take_over(&self.projection.session);
             self.save();
         }
     }
@@ -1874,22 +2004,29 @@ impl State {
         if self.read_only {
             return;
         }
-        self.pending_recordings.clear();
-        if self.queued_direction.take().is_some() {
-            self.direction_status =
-                "Pending guidance cancelled; your instruction is kept here".into();
+        // Guidance that has not reached the map is the latest thing to take back. An answer
+        // still on its way finds nobody waiting for it.
+        if self.queued_direction.take().is_some() || self.directing() {
+            self.pace.dropped(tacit::agent::Tier::Direct);
+            self.direction_status = "Guidance cancelled; your instruction is kept here".into();
+            if self.agent.is_some() {
+                self.organizer_status = AGENT_IDLE.into();
+            }
+            return;
         }
+        self.pending_recordings.clear();
         if let Some(previous) = self.history.pop() {
             self.revision += 1;
             if self
                 .dispatch_session(SessionEvent::Restored {
-                    session: previous,
+                    session: Box::new(previous),
                     reason: "undo".into(),
                 })
                 .is_err()
             {
                 return;
             }
+            self.pace.take_over(&self.projection.session);
             self.selected = None;
             self.save();
         }
@@ -3330,7 +3467,7 @@ fn legacy_view(s: &State, cx: &mut Cx<State>) -> El {
                 .child(
                     button(
                         if s.direction_mode {
-                            if s.directing {
+                            if s.directing() {
                                 "Considering…"
                             } else {
                                 "Apply direction ↗"
@@ -3841,22 +3978,16 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
     };
     match cloud {
         Ok(Some(config)) => {
-            s.organizer_status = "OpenRouter · quick themes + thoughtful review".into();
+            s.organizer_status = AGENT_IDLE.into();
             if std::env::var("TACIT_IMAGE_ART").as_deref() != Ok("off") {
                 s.gallery.worker = Some(generated_art::Worker::start(config.clone(), wake.clone()));
                 s.gallery.status = "Art · ready to compose a mural".into();
             }
             let recording_wake = wake.clone();
-            let direction_wake = wake.clone();
-            s.director = Some(tacit::direction::Worker::start(config.clone(), move || {
-                direction_wake()
-            }));
             s.recording_worker = Some(tacit::recording::Worker::start(config.clone(), move || {
                 recording_wake()
             }));
-            let fast_wake = wake.clone();
-            s.worker = Some(config.start(false, move || fast_wake()));
-            s.reviewer = Some(tacit::evolution::Worker::start(config, move || wake()));
+            s.agent = Some(tacit::agent::Worker::start(config, move || wake()));
             return;
         }
         Err(error) => {
@@ -4046,6 +4177,13 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         .as_ref()
         .and_then(|w| w.receive.try_recv().ok())
     {
+        // Words on their way are not a pause, even before they land as a thought.
+        if matches!(
+            event,
+            VoiceEvent::Partial { .. } | VoiceEvent::Segment { .. }
+        ) {
+            s.pace.speaking(now);
+        }
         s.receive_voice(event, now);
         changed = true;
     }
@@ -4059,6 +4197,7 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     if s.previewed_draft != s.draft.text {
         s.previewed_draft.clone_from(&s.draft.text);
+        s.pace.speaking(now);
         if !s.modern_ui && !s.draft.text.trim().is_empty() {
             tx.scroll_into_view("draft-preview");
         }
@@ -4084,23 +4223,10 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         s.receive_recording(response);
         changed = true;
     }
-    while let Some(response) = s.director.as_ref().and_then(|w| w.receive.try_recv().ok()) {
-        s.receive_direction(response, now);
+    // Guidance waits for the agent, and without one nothing would ever take it from the queue.
+    if (s.read_only || s.agent.is_none()) && s.queued_direction.take().is_some() {
+        s.direction_status = "The map agent is not running; your instruction is kept here".into();
         changed = true;
-    }
-    if !s.read_only
-        && s.queued_direction.is_some()
-        && s.pending_recordings.is_empty()
-        && !s.directing
-    {
-        s.start_queued_direction();
-        changed = true;
-    }
-    if s.directing || s.queued_direction.is_some() {
-        return changed;
-    }
-    if s.worker.is_none() {
-        return changed;
     }
     let progress = ((now - s.settled_at) / 0.85).clamp(0.0, 1.0) as f32;
     if s.settling != progress {
@@ -4109,76 +4235,198 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     if s.settling < 1.0 || s.busy {
         s.pulse = ((now * 3.0).sin() as f32 + 1.0) / 2.0;
-        tx.wake_after(std::time::Duration::from_millis(33));
         changed = true;
     }
-    while let Some(response) = s.reviewer.as_ref().and_then(|w| w.receive.try_recv().ok()) {
-        if response.revision == s.revision {
-            s.busy = false;
-            match response.result.and_then(|plan| {
-                let explanation = plan.explanation.clone();
-                let event = tacit::timeline::Event::MapRevised {
-                    fingerprint: response.fingerprint,
-                    plan,
-                };
-                s.projection
-                    .clone()
-                    .apply(&event)
-                    .map_err(|e| e.to_string())?;
-                s.checkpoint();
-                s.dispatch(event)?;
-                Ok(explanation)
-            }) {
-                Ok(explanation) => {
-                    s.review_applied = Some(s.revision);
-                    s.requested = Some(s.revision);
-                    s.review_requested = Some(s.revision);
-                    if s.selected
-                        .is_some_and(|id| !s.projection.session.thoughts.iter().any(|t| t.id == id))
-                    {
-                        // Keep the selected retired item inspectable, with its replacement links.
-                        s.revealed_selection = s.selected;
-                    }
-                    s.organizer_status = format!("✦ {explanation}");
-                    s.settled_at = now;
-                    s.settling = 0.0;
-                    s.save();
+    changed |= if s.agent.is_some() {
+        attend(s, now, tx)
+    } else if s.worker.is_some() {
+        organize_locally(s, now, tx)
+    } else {
+        std::mem::take(&mut s.busy)
+    };
+    if s.busy || s.settling < 1.0 {
+        tx.wake_after(std::time::Duration::from_millis(33));
+    }
+    changed
+}
+/// The map agent's side of a frame: take in the turns that came back, then ask for the next.
+fn attend(s: &mut State, now: f64, tx: &mut Tx) -> bool {
+    use tacit::agent::{self, Tier, brief, pace::Due};
+    let mut changed = false;
+    while !s.read_only
+        && let Some(response) = s.agent.as_ref().and_then(|a| a.receive.try_recv().ok())
+    {
+        changed = true;
+        let tier = response.tier;
+        if tier == Tier::Direct {
+            s.receive_direction(response, now);
+            continue;
+        }
+        let turn = match response.result {
+            Ok(turn) if s.pace.current(response.epoch) => turn,
+            // Briefed before the user took the map into their own hands.
+            Ok(_) => {
+                s.pace.dropped(tier);
+                if !s.directing() {
+                    s.organizer_status = AGENT_IDLE.into();
                 }
-                Err(e) => s.organizer_status = format!("Review: {e} · current map retained"),
+                continue;
+            }
+            Err(error) => {
+                s.pace.failed(tier, now);
+                s.organizer_status = error;
+                continue;
+            }
+        };
+        let waiting =
+            |s: &State| brief::waiting(&s.projection.session, &s.pending_recordings).len();
+        let before = waiting(s);
+        // The speaker may have said more since the turn was briefed, so its edits are tried
+        // against the map as it is now.
+        let outcome = agent::apply(
+            &s.projection.session,
+            &turn.ops,
+            tier,
+            &s.pending_recordings,
+        );
+        let said = report(&s.projection.session, tier, &outcome.ops, &turn.note);
+        if !outcome.ops.is_empty() {
+            // Filing keeps up with the speaker. A restructure is a step they can undo.
+            if tier == Tier::Steward {
+                s.checkpoint();
+            }
+            let change = SessionEvent::Mapped {
+                ops: outcome.ops,
+                pass: tier.name().into(),
+                note: turn.note,
+            };
+            if let Err(error) = s.dispatch_session(change) {
+                if tier == Tier::Steward {
+                    s.history.pop();
+                }
+                s.pace.failed(tier, now);
+                s.organizer_status = error;
+                continue;
+            }
+            (s.settled_at, s.settling) = (now, 0.0);
+            s.save();
+        }
+        s.pace
+            .landed(tier, &s.projection.session, waiting(s) < before, now);
+        if turn.escalate.is_some() {
+            s.pace.call();
+        }
+        s.organizer_status = said;
+    }
+    if s.read_only {
+        // Nothing more can be written, so no turn is worth paying for.
+        (s.agent, s.busy) = (None, false);
+        return true;
+    }
+    changed |= s.start_queued_direction(now);
+    let directing = s.directing();
+    match s
+        .pace
+        .due(&s.projection.session, &s.pending_recordings, now)
+    {
+        Due::Ask(tier) => {
+            if s.ask(tier, None, now) {
+                s.organizer_status = match tier {
+                    Tier::Place => "Finding a home for your thoughts…",
+                    _ => "✦ Stepping back · refining the whole map…",
+                }
+                .into();
             }
             changed = true;
+        }
+        Due::At(at) => tx.wake_after(std::time::Duration::from_secs_f64((at - now).max(0.01))),
+        Due::Rest => {
+            if agent::at_limit(&s.projection.session) && s.organizer_status != agent::AT_LIMIT {
+                s.organizer_status = agent::AT_LIMIT.into();
+                changed = true;
+            }
         }
     }
-    while let Some(response) = s.worker.as_ref().and_then(|w| w.receive.try_recv().ok()) {
-        if response.revision == s.revision && s.review_applied != Some(s.revision) {
-            s.fast_finished = Some(s.revision);
-            s.busy = false;
-            match response.result.and_then(|interpretation| {
-                s.dispatch_session(SessionEvent::Organized {
-                    interpretation,
-                    pass: "fast".into(),
-                })
-            }) {
-                Ok(()) => {
-                    s.organizer_status = if s.reviewer.is_some() {
-                        "Quick themes ready · review follows after a pause"
-                    } else {
-                        "Organized by local model · suggestions"
-                    }
-                    .into();
-                    s.settled_at = now;
-                    s.settling = 0.0;
-                    s.save();
-                }
-                Err(e) => s.organizer_status = format!("{e} · keeping local organization"),
-            }
-            changed = true;
+    if directing && !s.directing() {
+        // Its lane went quiet for good, and the pace gave up on it.
+        s.direction_status = "The map agent did not answer; your instruction is kept here".into();
+        s.organizer_status = AGENT_IDLE.into();
+        changed = true;
+    }
+    let busy = s.agent.is_some() && s.pace.busy();
+    changed |= busy != s.busy;
+    s.busy = busy;
+    changed
+}
+/// The agent's status line when it has nothing to report.
+const AGENT_IDLE: &str = "Map agent · files each thought, steps back in the pauses";
+/// What a turn's edits did to the map as it stood in `before`, for the status line.
+fn report(
+    before: &Session,
+    tier: tacit::agent::Tier,
+    ops: &[tacit::agent::Op],
+    note: &str,
+) -> String {
+    use tacit::agent::{Op, Tier};
+    if tier == Tier::Steward {
+        return match (ops.is_empty(), note.trim()) {
+            (true, _) => "Stepped back · the map holds as it is".into(),
+            (false, "") => "✦ Map refined".into(),
+            (false, note) => format!("✦ {note}"),
+        };
+    }
+    let parked = |id: &u64| before.parked.iter().any(|p| p.thought.id == *id);
+    let (mut filed, mut back, mut aside) = (0, 0, 0);
+    for op in ops {
+        match op {
+            Op::Place { thought, .. } if parked(thought) => back += 1,
+            Op::Place { .. } => filed += 1,
+            Op::Park { .. } => aside += 1,
+            _ => {}
         }
+    }
+    let thoughts = |n: usize| format!("{n} thought{}", if n == 1 { "" } else { "s" });
+    let mut said = [
+        (filed, format!("filed {}", thoughts(filed))),
+        (back, format!("brought {} back", thoughts(back))),
+        (aside, format!("parked {}", thoughts(aside))),
+    ]
+    .into_iter()
+    .filter_map(|(count, part)| (count > 0).then_some(part))
+    .collect::<Vec<_>>()
+    .join(" · ");
+    if said.is_empty() {
+        return "Still weighing where these belong…".into();
+    }
+    said[..1].make_ascii_uppercase();
+    said
+}
+/// The local model's side of a frame: one pass over the whole map after each change.
+fn organize_locally(s: &mut State, now: f64, tx: &mut Tx) -> bool {
+    let mut changed = false;
+    while let Some(response) = s.worker.as_ref().and_then(|w| w.receive.try_recv().ok()) {
+        if response.revision != s.revision {
+            continue;
+        }
+        s.busy = false;
+        match response.result.and_then(|interpretation| {
+            s.dispatch_session(SessionEvent::Organized {
+                interpretation,
+                pass: "fast".into(),
+            })
+        }) {
+            Ok(()) => {
+                s.organizer_status = "Organized by local model · suggestions".into();
+                (s.settled_at, s.settling) = (now, 0.0);
+                s.save();
+            }
+            Err(e) => s.organizer_status = format!("{e} · keeping local organization"),
+        }
+        changed = true;
     }
     if s.observed != s.revision {
         s.observed = s.revision;
         s.due = now + 0.18;
-        s.review_due = now + 3.0;
         s.busy = false;
     }
     if s.requested != Some(s.revision) && !s.projection.session.thoughts.is_empty() {
@@ -4187,7 +4435,10 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 revision: s.revision,
                 session: s.projection.session.clone(),
             };
-            if s.worker.as_ref().unwrap().send.send(request).is_ok() {
+            if s.worker
+                .as_ref()
+                .is_some_and(|w| w.send.send(request).is_ok())
+            {
                 s.organizer_status = "Finding a home for your thoughts…".into();
                 s.busy = true;
             } else {
@@ -4198,32 +4449,6 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         } else {
             tx.wake_after(std::time::Duration::from_secs_f64((s.due - now).max(0.01)));
         }
-    }
-    if let Some(reviewer) = &s.reviewer
-        && s.review_requested != Some(s.revision)
-        && s.fast_finished == Some(s.revision)
-        && !s.projection.session.thoughts.is_empty()
-    {
-        if now >= s.review_due {
-            let request = tacit::evolution::Request {
-                revision: s.revision,
-                session: s.projection.session.clone(),
-                sources: s.projection.evidence(),
-            };
-            if reviewer.send.send(request).is_ok() {
-                s.organizer_status = "✦ Stepping back · refining the whole map…".into();
-                s.busy = true;
-            }
-            s.review_requested = Some(s.revision);
-            changed = true;
-        } else {
-            tx.wake_after(std::time::Duration::from_secs_f64(
-                (s.review_due - now).max(0.01),
-            ));
-        }
-    }
-    if s.busy || s.settling < 1.0 {
-        tx.wake_after(std::time::Duration::from_millis(33));
     }
     changed
 }
@@ -4330,7 +4555,7 @@ mod tests {
             4.0,
         );
         assert!(s.projection.session.thoughts.is_empty());
-        assert!(!s.directing);
+        assert!(!s.directing());
     }
 
     fn mural_fixture() -> tacit::artist::Mural {
@@ -4436,7 +4661,8 @@ mod tests {
         assert!(s.projection.session.thoughts.is_empty());
         assert_eq!(s.draft.text, "An unfinished idea");
         assert_eq!(s.direction_draft.text, "Put decisions first");
-        assert!(!s.directing); // No provider: retain instruction, never fall back to capture.
+        // No provider: retain instruction, never fall back to capture.
+        assert!(!s.directing() && s.queued_direction.is_none());
         s.voice_state = VoiceState::Recording;
         s.toggle_direction();
         assert!(s.direction_mode);
@@ -4444,7 +4670,6 @@ mod tests {
     #[test]
     fn spoken_guidance_resumes_once_after_splitting_and_refines_the_latest_map() {
         use std::sync::mpsc;
-        use tacit::direction::{Classification, Edit, Placement};
         let mut s = State::empty();
         let recording = "Hosting costs doubled. We could remove unused replicas.";
         s.draft = TextEdit::new(recording);
@@ -4455,16 +4680,15 @@ mod tests {
         let (send, _split_requests) = mpsc::channel();
         let (split_results, receive) = mpsc::channel();
         s.recording_worker = Some(tacit::recording::Worker { send, receive });
-        let (send, requests) = mpsc::channel();
-        let (results, receive) = mpsc::channel();
-        s.director = Some(tacit::direction::Worker { send, receive });
+        let (_placing, _stewarding, mut requests, answer) = lanes(&mut s);
         s.direction_mode = true;
         let instruction = "Could you separate hiring from infrastructure costs?";
         s.receive_voice(VoiceEvent::Transcript(instruction.into()), 1.0);
         assert_eq!(s.queued_direction.as_deref(), Some(instruction));
         assert_eq!(s.direction_draft.text, instruction);
         assert_eq!(s.projection.session.thoughts.len(), 2);
-        assert!(!s.directing);
+        poll_live(&mut s, 1.5, &mut Tx::default());
+        assert!(!s.directing());
         assert!(requests.try_recv().is_err());
 
         split_results
@@ -4489,50 +4713,23 @@ mod tests {
             .unwrap();
         poll_live(&mut s, 3.0, &mut Tx::default());
         let request = requests.try_recv().unwrap();
-        assert_eq!(request.instruction, instruction);
+        assert_eq!(request.instruction.as_deref(), Some(instruction));
         assert_eq!(request.session, s.projection.session);
         assert_eq!(request.session.thoughts.len(), 3);
         assert!(s.queued_direction.is_none());
-        assert!(s.directing);
+        assert!(s.directing());
         assert!(!s.can_switch_session());
         let before = request.session.clone();
-        results
-            .send(tacit::direction::Response {
-                fingerprint: tacit::timeline::content_hash(&request.session).unwrap(),
-                instruction: request.instruction,
-                result: Ok(tacit::direction::Plan {
-                    explanation: "Separated hiring from infrastructure costs.".into(),
-                    edits: vec![Edit::RefineCategories {
-                        classification: Classification {
-                            categories: ["hiring", "cloud-costs"]
-                                .iter()
-                                .map(|name| tacit::model::Category {
-                                    id: (*name).into(),
-                                    name: (*name).into(),
-                                    parent: None,
-                                    motif: None,
-                                    illustration: None,
-                                })
-                                .collect(),
-                            placements: request
-                                .session
-                                .thoughts
-                                .iter()
-                                .map(|t| Placement {
-                                    id: t.id,
-                                    category: if t.id == 2 { "hiring" } else { "cloud-costs" }
-                                        .into(),
-                                })
-                                .collect(),
-                        },
-                    }],
-                }),
-            })
-            .unwrap();
+        let mut ops = vec![grow("hiring", "Hiring"), grow("cloud-costs", "Cloud costs")];
+        let home = |id| if id == 2 { "hiring" } else { "cloud-costs" };
+        ops.extend(before.thoughts.iter().map(|t| file(t.id, home(t.id))));
+        let note = "Separated hiring from infrastructure costs.";
+        answer.send(directed(&request, ops, note)).unwrap();
         poll_live(&mut s, 4.0, &mut Tx::default());
         assert!(requests.try_recv().is_err());
-        assert!(!s.directing);
+        assert!(!s.directing());
         assert!(s.direction_draft.text.is_empty());
+        assert_eq!(s.direction_status, note);
         assert_eq!(s.projection.session.categories.len(), 2);
         assert_eq!(s.projection.session.directions, [instruction]);
         assert!(
@@ -4540,27 +4737,128 @@ mod tests {
                 .session
                 .thoughts
                 .iter()
-                .all(|t| !t.pinned && t.text != instruction)
+                .all(|t| t.category.is_some() && !t.pinned && t.text != instruction)
         );
         s.undo();
         assert_eq!(s.projection.session, before);
     }
     #[test]
     fn undo_cancels_queued_guidance_and_keeps_its_draft() {
-        use std::sync::mpsc;
         let mut s = State::empty();
         s.pending_recordings.insert(1);
         s.direction_draft = TextEdit::new("Refine these categories");
-        let (send, requests) = mpsc::channel();
-        let (_results, receive) = mpsc::channel();
-        s.director = Some(tacit::direction::Worker { send, receive });
+        let (_placing, _stewarding, mut requests, _answer) = lanes(&mut s);
         s.submit_direction();
         assert!(s.queued_direction.is_some());
         s.undo();
-        poll_live(&mut s, 1.0, &mut Tx::default());
         assert!(s.queued_direction.is_none());
+        // The capture it waited for finishes: nothing is left to send.
+        s.pending_recordings.clear();
+        poll_live(&mut s, 1.0, &mut Tx::default());
         assert_eq!(s.direction_draft.text, "Refine these categories");
         assert!(requests.try_recv().is_err());
+        assert!(!s.directing());
+    }
+    #[test]
+    fn undo_takes_back_guidance_in_flight_and_a_late_answer_changes_nothing() {
+        let mut s = State::empty();
+        s.draft = TextEdit::new("Hosting costs doubled");
+        s.capture();
+        let (_placing, _stewarding, mut requests, answer) = lanes(&mut s);
+        let words = "Start a branch for costs";
+        let first = instruct(&mut s, &mut requests, words, 1.0);
+        assert!(s.directing() && !s.can_switch_session());
+        let before = s.projection.session.clone();
+        s.undo();
+        // The instruction is what undo took back, not the thought before it.
+        assert!(!s.directing());
+        assert_eq!(s.projection.session, before);
+        assert_eq!(s.direction_draft.text, words);
+        let ops = || vec![grow("costs", "Costs"), file(1, "costs")];
+        answer.send(directed(&first, ops(), "Done")).unwrap();
+        poll_live(&mut s, 2.0, &mut Tx::default());
+        assert_eq!(s.projection.session, before);
+        // Asked again, it is a new turn: the first answer still counts for nothing.
+        let second = instruct(&mut s, &mut requests, words, 3.0);
+        answer.send(directed(&first, ops(), "Done")).unwrap();
+        poll_live(&mut s, 4.0, &mut Tx::default());
+        assert!(s.directing());
+        assert_eq!(s.projection.session, before);
+        answer.send(directed(&second, ops(), "")).unwrap();
+        poll_live(&mut s, 5.0, &mut Tx::default());
+        assert!(!s.directing());
+        assert_eq!(s.projection.session.categories.len(), 1);
+        assert_eq!(s.direction_status, "Guidance applied to the map");
+        assert!(s.direction_draft.text.is_empty());
+    }
+    #[test]
+    fn guidance_parks_holds_and_brings_thoughts_back_on_the_users_word() {
+        use tacit::agent::{Op, Tier};
+        use tacit::model::ParkKind;
+        let mut s = State::empty();
+        for words in [
+            "Signup asks for fourteen fields",
+            "Pricing tiers confuse buyers",
+            "The coffee machine is broken",
+        ] {
+            s.draft = TextEdit::new(words);
+            s.capture();
+        }
+        let (mut placing, _stewarding, mut requests, answer) = lanes(&mut s);
+        let park = |thought, kind, topic: &str| Op::Park {
+            thought,
+            kind,
+            topic: topic.into(),
+            reason: "Not what this session is about".into(),
+            concept: Some(format!("Concept {thought}")),
+        };
+        let parked = |s: &State, id| {
+            let lot = s.projection.session.parked.iter();
+            lot.filter(|p| p.thought.id == id)
+                .map(|p| (p.kind, p.held))
+                .next()
+        };
+        // The agent files one thought and sets two aside on its own judgement.
+        poll_live(&mut s, 1.0, &mut Tx::default());
+        let asked = placing.try_recv().unwrap();
+        let ops = vec![
+            grow("signup", "Signup"),
+            file(1, "signup"),
+            park(2, ParkKind::Later, "Pricing"),
+            park(3, ParkKind::OffTopic, "Office"),
+        ];
+        answer
+            .send(turned(asked.epoch, Tier::Place, ops, ""))
+            .unwrap();
+        poll_live(&mut s, 2.0, &mut Tx::default());
+        assert_eq!(parked(&s, 2), Some((ParkKind::Later, false)));
+        assert_eq!(parked(&s, 3), Some((ParkKind::OffTopic, false)));
+        let agents = s.projection.session.clone();
+
+        let words = "Bring pricing back, keep the coffee machine out, and leave signup for later";
+        let request = instruct(&mut s, &mut requests, words, 3.0);
+        assert!(request.holds.is_empty());
+        let ops = vec![
+            grow("pricing", "Pricing"),
+            file(2, "pricing"),
+            park(3, ParkKind::OffTopic, "Office"),
+            park(1, ParkKind::Later, "Signup"),
+        ];
+        answer
+            .send(directed(&request, ops, "Pricing is back on the map"))
+            .unwrap();
+        poll_live(&mut s, 4.0, &mut Tx::default());
+        let session = &s.projection.session;
+        let back = session.thoughts.iter().find(|t| t.id == 2).unwrap();
+        assert!(back.kept && back.category.as_deref() == Some("pricing"));
+        // What the user decided is held against the agent's own later turns.
+        assert_eq!(parked(&s, 3), Some((ParkKind::OffTopic, true)));
+        assert_eq!(parked(&s, 1), Some((ParkKind::Later, true)));
+        assert_eq!(s.direction_status, "Pricing is back on the map");
+        assert_eq!(s.organizer_status, "✦ Map follows your guidance");
+        // One step back is the parking lot as the agent left it.
+        s.undo();
+        assert_eq!(s.projection.session, agents);
     }
     #[test]
     fn final_transcript_only_adds_missing_live_windows() {
@@ -4635,32 +4933,34 @@ mod tests {
         assert_eq!(s.direction_draft.text, "Rename the map");
     }
     #[test]
-    fn directions_are_replayable_undoable_and_stale_plans_are_rejected() {
+    fn guidance_is_journaled_replayable_undoable_and_lands_once() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = State::open_session(dir.path().join("session.json")).unwrap();
         s.draft = TextEdit::new("A real idea");
         s.capture();
+        let (_placing, _stewarding, mut requests, answer) = lanes(&mut s);
+        let instruction = "Call this map Research";
+        let request = instruct(&mut s, &mut requests, instruction, 1.0);
         let before = s.projection.session.clone();
-        let fingerprint = tacit::timeline::content_hash(&before).unwrap();
-        let response = || tacit::direction::Response {
-            fingerprint: fingerprint.clone(),
-            instruction: "Call this map Research".into(),
-            result: Ok(tacit::direction::Plan {
-                explanation: "Renamed the central theme to Research".into(),
-                edits: vec![tacit::direction::Edit::SetTitle {
-                    title: "Research".into(),
-                }],
-            }),
+        let response = || {
+            let title = tacit::agent::Op::Title {
+                title: "Research".into(),
+            };
+            directed(&request, vec![title], "Renamed the map to Research")
         };
-        s.receive_direction(response(), 2.0);
+        answer.send(response()).unwrap();
+        poll_live(&mut s, 2.0, &mut Tx::default());
         assert_eq!(s.projection.session.title, "Research");
         assert_eq!(s.projection.session.thoughts, before.thoughts);
+        assert_eq!(s.projection.session.directions, [instruction]);
+        assert_eq!(s.direction_status, "Renamed the map to Research");
         let j = s.journal.as_ref().unwrap();
         assert_eq!(j.at(j.duration()).unwrap().session, s.projection.session);
         let changed = s.projection.session.clone();
-        s.receive_direction(response(), 3.0);
+        // The same answer again: nobody is waiting for it any more.
+        answer.send(response()).unwrap();
+        poll_live(&mut s, 3.0, &mut Tx::default());
         assert_eq!(s.projection.session, changed);
-        assert!(s.direction_status.contains("map changed"));
         s.undo();
         assert_eq!(s.projection.session, before);
     }
@@ -5324,53 +5624,445 @@ mod tests {
         assert_eq!(state.projection.session, before);
         assert!(state.organizer_status.contains("test timeout"));
     }
+    type Asked = tokio::sync::mpsc::UnboundedReceiver<tacit::agent::worker::Request>;
+    type Answer = std::sync::mpsc::Sender<tacit::agent::worker::Response>;
+    /// A map agent whose lanes the test reads and answers by hand: the placer's, the
+    /// steward's, and the one for what the user asks of the map.
+    fn lanes(s: &mut State) -> (Asked, Asked, Asked, Answer) {
+        let (place, placing) = tokio::sync::mpsc::unbounded_channel();
+        let (steward, stewarding) = tokio::sync::mpsc::unbounded_channel();
+        let (direct, directing) = tokio::sync::mpsc::unbounded_channel();
+        let (answer, receive) = std::sync::mpsc::channel();
+        s.agent = Some(tacit::agent::Worker {
+            place,
+            steward,
+            direct,
+            receive,
+        });
+        (placing, stewarding, directing, answer)
+    }
+    /// The same for a test in which nobody gives the map an instruction.
+    fn agent(s: &mut State) -> (Asked, Asked, Answer) {
+        let (placing, stewarding, _, answer) = lanes(s);
+        (placing, stewarding, answer)
+    }
+    fn turned(
+        epoch: u64,
+        tier: tacit::agent::Tier,
+        ops: Vec<tacit::agent::Op>,
+        note: &str,
+    ) -> tacit::agent::worker::Response {
+        let turn = tacit::agent::Turn {
+            tier,
+            ops,
+            note: note.into(),
+            escalate: None,
+            remember: false,
+            refused: vec![],
+            unmet: 0,
+            garbled: false,
+            usage: Default::default(),
+        };
+        tacit::agent::worker::Response {
+            epoch,
+            tier,
+            instruction: None,
+            result: Ok(turn),
+        }
+    }
+    /// The agent's answer to the instruction a request carried.
+    fn directed(
+        request: &tacit::agent::worker::Request,
+        ops: Vec<tacit::agent::Op>,
+        note: &str,
+    ) -> tacit::agent::worker::Response {
+        let mut response = turned(request.epoch, tacit::agent::Tier::Direct, ops, note);
+        response.instruction = request.instruction.clone();
+        response
+    }
+    /// Type an instruction and let a frame hand it to the agent.
+    fn instruct(
+        s: &mut State,
+        asked: &mut Asked,
+        words: &str,
+        at: f64,
+    ) -> tacit::agent::worker::Request {
+        s.direction_draft = TextEdit::new(words);
+        s.submit_direction();
+        poll_live(s, at, &mut Tx::default());
+        asked.try_recv().unwrap()
+    }
+    fn grow(id: &str, name: &str) -> tacit::agent::Op {
+        tacit::agent::Op::Branch {
+            id: id.into(),
+            name: name.into(),
+            parent: None,
+        }
+    }
+    fn file(thought: u64, branch: &str) -> tacit::agent::Op {
+        tacit::agent::Op::Place {
+            thought,
+            branch: branch.into(),
+            concept: Some(format!("Concept {thought}")),
+            role: None,
+        }
+    }
     #[test]
-    fn review_waits_for_fast_pass_and_quiet_period_and_rejects_old_edits() {
-        use std::sync::mpsc;
-        let mut s = State::demo();
-        let (fast_send, fast_requests) = mpsc::channel();
-        let (fast_response, fast_receive) = mpsc::channel();
-        let (review_send, review_requests) = mpsc::channel();
-        let (review_response, review_receive) = mpsc::channel();
-        s.worker = Some(tacit::organizer::Worker {
-            send: fast_send,
-            receive: fast_receive,
-        });
-        s.reviewer = Some(tacit::evolution::Worker {
-            send: review_send,
-            receive: review_receive,
-        });
-        s.revision = 1;
+    fn the_agent_files_thoughts_at_once_parks_and_steps_back_in_the_pause() {
+        use tacit::agent::{Op, Tier};
+        let mut s = State::empty();
+        let (mut placing, mut stewarding, answer) = agent(&mut s);
         let mut tx = Tx::default();
         poll(&mut s, 0.0, &mut tx);
-        assert!(fast_requests.try_recv().is_err());
-        poll(&mut s, 0.2, &mut tx);
-        assert_eq!(fast_requests.try_recv().unwrap().revision, 1);
-        assert!(review_requests.try_recv().is_err());
-        fast_response
-            .send(tacit::organizer::Response {
-                revision: 1,
-                result: Err("fixture".into()),
-            })
+        assert!(placing.try_recv().is_err());
+        for words in [
+            "Meetings eat the whole morning",
+            "Nobody knows who decides",
+            "My bike needs a new chain",
+        ] {
+            s.draft = TextEdit::new(words);
+            s.capture();
+        }
+        poll(&mut s, 1.0, &mut tx);
+        let request = placing.try_recv().expect("asked the moment thoughts wait");
+        assert_eq!(request.session, s.projection.session);
+        assert!(s.busy && stewarding.try_recv().is_err());
+        let park = Op::Park {
+            thought: 3,
+            kind: tacit::model::ParkKind::Later,
+            topic: "Commute".into(),
+            reason: "Nothing on the map is about getting to work yet".into(),
+            concept: Some("Bike repair".into()),
+        };
+        let ops = vec![
+            grow("time", "Time"),
+            file(1, "time"),
+            grow("decisions", "Decisions"),
+            file(2, "decisions"),
+            park,
+        ];
+        answer
+            .send(turned(request.epoch, Tier::Place, ops, ""))
+            .unwrap();
+        poll(&mut s, 2.0, &mut tx);
+        let session = &s.projection.session;
+        assert_eq!(session.thoughts[0].category.as_deref(), Some("time"));
+        assert_eq!((session.thoughts.len(), session.parked.len()), (2, 1));
+        assert_eq!(s.organizer_status, "Filed 2 thoughts · parked 1 thought");
+        assert!(!s.busy);
+        // Filing keeps up with the speaker; only the three captures are steps to undo.
+        assert_eq!(s.history.len(), 3);
+
+        // The steward waits for the talk to pause.
+        poll(&mut s, 3.0, &mut tx);
+        assert!(stewarding.try_recv().is_err());
+        poll(&mut s, 4.1, &mut tx);
+        let request = stewarding.try_recv().expect("asked once the talk pauses");
+        assert!(s.busy && placing.try_recv().is_err());
+        let ops = vec![
+            grow("commute", "Commute"),
+            file(3, "commute"),
+            Op::Narrative {
+                narrative: "Mornings go to meetings, and nobody owns decisions.".into(),
+            },
+        ];
+        answer
+            .send(turned(
+                request.epoch,
+                Tier::Steward,
+                ops,
+                "Brought the commute back",
+            ))
+            .unwrap();
+        poll(&mut s, 5.0, &mut tx);
+        assert!(s.projection.session.parked.is_empty());
+        assert_eq!(s.projection.session.thoughts.len(), 3);
+        assert_eq!(s.organizer_status, "✦ Brought the commute back");
+        assert!(!s.busy);
+
+        // A restructure is one step to undo, and the steward then leaves the map alone.
+        s.undo();
+        assert_eq!(s.projection.session.parked.len(), 1);
+        assert!(tacit::agent::brief::narrative(&s.projection.session).is_empty());
+        poll(&mut s, 30.0, &mut tx);
+        assert!(placing.try_recv().is_err() && stewarding.try_recv().is_err());
+    }
+    #[test]
+    fn turns_from_before_a_user_edit_are_dropped_and_failures_keep_the_map() {
+        use tacit::agent::Tier;
+        let mut s = State::demo();
+        let (mut placing, _stewarding, answer) = agent(&mut s);
+        let mut tx = Tx::default();
+        poll(&mut s, 0.0, &mut tx);
+        let request = placing.try_recv().unwrap();
+        // The user takes the map into their own hands while the turn is in flight.
+        s.selected = Some(1);
+        s.move_selected();
+        let before = s.projection.session.clone();
+        let ops = vec![grow("time", "Time"), file(2, "time")];
+        answer
+            .send(turned(request.epoch, Tier::Place, ops, ""))
             .unwrap();
         poll(&mut s, 1.0, &mut tx);
-        assert!(review_requests.try_recv().is_err());
-        poll(&mut s, 3.1, &mut tx);
-        assert_eq!(review_requests.try_recv().unwrap().revision, 1);
-        s.revision = 2;
-        let before = s.projection.session.clone();
-        review_response
-            .send(tacit::evolution::Response {
-                revision: 1,
-                fingerprint: String::new(),
-                result: Err("stale review".into()),
+        assert_eq!(s.projection.session, before);
+        // The map as it now stands is asked about instead.
+        let request = placing.try_recv().unwrap();
+        assert_eq!(request.session, before);
+        assert_ne!(request.epoch, 0);
+        answer
+            .send(tacit::agent::worker::Response {
+                epoch: request.epoch,
+                tier: Tier::Place,
+                instruction: None,
+                result: Err("test timeout".into()),
             })
             .unwrap();
-        poll(&mut s, 3.2, &mut tx);
+        poll(&mut s, 2.0, &mut tx);
         assert_eq!(s.projection.session, before);
-        assert!(!s.organizer_status.contains("stale review"));
-        poll(&mut s, 3.4, &mut tx);
-        assert_eq!(fast_requests.try_recv().unwrap().revision, 2);
+        assert!(s.organizer_status.contains("test timeout"));
+        assert!(!s.busy);
+        // A failure waits before it asks again.
+        poll(&mut s, 2.5, &mut tx);
+        assert!(placing.try_recv().is_err());
+        poll(&mut s, 4.1, &mut tx);
+        assert!(placing.try_recv().is_ok());
+    }
+    #[test]
+    fn a_capture_still_being_split_waits_for_its_thoughts() {
+        use tacit::agent::Tier;
+        let mut s = State::empty();
+        let (mut placing, _stewarding, answer) = agent(&mut s);
+        let mut tx = Tx::default();
+        let words = "Meetings eat the morning. Budgets are frozen.";
+        s.receive_voice(VoiceEvent::Transcript(words.into()), 0.0);
+        s.pending_recordings.insert(1);
+        poll(&mut s, 0.0, &mut tx);
+        assert!(placing.try_recv().is_err());
+        assert!(!s.busy);
+        s.receive_recording(tacit::recording::Response {
+            id: 1,
+            text: words.into(),
+            result: Ok(vec![
+                "Meetings eat the morning. ".into(),
+                "Budgets are frozen.".into(),
+            ]),
+        });
+        poll(&mut s, 1.0, &mut tx);
+        let request = placing.try_recv().unwrap();
+        assert_eq!(request.session.thoughts.len(), 2);
+        assert!(request.holds.is_empty());
+        // The speaker goes on while the turn is out: its edits land on the newer map.
+        s.draft = TextEdit::new("Hiring is paused");
+        s.capture();
+        let ops = vec![grow("time", "Time"), file(1, "time"), file(2, "time")];
+        answer
+            .send(turned(request.epoch, Tier::Place, ops, ""))
+            .unwrap();
+        poll(&mut s, 2.0, &mut tx);
+        let filed = |s: &State| {
+            let thoughts = s.projection.session.thoughts.iter();
+            thoughts.filter(|t| t.category.is_some()).count()
+        };
+        assert_eq!((filed(&s), s.projection.session.thoughts.len()), (2, 3));
+        assert_eq!(placing.try_recv().unwrap().session.thoughts.len(), 3);
+    }
+    #[test]
+    fn the_parking_lot_is_the_users_to_fill_keep_and_empty() {
+        use tacit::model::ParkKind;
+        let mut rt = runtime((1280.0, 1000.0));
+        click(&mut rt, "thought-1");
+        assert!(rt.find("revive").is_none() && rt.find("parking-lot").is_none());
+        click(&mut rt, "park");
+        let session = &rt.state.projection.session;
+        assert_eq!((session.thoughts.len(), session.parked.len()), (5, 1));
+        assert!(session.parked[0].held);
+        // It stays in view beside the map, with its way back.
+        assert_eq!(rt.state.selected, Some(1));
+        for key in ["revive", "remove", "parking-lot", "parked-1"] {
+            assert!(rt.find(key).is_some(), "{key}");
+        }
+        for key in ["move", "park", "hold"] {
+            assert!(rt.find(key).is_none(), "{key}");
+        }
+        click(&mut rt, "show-transcript");
+        click(&mut rt, "thought-2");
+        click(&mut rt, "park");
+        // The lot opens with the room to read all of it, so there is nothing left to expand.
+        assert!(rt.find("transcript-expand").is_none());
+        click(&mut rt, "parked-1");
+        assert_eq!(rt.state.selected, Some(1));
+        // The lot opens from the transcript on whatever was parked last.
+        click(&mut rt, "show-transcript");
+        click(&mut rt, "parking-lot");
+        assert_eq!(rt.state.selected, Some(2));
+        click(&mut rt, "revive");
+        let session = &rt.state.projection.session;
+        let back = session.thoughts.last().unwrap();
+        assert_eq!((back.id, back.kept, &back.category), (2, true, &None));
+        assert_eq!(session.parked.len(), 1);
+        assert!(rt.find("park").is_some() && rt.find("revive").is_none());
+        // Parking and bringing back are steps to undo like any other edit.
+        click(&mut rt, "undo");
+        assert_eq!(rt.state.projection.session.parked.len(), 2);
+        click(&mut rt, "parking-lot");
+        click(&mut rt, "remove");
+        let session = &rt.state.projection.session;
+        assert_eq!((session.thoughts.len(), session.parked.len()), (4, 1));
+
+        // What the agent parked "not yet" can be kept off the map for good.
+        let park = tacit::agent::Op::Park {
+            thought: 3,
+            kind: ParkKind::Later,
+            topic: "Commute".into(),
+            reason: "No branch is about getting to work yet".into(),
+            concept: Some("Bike repair".into()),
+        };
+        let parked = SessionEvent::Mapped {
+            ops: vec![park],
+            pass: "place".into(),
+            note: String::new(),
+        };
+        rt.state.dispatch_session(parked).unwrap();
+        rt.state.selected = Some(3);
+        rt.invalidate();
+        click(&mut rt, "hold");
+        let kept = rt.state.projection.session.parked.last().unwrap();
+        assert_eq!((kept.kind, kept.held), (ParkKind::OffTopic, true));
+        assert!(rt.find("hold").is_none() && rt.find("revive").is_some());
+    }
+    #[test]
+    fn the_parking_lot_opens_with_every_kind_in_view() {
+        use tacit::model::ParkKind;
+        let scene = State::mapped_demo();
+        let session = &scene.projection.session;
+        let roots = session.categories.iter().filter(|c| c.parent.is_none());
+        assert_eq!((session.thoughts.len(), roots.count()), (8, 4));
+        assert!(session.thoughts.iter().all(|t| t.category.is_some()));
+        let kinds: Vec<_> = session.parked.iter().map(|p| p.kind).collect();
+        let off = ParkKind::OffTopic;
+        assert_eq!(kinds, [off, off, ParkKind::Later, ParkKind::Aside]);
+        // What was said twice is kept with the thought it repeats, not drawn twice.
+        let repeat = session.retired.last().unwrap();
+        assert_eq!((repeat.thought.id, &repeat.replaced_by[..]), (11, &[4][..]));
+        assert!(session.narrative().contains("[2][4]"));
+
+        let env = Env {
+            system_dark: false,
+            scale: 1.0,
+        };
+        let mut rt = Runtime::new(State::parked_demo(), view, (1280.0, 860.0), env);
+        rt.poll = Some(poll);
+        rt.frame(0.0);
+        rt.frame(1.0);
+        assert_eq!(rt.state.selected, Some(13));
+        let elements = rt.elements();
+        let found = |key: &str| {
+            let found = elements.iter().find(|e| e.key.as_deref() == Some(key));
+            found.unwrap_or_else(|| panic!("missing {key}"))
+        };
+        let place = found("selected-place").text.as_deref();
+        assert_eq!(place, Some("Parked · Aside · Recording check"));
+        // A subject is named beside a thought only where the thought does not say it already.
+        let room = found("transcript-scroll").rect;
+        for (key, title) in [
+            ("parked-12", "Hybrid days"),
+            ("parked-10", "Hosting costs › Audit unused servers"),
+            ("parked-9", "Hosting costs doubled"),
+            ("parked-13", "Recording check"),
+        ] {
+            let pill = found(key);
+            assert_eq!(pill.label.as_deref(), Some(title));
+            let (below, floor) = (pill.rect[1] + pill.rect[3], room[1] + room[3]);
+            assert!(below <= floor, "{key} is out of view");
+        }
+        // The room is the lot's for as long as it is open, and the transcript's own after.
+        assert!(rt.find("transcript-expand").is_none());
+        click(&mut rt, "show-transcript");
+        assert!(rt.find("transcript-expand").is_some());
+        let closed = rt.elements();
+        let closed = closed
+            .iter()
+            .find(|e| e.key.as_deref() == Some("transcript-scroll"));
+        assert!(closed.unwrap().rect[3] < room[3]);
+    }
+    #[test]
+    fn the_agent_honours_what_the_user_keeps_parked_and_what_they_bring_back() {
+        use tacit::agent::{Op, Tier};
+        use tacit::model::ParkKind;
+        let mut s = State::empty();
+        let (mut placing, mut stewarding, answer) = agent(&mut s);
+        let mut tx = Tx::default();
+        poll(&mut s, 0.0, &mut tx);
+        for words in [
+            "Meetings eat the whole morning",
+            "My bike needs a new chain",
+        ] {
+            s.draft = TextEdit::new(words);
+            s.capture();
+        }
+        poll(&mut s, 1.0, &mut tx);
+        let request = placing.try_recv().unwrap();
+        let park = || Op::Park {
+            thought: 2,
+            kind: ParkKind::Later,
+            topic: "Commute".into(),
+            reason: "Nothing on the map is about getting to work yet".into(),
+            concept: Some("Bike repair".into()),
+        };
+        let ops = vec![grow("time", "Time"), file(1, "time"), park()];
+        answer
+            .send(turned(request.epoch, Tier::Place, ops, ""))
+            .unwrap();
+        poll(&mut s, 2.0, &mut tx);
+        assert_eq!(s.projection.session.parked[0].kind, ParkKind::Later);
+
+        // Kept parked: the steward may no longer bring it back.
+        s.selected = Some(2);
+        s.hold_selected();
+        let kept = &s.projection.session.parked[0];
+        assert_eq!((kept.kind, kept.held), (ParkKind::OffTopic, true));
+        poll(&mut s, 12.0, &mut tx);
+        let request = stewarding.try_recv().expect("asked in the lull");
+        let ops = vec![
+            grow("commute", "Commute"),
+            file(2, "commute"),
+            Op::Narrative {
+                narrative: "Mornings go to meetings.".into(),
+            },
+        ];
+        answer
+            .send(turned(request.epoch, Tier::Steward, ops, ""))
+            .unwrap();
+        poll(&mut s, 13.0, &mut tx);
+        let session = &s.projection.session;
+        assert_eq!((session.thoughts.len(), session.parked.len()), (1, 1));
+        assert_eq!(session.categories.len(), 1);
+        assert_eq!(
+            tacit::agent::brief::narrative(session),
+            "Mornings go to meetings."
+        );
+
+        // Brought back: it waits for a branch, and the agent may not park it again.
+        s.revive_selected();
+        poll(&mut s, 14.0, &mut tx);
+        let request = placing
+            .try_recv()
+            .expect("asked about the returned thought");
+        assert!(request.session.thoughts.iter().any(|t| t.id == 2 && t.kept));
+        answer
+            .send(turned(request.epoch, Tier::Place, vec![park()], ""))
+            .unwrap();
+        poll(&mut s, 15.0, &mut tx);
+        assert!(s.projection.session.parked.is_empty());
+        poll(&mut s, 17.1, &mut tx);
+        let request = placing.try_recv().expect("asked again after a breath");
+        let ops = vec![grow("commute", "Commute"), file(2, "commute")];
+        answer
+            .send(turned(request.epoch, Tier::Place, ops, ""))
+            .unwrap();
+        poll(&mut s, 18.0, &mut tx);
+        let back = s.projection.session.thoughts.last().unwrap();
+        assert_eq!((back.id, back.category.as_deref()), (2, Some("commute")));
     }
     #[test]
     fn artwork_is_composed_only_when_someone_asks() {

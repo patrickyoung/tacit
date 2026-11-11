@@ -49,10 +49,12 @@ fn main() {
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
+            let client = config.client()?;
             let mut session = tacit::model::Session::demo();
             let transcript = "We spend too long in meetings. We could collect updates beforehand so that time is used for decisions. On another topic, our hosting costs have doubled. We should audit unused servers. Coming back to meetings, having one owner for each decision would help too.";
-            let chunks =
-                runtime.block_on(tacit::recording::split(&config, transcript, &session))?;
+            let usage = &mut tacit::agent::Usage::default();
+            let heard = tacit::recording::sift(&client, &config, transcript, &session, usage);
+            let chunks = runtime.block_on(heard)?;
             if chunks.concat() != transcript {
                 return Err("Transcript preservation failed".into());
             }
@@ -60,14 +62,24 @@ fn main() {
                 "Recording split into {} thoughts; original words validated",
                 chunks.len()
             );
+            let said = session.next_id;
             for chunk in &chunks {
                 session.add(chunk);
             }
-            runtime
-                .block_on(config.organize(&session, false))?
-                .apply(&mut session)?;
-            for thought in session.thoughts.iter().skip(6) {
+            settle(&runtime, &client, &config, &mut session)?;
+            for thought in session.thoughts.iter().filter(|t| t.id >= said) {
                 println!("{}: {}", session.placement_path(thought), thought.text);
+            }
+            for parked in session.parked.iter().filter(|p| p.thought.id >= said) {
+                let (kind, text) = (parked.kind.label(), &parked.thought.text);
+                println!("Parked, {kind} ({}): {text}", parked.topic);
+            }
+            // Said before: the words stay with the thought they were combined into.
+            for gone in session.retired.iter().filter(|r| r.thought.id >= said) {
+                let into = |id: &u64| session.thoughts.iter().find(|t| t.id == *id);
+                let label = gone.replaced_by.iter().find_map(into);
+                let label = label.map_or("another thought", |t| t.map_label());
+                println!("Combined into {label}: {}", gone.thought.text);
             }
             Ok(())
         })();
@@ -103,23 +115,17 @@ fn main() {
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
+            let client = config.client()?;
             let mut session = tacit::model::Session::demo();
-            for review in [false, false, true] {
-                if !review && !session.categories.is_empty() {
-                    session.add("We could protect an hour each morning for focused work.");
-                }
-                let started = std::time::Instant::now();
-                let result = runtime.block_on(config.organize(&session, review))?;
-                result.apply(&mut session)?;
-                println!(
-                    "{}: {:.2}s, {} themes, {} thoughts validated",
-                    if review { "Review" } else { "Fast" },
-                    started.elapsed().as_secs_f32(),
-                    session.categories.len(),
-                    session.thoughts.len()
-                );
-            }
-            Ok(())
+            settle(&runtime, &client, &config, &mut session)?;
+            // What is said next is filed at once, and what the user asks for is done as asked.
+            session.add("We could protect an hour each morning for focused work.");
+            let place = tacit::agent::Tier::Place;
+            turn(&runtime, &client, &config, place, &mut session, "")?;
+            let asked = "Call this map Room for focused work.";
+            let direct = tacit::agent::Tier::Direct;
+            turn(&runtime, &client, &config, direct, &mut session, asked)?;
+            filed(&session)
         })();
         if let Err(e) = result {
             eprintln!("{e}");
@@ -145,6 +151,8 @@ fn main() {
                 ("demo", |s| *s = ui::State::demo()),
                 ("themes", |s| *s = ui::State::themed_demo()),
                 ("hierarchy", |s| *s = ui::State::hierarchy_demo()),
+                ("mapped", |s| *s = ui::State::mapped_demo()),
+                ("parked", |s| *s = ui::State::parked_demo()),
                 ("art-draw", |s| *s = ui::State::art_demo()),
                 ("generated", |s| *s = ui::State::generated_demo()),
             ],
@@ -160,4 +168,61 @@ fn main() {
         },
         capture::Capture::default(),
     );
+}
+
+/// One turn of the map agent, asked of its tier's model. Its edits go onto the map the way
+/// the journal replays them, so a turn the journal could not keep fails the check.
+fn turn(
+    runtime: &tokio::runtime::Runtime,
+    client: &openrouter_rs::OpenRouterClient,
+    config: &tacit::organizer::CloudConfig,
+    tier: tacit::agent::Tier,
+    session: &mut tacit::model::Session,
+    instruction: &str,
+) -> Result<(), String> {
+    use tacit::agent::{guided, health, replay, turn};
+    let holds = std::collections::BTreeSet::new();
+    let stands = &mut Default::default();
+    let asked = turn::run(client, config, tier, session, &holds, instruction, stands);
+    let done = runtime.block_on(asked)?;
+    *session = if tier.user() {
+        guided(session, instruction, &done.ops)?
+    } else {
+        replay(session, &done.ops)?
+    };
+    let shape = health::shape(session);
+    println!(
+        "{}: {:.2}s over {} call(s), {} edit(s); {} thoughts on {} branches, {} waiting, {} parked",
+        tier.name(),
+        done.usage.elapsed.as_secs_f32(),
+        done.usage.calls,
+        done.ops.len(),
+        shape.filed,
+        shape.branches,
+        shape.unfiled,
+        shape.parked
+    );
+    Ok(())
+}
+/// File what waits, then step back and read the whole map, as the app does when the talk
+/// pauses.
+fn settle(
+    runtime: &tokio::runtime::Runtime,
+    client: &openrouter_rs::OpenRouterClient,
+    config: &tacit::organizer::CloudConfig,
+    session: &mut tacit::model::Session,
+) -> Result<(), String> {
+    use tacit::agent::Tier;
+    turn(runtime, client, config, Tier::Place, session, "")?;
+    turn(runtime, client, config, Tier::Steward, session, "")?;
+    filed(session)
+}
+/// Every thought ends on a branch or in the parking lot.
+fn filed(session: &tacit::model::Session) -> Result<(), String> {
+    match tacit::agent::health::shape(session).unfiled {
+        0 => Ok(()),
+        left => Err(format!(
+            "The map agent left {left} thought(s) without a branch"
+        )),
+    }
 }
