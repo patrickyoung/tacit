@@ -35,6 +35,9 @@ pub struct Thought {
     /// Concise interpretation for the map; `text` always retains the original words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concept: Option<String>,
+    /// The user brought this back from the parking lot; the agent may not park it again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kept: bool,
     pub id: u64,
     pub text: String,
     pub role: Role,
@@ -46,6 +49,74 @@ impl Thought {
     pub fn map_label(&self) -> &str {
         self.concept.as_deref().unwrap_or(&self.text)
     }
+}
+/// Why a thought waits beside the map instead of on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParkKind {
+    /// Relevant, but the map has no home for it yet.
+    Later,
+    /// A different subject from the one this map is about.
+    OffTopic,
+    /// Filler, housekeeping or a false start with nothing to map.
+    Aside,
+}
+impl ParkKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Later => "Not yet",
+            Self::OffTopic => "Off topic",
+            Self::Aside => "Aside",
+        }
+    }
+}
+/// A captured thought held in the parking lot. Its words are never lost and it can return.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Parked {
+    pub thought: Thought,
+    pub kind: ParkKind,
+    /// Keyword label shared by parked thoughts about the same subject.
+    pub topic: String,
+    pub reason: String,
+    /// The user decided this stays parked; the agent may not bring it back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held: bool,
+}
+/// What the mind map agent remembers between turns. Captures never clear it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Charter {
+    /// The central question or subject this map is about.
+    #[serde(default)]
+    pub focus: String,
+    /// The one ordering idea its main branches share.
+    #[serde(default)]
+    pub principle: String,
+    #[serde(default)]
+    pub narrative: String,
+    #[serde(default)]
+    pub links: Vec<Relationship>,
+}
+pub const MAX_LINKS: usize = 12;
+impl Charter {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.focus.chars().count() > 300
+            || self.principle.chars().count() > 300
+            || self.narrative.chars().count() > 3000
+            || self.links.len() > MAX_LINKS
+            || self.links.iter().any(|r| {
+                r.from == r.to || r.label.trim().is_empty() || r.label.chars().count() > 60
+            })
+        {
+            return Err("Invalid map charter".into());
+        }
+        Ok(())
+    }
+}
+pub fn validate_topic(topic: &str) -> Result<(), String> {
+    if topic.trim().is_empty() || topic != topic.trim() || topic.chars().count() > 36 {
+        return Err("A parked topic needs a short keyword label".into());
+    }
+    Ok(())
 }
 pub fn validate_concept(concept: &str) -> Result<(), String> {
     if concept.trim().is_empty()
@@ -66,6 +137,11 @@ pub struct Session {
     pub retired: Vec<crate::evolution::RetiredThought>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub directions: Vec<String>,
+    /// Thoughts waiting beside the map: not yet placeable, off topic, or asides.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parked: Vec<Parked>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charter: Option<Charter>,
     pub version: u32,
     pub title: String,
     pub thoughts: Vec<Thought>,
@@ -81,6 +157,8 @@ impl Default for Session {
             sources: Default::default(),
             retired: vec![],
             directions: vec![],
+            parked: vec![],
+            charter: None,
             version: 1,
             title: "A thought taking shape".into(),
             thoughts: vec![],
@@ -102,6 +180,7 @@ impl Session {
         self.thoughts.push(Thought {
             evidence: vec![],
             concept: None,
+            kept: false,
             id,
             text: text.into(),
             role: classify(text),
@@ -171,6 +250,14 @@ impl Session {
         if let Some(i) = &self.interpretation {
             return i.narrative.clone();
         }
+        // The agent's last reading stays visible while a new capture is still being placed.
+        if let Some(c) = self
+            .charter
+            .as_ref()
+            .filter(|c| !c.narrative.trim().is_empty())
+        {
+            return c.narrative.clone();
+        }
         if self.thoughts.is_empty() {
             return "Start anywhere. A question, a friction, a possibility.".into();
         }
@@ -186,6 +273,85 @@ impl Session {
             }
         }
         parts.join("\n\n")
+    }
+    /// Move a thought off the map. Its words, label and evidence travel with it.
+    pub fn park(
+        &mut self,
+        id: u64,
+        kind: ParkKind,
+        topic: &str,
+        reason: &str,
+        held: bool,
+    ) -> Result<(), String> {
+        validate_topic(topic)?;
+        let index = self
+            .thoughts
+            .iter()
+            .position(|t| t.id == id)
+            .ok_or("Unknown thought")?;
+        let mut thought = self.thoughts.remove(index);
+        thought.category = None;
+        thought.pinned = false;
+        thought.kept = false;
+        self.parked.push(Parked {
+            thought,
+            kind,
+            topic: topic.into(),
+            reason: reason.into(),
+            held,
+        });
+        Ok(())
+    }
+    /// Return a parked thought to the map, unplaced until someone gives it a branch.
+    pub fn revive(&mut self, id: u64) -> Result<&mut Thought, String> {
+        let index = self
+            .parked
+            .iter()
+            .position(|p| p.thought.id == id)
+            .ok_or("Unknown parked thought")?;
+        self.thoughts.push(self.parked.remove(index).thought);
+        Ok(self.thoughts.last_mut().unwrap())
+    }
+    /// Rebuild the reading the views use from the charter, once every thought has a home.
+    pub fn refresh_reading(&mut self) {
+        self.interpretation = None;
+        let Some(charter) = &self.charter else {
+            return;
+        };
+        if charter.narrative.trim().is_empty()
+            || self.thoughts.is_empty()
+            || self
+                .thoughts
+                .iter()
+                .any(|t| t.category.is_none() || t.concept.is_none())
+        {
+            return;
+        }
+        let live = |id: &u64| self.thoughts.iter().any(|t| t.id == *id);
+        let reading = Interpretation {
+            categories: self.categories.clone(),
+            title: self.title.clone(),
+            narrative: charter.narrative.clone(),
+            assignments: self
+                .thoughts
+                .iter()
+                .map(|t| Assignment {
+                    concept: t.concept.clone(),
+                    id: t.id,
+                    category: t.category.clone(),
+                    role: t.role,
+                })
+                .collect(),
+            relationships: charter
+                .links
+                .iter()
+                .filter(|r| live(&r.from) && live(&r.to))
+                .cloned()
+                .collect(),
+        };
+        if reading.validate(self).is_ok() {
+            self.interpretation = Some(reading);
+        }
     }
     pub fn demo() -> Self {
         let mut session = Self {
@@ -205,10 +371,22 @@ impl Session {
         session
     }
     pub fn validate(&self) -> Result<(), String> {
+        self.check(true)
+    }
+    /// The same for a map midway through a regrouping, which may hold more root themes than
+    /// a map is left with.
+    pub fn validate_midway(&self) -> Result<(), String> {
+        self.check(false)
+    }
+    fn check(&self, settled: bool) -> Result<(), String> {
         if self.version != 1 {
             return Err(format!("Unsupported session version {}", self.version));
         }
-        validate_categories(&self.categories)?;
+        if settled {
+            validate_categories(&self.categories)?;
+        } else {
+            validate_hierarchy(&self.categories)?;
+        }
         let category_ids: std::collections::HashSet<_> =
             self.categories.iter().map(|c| &c.id).collect();
         if self.thoughts.iter().any(|t| {
@@ -243,10 +421,31 @@ impl Session {
                 return Err("Invalid retired concept history".into());
             }
         }
+        for p in &self.parked {
+            let t = &p.thought;
+            if t.id == 0
+                || t.id >= self.next_id
+                || !ids.insert(t.id)
+                || t.text.trim().is_empty()
+                || t.pinned
+                || t.category.is_some()
+                || p.reason.chars().count() > 300
+            {
+                return Err("Invalid parked thought".into());
+            }
+            validate_topic(&p.topic)?;
+            if let Some(concept) = &t.concept {
+                validate_concept(concept)?;
+            }
+        }
+        if let Some(charter) = &self.charter {
+            charter.validate()?;
+        }
         for thought in self
             .thoughts
             .iter()
             .chain(self.retired.iter().map(|r| &r.thought))
+            .chain(self.parked.iter().map(|p| &p.thought))
         {
             if thought
                 .evidence
@@ -305,12 +504,19 @@ pub struct Category {
 }
 pub const MAX_CATEGORY_DEPTH: usize = 3;
 pub const MAX_CATEGORIES: usize = 72;
+const TOO_MANY: &str = "Use at most eight root themes and 72 themes in total";
 pub fn validate_categories(categories: &[Category]) -> Result<(), String> {
+    if categories.iter().filter(|c| c.parent.is_none()).count() > 8 {
+        return Err(TOO_MANY.into());
+    }
+    validate_hierarchy(categories)
+}
+/// All that `validate_categories` asks but the count of root themes, which a regrouping in
+/// progress may pass.
+pub fn validate_hierarchy(categories: &[Category]) -> Result<(), String> {
     use std::collections::HashSet;
-    if categories.len() > MAX_CATEGORIES
-        || categories.iter().filter(|c| c.parent.is_none()).count() > 8
-    {
-        return Err("Use at most eight root themes and 72 themes in total".into());
+    if categories.len() > MAX_CATEGORIES {
+        return Err(TOO_MANY.into());
     }
     let mut ids = HashSet::new();
     for c in categories {
@@ -461,6 +667,10 @@ impl Interpretation {
         }
         session.categories = categories;
         session.title = self.title.clone();
+        if let Some(charter) = &mut session.charter {
+            charter.narrative.clone_from(&self.narrative);
+            charter.links.clone_from(&self.relationships);
+        }
         session.interpretation = Some(self);
         Ok(())
     }

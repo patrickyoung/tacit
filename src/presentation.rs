@@ -239,7 +239,7 @@ impl crate::timeline::Journal {
                 at_ms,
                 Event::SessionChanged {
                     change: SessionEvent::Restored {
-                        session: scene.session.clone(),
+                        session: Box::new(scene.session.clone()),
                         reason: reason.into(),
                     },
                 },

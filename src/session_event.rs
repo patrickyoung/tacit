@@ -1,6 +1,6 @@
 //! Portable content events. The same pure reducer is used during live dispatch and replay.
 //! No clocks, model requests, UI handles, or layout decisions belong here.
-use crate::model::{Interpretation, Role, Session, Thought, classify};
+use crate::model::{Interpretation, ParkKind, Role, Session, Thought, classify};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -34,8 +34,33 @@ pub enum SessionEvent {
         pass: String,
     },
     Restored {
-        session: Session,
+        session: Box<Session>,
         reason: String,
+    },
+    /// One turn of the mind map agent: an ordered list of edits that all applied.
+    Mapped {
+        ops: Vec<crate::agent::Op>,
+        pass: String,
+        note: String,
+    },
+    /// A turn of the mind map agent that carried out the user's instruction, with their
+    /// authority over what they had pinned, kept or parked.
+    Guided {
+        instruction: String,
+        ops: Vec<crate::agent::Op>,
+        note: String,
+    },
+    /// The user set a thought aside. The agent may not bring it back.
+    Parked {
+        id: u64,
+    },
+    /// The user brought a parked thought back. The agent places it and may not park it again.
+    Revived {
+        id: u64,
+    },
+    /// The user decided a parked thought stays off the map.
+    Held {
+        id: u64,
     },
 }
 impl SessionEvent {
@@ -74,10 +99,12 @@ impl SessionEvent {
                 next.interpretation = None;
             }
             Self::Removed { id } => {
-                if !next.thoughts.iter().any(|t| t.id == *id) {
+                let before = next.thoughts.len() + next.parked.len();
+                next.thoughts.retain(|t| t.id != *id);
+                next.parked.retain(|p| p.thought.id != *id);
+                if before == next.thoughts.len() + next.parked.len() {
                     return Err("Unknown thought".into());
                 }
-                next.thoughts.retain(|t| t.id != *id);
                 next.interpretation = None;
             }
             Self::Split {
@@ -114,10 +141,40 @@ impl SessionEvent {
             }
             Self::Organized { interpretation, .. } => interpretation.clone().apply(&mut next)?,
             Self::Restored { session, .. } => {
-                next = session.clone();
+                next = Session::clone(session);
                 // Undo must never reuse an ID that historical transcript/artwork references may retain.
                 next.next_id = next.next_id.max(current.next_id);
             }
+            Self::Mapped { ops, .. } => next = crate::agent::replay(current, ops)?,
+            Self::Guided {
+                instruction, ops, ..
+            } => next = crate::agent::guided(current, instruction, ops)?,
+            Self::Parked { id } => {
+                next.park(*id, ParkKind::OffTopic, "Set aside", "Parked by you", true)?;
+                next.interpretation = None;
+            }
+            Self::Revived { id } => {
+                next.revive(*id)?.kept = true;
+                next.interpretation = None;
+            }
+            Self::Held { id } => {
+                let p = next
+                    .parked
+                    .iter_mut()
+                    .find(|p| p.thought.id == *id)
+                    .ok_or("Unknown parked thought")?;
+                if p.kind == ParkKind::Later {
+                    p.kind = ParkKind::OffTopic;
+                }
+                p.held = true;
+            }
+        }
+        // A map the agent tends keeps its reading in step with every other kind of change.
+        if next.charter.is_some()
+            && next.interpretation.is_none()
+            && !matches!(self, Self::Restored { .. })
+        {
+            next.refresh_reading();
         }
         next.validate()?;
         Ok(next)
@@ -127,6 +184,7 @@ impl SessionEvent {
             thought: Thought {
                 evidence: vec![],
                 concept: None,
+                kept: false,
                 id: session.next_id,
                 text: text.trim().into(),
                 role: classify(text.trim()),

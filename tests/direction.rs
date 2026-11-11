@@ -235,7 +235,7 @@ fn category_refinement_and_future_guidance_replay_and_restore_exactly() {
             40,
             Event::SessionChanged {
                 change: SessionEvent::Restored {
-                    session: before.clone(),
+                    session: Box::new(before.clone()),
                     reason: "undo".into(),
                 },
             },

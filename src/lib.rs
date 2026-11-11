@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod art;
 pub mod artist;
 pub mod camera;

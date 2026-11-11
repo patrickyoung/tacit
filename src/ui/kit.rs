@@ -38,6 +38,7 @@ pub(super) enum Icon {
     Forward,
     Next,
     Film,
+    Park,
 }
 
 fn ring(c: [f32; 2], r: f32) -> Path {
@@ -268,6 +269,21 @@ pub(super) fn glyph(icon: Icon, size: f32, ink: Color) -> Shape {
             .stroke_with(
                 vec![[15.5, 10.6], [20.5, 7.6], [20.5, 16.4], [15.5, 13.4]],
                 false,
+                w,
+                cap,
+                ink,
+            ),
+        // The sign over a parking lot.
+        Icon::Park => s
+            .stroke_path(&rounded(3.5, 3.5, 17.0, 17.0, 4.2), w, cap, ink)
+            .stroke_path(
+                &Path::new()
+                    .move_to([9.5, 17.0])
+                    .line_to([9.5, 7.5])
+                    .line_to([12.5, 7.5])
+                    .cubic_to([13.9, 7.5], [15.0, 8.6], [15.0, 10.0])
+                    .cubic_to([15.0, 11.4], [13.9, 12.5], [12.5, 12.5])
+                    .line_to([9.5, 12.5]),
                 w,
                 cap,
                 ink,
