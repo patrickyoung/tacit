@@ -9,7 +9,7 @@
 //!   cargo run --release --example agent_eval -- [runs=1] [mode=full|place|steward|direct]
 //!       [every=3] [talk=onboarding|machines|plots] [place=MODEL] [place_effort=off|low|…]
 //!       [steward=MODEL] [steward_effort=…] [direct=MODEL] [direct_effort=…] [save=FILE]
-//!       [load=FILE] [ask=INSTRUCTION] [quiet=1] [trace=1]
+//!       [frames=DIR] [load=FILE] [ask=INSTRUCTION] [quiet=1] [trace=1]
 //! `mode=place` never calls the steward; `mode=steward` stewards a session saved by `save=`.
 //! `mode=direct` gives a saved onboarding map the instructions a user might, one directed turn
 //! each (one of them a request no map can hold, which must change nothing), then lets the
@@ -386,6 +386,7 @@ struct Args {
     mode: String,
     every: usize,
     save: Option<String>,
+    frames: Option<String>,
     load: Option<String>,
     ask: Option<String>,
     quiet: bool,
@@ -399,6 +400,7 @@ fn args(config: &mut CloudConfig) -> Result<Args, String> {
         mode: "full".into(),
         every: 3,
         save: None,
+        frames: None,
         load: None,
         ask: None,
         quiet: false,
@@ -427,6 +429,7 @@ fn args(config: &mut CloudConfig) -> Result<Args, String> {
             "direct" => config.direct_model = value.into(),
             "direct_effort" => config.direct_effort = value.into(),
             "save" => args.save = Some(value.into()),
+            "frames" => args.frames = Some(value.into()),
             "load" => args.load = Some(value.into()),
             "ask" => args.ask = Some(value.into()),
             "quiet" => args.quiet = value != "0",
@@ -1341,6 +1344,17 @@ async fn talk(cloud: Cloud<'_>, args: &Args) -> Result<bool, String> {
             if let (None, Some(id)) = (returned, back) {
                 returned = Some(matches!(at(&session, id), At::Parked(_)));
             }
+            let mut frame = 0;
+            let mut keep = |session: &Session| -> Result<(), String> {
+                if let Some(dir) = &args.frames {
+                    let path = format!("{dir}/{:02}-{frame}.json", index + 1);
+                    let saved = serde_json::to_string(session).map_err(|e| e.to_string())?;
+                    std::fs::write(&path, saved).map_err(|e| format!("{path}: {e}"))?;
+                    frame += 1;
+                }
+                Ok(())
+            };
+            keep(&session)?;
             since += 1;
             let last = index + 1 == args.talk.len();
             let due = last || since >= args.every || call.is_some() || health::strained(&session);
@@ -1348,6 +1362,7 @@ async fn talk(cloud: Cloud<'_>, args: &Args) -> Result<bool, String> {
                 let label = format!("{} steward", index + 1);
                 step(cloud, Tier::Steward, &mut session, tally, &label, "").await?;
                 println!("{:11}{}", "", main_branches(&session));
+                keep(&session)?;
                 since = 0;
             }
         }

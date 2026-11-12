@@ -153,6 +153,7 @@ fn main() {
                 ("hierarchy", |s| *s = ui::State::hierarchy_demo()),
                 ("mapped", |s| *s = ui::State::mapped_demo()),
                 ("parked", |s| *s = ui::State::parked_demo()),
+                ("file", |s| *s = ui::State::file_demo()),
                 ("art-draw", |s| *s = ui::State::art_demo()),
                 ("generated", |s| *s = ui::State::generated_demo()),
             ],
