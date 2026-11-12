@@ -468,6 +468,7 @@ fn drawer(s: &State) -> El {
         && !s.directing()
         && s.queued_direction.is_none()
         && s.pending_recordings.is_empty()
+        && s.reading.is_empty()
         && !s.video_busy();
     let mut list = col().gap(2.0).grow(1.0).min_h(0.0).scroll(ScrollSpec {
         stick_bottom: false,
@@ -706,6 +707,8 @@ fn transcript(s: &State) -> El {
                     .and_then(|n| n.parse::<u64>().ok())
                     .map(|n| (n, id, words))
             })
+            // What a file said is shown under the file's name, below.
+            .filter(|(n, _, _)| !s.projection.attachment_links.values().any(|t| t == n))
             .collect::<Vec<_>>();
         originals.sort_by_key(|(n, _, _)| *n);
         for (_, id, words) in originals {
@@ -717,6 +720,25 @@ fn transcript(s: &State) -> El {
             );
             count += 1;
         }
+    }
+    for attachment in &s.projection.attachments {
+        let Some(reading) = s.projection.readings.get(&attachment.id) else {
+            continue;
+        };
+        // A long file is shown by its opening: the whole of it is in the session's journal.
+        let mut opening: String = reading.chars().take(1_200).collect();
+        if opening.len() < reading.len() {
+            opening.push_str(" …");
+        }
+        lines = lines
+            .child(label(format!("File  ·  {}", attachment.name), 10.0, GREEN))
+            .child(
+                label(opening, 15.0, INK)
+                    .key(format!("file-{}", attachment.id))
+                    .wrap_anywhere()
+                    .selectable(true),
+            );
+        count += 1;
     }
     if !s.live_text.is_empty() {
         lines = lines
@@ -1261,7 +1283,15 @@ fn empty_map(s: &State) -> El {
                 .items_center()
                 .gap(2.0)
                 .child(label("Speak a thought. Follow a question.", 15.0, MUTED))
-                .child(label("Let the connections take shape.", 15.0, MUTED)),
+                .child(label("Let the connections take shape.", 15.0, MUTED))
+                .child(
+                    label(
+                        "Or drop in a document, an image, a recording or a video.",
+                        13.0,
+                        MUTED,
+                    )
+                    .mt(8.0),
+                ),
         );
     // A recording or queued guidance holds its mode, and then a starter could not open a thought.
     if s.read_only || s.direction_mode && s.input_mode_locked() {
@@ -1552,6 +1582,61 @@ pub(super) fn video(s: &State, cx: &mut Cx<State>) -> El {
     window(s, cx, center)
 }
 
+/// The map or the thread, as the place files from outside are dropped. Each file is kept in
+/// the session, read into text, and goes onto the map the way a recording does.
+fn drop_zone(s: &State, main: El) -> El {
+    let zone = row()
+        .key("drop-zone")
+        .h(0.0)
+        .grow(1.0)
+        .min_h(0.0)
+        .child(main);
+    if s.replay.is_some() || s.read_only {
+        return zone;
+    }
+    let zone = zone
+        .accepts_files(|path| tacit::ingest::Kind::of(path).is_some())
+        .on_drop_files(|s: &mut State, files, _| s.drop_files(files))
+        .on_drop_hover(|s: &mut State, over, _| s.drop_over = over)
+        .on_drop_rejected(|s: &mut State, files, _| s.refuse_files(files));
+    if !s.drop_over {
+        return zone;
+    }
+    // Says where each kind of file is read before it is let go of.
+    zone.child(
+        col()
+            .key("drop-hint")
+            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+            .inert()
+            .center()
+            .gap(8.0)
+            .padding(32.0)
+            .radius(kit::CARD)
+            .fill(PAPER.alpha(0.97))
+            .border(2.0, GREEN.alpha(0.7))
+            .child(
+                label("Drop to add to the map", 24.0, INK)
+                    .font(TextStyle::new(24.0, 600.0).tracking(-0.5)),
+            )
+            .child(label(
+                "Kept in this session, read into text, then organized like anything you say.",
+                14.0,
+                MUTED,
+            ))
+            .child(label(
+                if s.ingest.is_none() {
+                    "Files cannot be read in this window."
+                } else if s.agent.is_some() {
+                    "Documents are read on this Mac · audio and video are transcribed here by Hex · images, scans and long files are read with OpenRouter"
+                } else {
+                    "Documents are read on this Mac · audio and video are transcribed here by Hex · images, scans and long files need OpenRouter"
+                },
+                12.0,
+                MUTED,
+            )),
+    )
+}
+
 pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     if s.replay.is_some() {
         cx.reduced_motion(s.reduced_motion);
@@ -1562,6 +1647,17 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     let mut header = header(s);
     if s.replay.is_none() {
         // The tools that come and go most sit furthest left, so the rest keep still for them.
+        if let Some(job) = s.reading.first() {
+            let mut reading = if job.note.is_empty() {
+                format!("Reading {}…", job.name)
+            } else {
+                format!("{} · {}…", job.name, job.note)
+            };
+            if s.reading.len() > 1 {
+                reading = format!("{reading} +{} more", s.reading.len() - 1);
+            }
+            header = header.child(kit::progress(reading, "file-progress"));
+        }
         if !s.story {
             header = artwork(s, header);
         }
@@ -1618,7 +1714,7 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
         .h_full()
         .gap(12.0)
         .child(header)
-        .child(row().h(0.0).grow(1.0).min_h(0.0).child(main))
+        .child(drop_zone(s, main))
         .child(dock(s));
     if s.replay.is_some() {
         center = center.child(replay_controls(s));
@@ -1659,6 +1755,43 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
                     |s| s.gallery.status.clear(),
                 )),
         );
+    }
+    if s.replay.is_none() && !s.file_notice.is_empty() {
+        // A file that could not be read is said so until someone reads it again or puts the
+        // notice away: it is kept either way.
+        let mut notice = row()
+            .key("file-notice")
+            .gap(4.0)
+            .center_y()
+            .pl(14.0)
+            .pr(6.0)
+            .py(4.0)
+            .radius(20.0)
+            .fill(GOLD.alpha(0.09))
+            .child(
+                label(&s.file_notice, 12.0, INK)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .mr(4.0)
+                    .wrap_anywhere(),
+            );
+        if s.file_retry.is_some() && s.ingest.is_some() && !s.read_only {
+            notice = notice.child(kit::tool(
+                Some(Icon::Retry),
+                "Read again",
+                "retry-file",
+                State::retry_file,
+            ));
+        }
+        center = center.child(notice.child(kit::icon_button(
+            Icon::Close,
+            "Dismiss",
+            "file-dismiss",
+            |s| {
+                s.file_notice.clear();
+                s.file_retry = None;
+            },
+        )));
     }
     center = center.child(status(s));
     window(s, cx, center)

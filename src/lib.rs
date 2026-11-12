@@ -3,6 +3,7 @@ pub mod art;
 pub mod artist;
 pub mod camera;
 pub mod generated_art;
+pub mod ingest;
 pub mod model;
 pub mod organizer;
 pub mod presentation;

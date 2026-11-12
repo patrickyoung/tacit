@@ -508,3 +508,131 @@ fn whole_map_artwork_has_portable_scope_and_cannot_replace_a_same_named_theme() 
     assert_eq!(legacy.scope, ArtworkScope::Theme);
     assert!(serde_json::to_value(legacy).unwrap().get("scope").is_none());
 }
+
+#[test]
+fn a_dropped_file_replays_from_the_journal_without_being_read_again() {
+    use tacit::{ingest::Kind, timeline::Attachment};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.json");
+    let mut journal = Journal::open(&path, Session::default()).unwrap();
+    let before = serde_json::to_value(journal.projection.content()).unwrap();
+    assert!(
+        before.get("attachments").is_none() && before.get("attachment_links").is_none(),
+        "a session with no files reads as it did before files could be dropped"
+    );
+    let source = dir.path().join("Plan.PDF");
+    std::fs::write(&source, b"%PDF-1.4 not really").unwrap();
+    let asset = tacit::timeline::store(&journal.root.join("media"), &source, "pdf").unwrap();
+    assert_eq!(
+        asset,
+        format!("{}.pdf", blake3::hash(b"%PDF-1.4 not really").to_hex())
+    );
+    // The same contents are kept once, whatever the file was called.
+    let again = dir.path().join("copy.pdf");
+    std::fs::copy(&source, &again).unwrap();
+    assert_eq!(
+        tacit::timeline::store(&journal.root.join("media"), &again, "pdf").unwrap(),
+        asset
+    );
+    assert_eq!(
+        std::fs::read_dir(journal.root.join("media"))
+            .unwrap()
+            .count(),
+        1
+    );
+    let attachment = Attachment {
+        id: "attachment-1".into(),
+        name: "Plan.PDF".into(),
+        kind: Kind::Pdf,
+        asset,
+    };
+    journal
+        .append(
+            10,
+            Event::AttachmentSaved {
+                attachment: attachment.clone(),
+            },
+        )
+        .unwrap();
+    // Read, captured and linked together, or not at all.
+    assert!(
+        journal
+            .append(
+                15,
+                Event::Transaction {
+                    events: vec![
+                        Event::AttachmentRead {
+                            attachment: "attachment-1".into(),
+                            text: "We ship in March.".into(),
+                        },
+                        Event::AttachmentLinked {
+                            attachment: "attachment-9".into(),
+                            thought_id: 1,
+                        },
+                    ],
+                },
+            )
+            .is_err()
+    );
+    assert!(journal.projection.readings.is_empty());
+    journal
+        .append(
+            20,
+            Event::Transaction {
+                events: vec![
+                    Event::AttachmentRead {
+                        attachment: "attachment-1".into(),
+                        text: "We ship in March.".into(),
+                    },
+                    Event::SessionChanged {
+                        change: SessionEvent::capture(
+                            &journal.projection.session,
+                            "We ship in March.",
+                        ),
+                    },
+                    Event::AttachmentLinked {
+                        attachment: "attachment-1".into(),
+                        thought_id: 1,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+    for refused in [
+        Event::AttachmentSaved {
+            attachment: attachment.clone(),
+        },
+        Event::AttachmentSaved {
+            attachment: Attachment {
+                id: "attachment-2".into(),
+                asset: "../outside.pdf".into(),
+                ..attachment.clone()
+            },
+        },
+        Event::AttachmentRead {
+            attachment: "attachment-2".into(),
+            text: "Words from nowhere.".into(),
+        },
+    ] {
+        assert!(journal.append(30, refused).is_err());
+    }
+    let original = journal.original(&attachment).unwrap();
+    // An original may be removed to save space: the journal holds what it said.
+    std::fs::remove_file(original).unwrap();
+    let replayed = Journal::read(&path).unwrap();
+    assert_eq!(replayed.projection, journal.projection);
+    assert_eq!(replayed.projection.attachments, vec![attachment.clone()]);
+    assert_eq!(
+        &*replayed.projection.readings["attachment-1"],
+        "We ship in March."
+    );
+    assert_eq!(replayed.projection.attachment_links["attachment-1"], 1);
+    assert_eq!(
+        replayed.projection.session.thoughts[0].text,
+        "We ship in March."
+    );
+    assert_eq!(replayed.original(&attachment), None);
+    let content = serde_json::to_value(replayed.projection.content()).unwrap();
+    assert_eq!(content["attachments"][0]["kind"], "pdf");
+    assert_eq!(content["attachment_links"]["attachment-1"], 1);
+}
