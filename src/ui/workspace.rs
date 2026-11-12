@@ -53,6 +53,13 @@ impl State {
         self.zoom_readout
             .set(format!("{:.0}%", self.camera_zoom.get() * 100.0));
     }
+    /// Lets a gesture move the camera without the view being built again. A gliding camera is
+    /// bound to a spring, so the view is built once more to bind the camera to the gesture.
+    fn steer(&self, tx: &mut Tx) {
+        if !self.gliding.replace(false) {
+            tx.live_only();
+        }
+    }
     pub(super) fn zoom_center(&mut self, factor: f32) {
         if self.replay.is_some() {
             return;
@@ -140,6 +147,7 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
         [0.0; 2]
     };
     s.map_size.set(size);
+    let mut gliding = false;
     if s.replay.is_none() {
         if s.framing.get() == Framing::Restored {
             // A view that already shows every idea was never focused on a detail.
@@ -159,9 +167,37 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
             let camera = s.frame(size, viewport);
             s.camera_zoom.set(camera.zoom);
             s.camera_pan.set(camera.pan);
+            // The camera glides after a map that grows, and through whatever that does to the
+            // canvas. It keeps pace with a window being resized, and a canvas still finding
+            // its size in a new window is not worth a glide.
+            let framing = [
+                size,
+                viewport,
+                rune::memo::layout_size("root").unwrap_or_default(),
+            ];
+            gliding = match s.framed.replace(Some(framing)) {
+                Some(seen) if seen == framing => s.gliding.get(),
+                Some(seen) => {
+                    seen[2] == framing[2]
+                        && (seen[1] == framing[1] || s.gliding.get())
+                        && !s.reduced_motion
+                }
+                None => false,
+            };
+        } else {
+            s.framed.set(None);
         }
         s.read_out_zoom();
     }
+    s.gliding.set(gliding);
+    let bind = |spring: Option<rune::Spring>| {
+        let (zoom, pan) = (&s.camera_zoom, &s.camera_pan);
+        match spring {
+            Some(spring) => (zoom.smooth(spring), pan.smooth(spring)),
+            None => (zoom.into(), pan.into()),
+        }
+    };
+    let (zoom, pan) = bind(gliding.then_some(kit::GLIDE));
     let mut map = kit::stage(el().key("map"))
         .help("Drag or scroll to pan. Pinch to zoom. Use Fit map to see every idea.")
         .w(0.0)
@@ -187,13 +223,12 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
                 let mut camera = s.camera();
                 camera.zoom_at((e.dy * 0.006).exp(), [e.x, e.y]);
                 s.set_camera(camera);
-                tx.live_only();
             } else {
                 let p = s.camera_pan.get();
                 s.camera_pan.set([p[0] + e.dx, p[1] + e.dy]);
                 s.framing.set(Framing::Held);
-                tx.live_only();
             }
+            s.steer(tx);
             true
         })
         .on_magnify(|s: &mut State, e, tx| {
@@ -201,7 +236,7 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
                 let mut camera = s.camera();
                 camera.zoom_at(1.0 + e.delta, [e.x, e.y]);
                 s.set_camera(camera);
-                tx.live_only();
+                s.steer(tx);
             }
             true
         })
@@ -230,14 +265,18 @@ pub(super) fn canvas(s: &State, sheet: El, size: [f32; 2]) -> El {
                 }
                 _ => {}
             }
-            tx.live_only();
+            if s.framing.get() == Framing::Held {
+                s.steer(tx);
+            } else {
+                tx.live_only();
+            }
         })
         .child(
             sheet
                 .absolute(shift[0], shift[1])
                 .origin(0.0, 0.0)
-                .live_scale(&s.camera_zoom)
-                .live_offset(&s.camera_pan),
+                .live_scale(zoom)
+                .live_offset(pan),
         );
     if s.replay.is_some() {
         return map;
