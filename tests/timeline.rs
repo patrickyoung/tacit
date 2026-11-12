@@ -522,6 +522,10 @@ fn a_dropped_file_replays_from_the_journal_without_being_read_again() {
     );
     let source = dir.path().join("Plan.PDF");
     std::fs::write(&source, b"%PDF-1.4 not really").unwrap();
+    // A file that may not be written to is kept like any other.
+    let mut permissions = std::fs::metadata(&source).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&source, permissions).unwrap();
     let asset = tacit::timeline::store(&journal.root.join("media"), &source, "pdf").unwrap();
     assert_eq!(
         asset,

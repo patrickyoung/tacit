@@ -830,8 +830,14 @@ mod tests {
 
     #[test]
     fn a_tool_that_hangs_is_stopped() {
-        let mut command = Command::new("/bin/sleep");
-        command.arg("30");
+        // Windows has no sleep: there a ping a second, thirty times, takes as long.
+        let (tool, args) = if cfg!(windows) {
+            ("ping", &["-n", "30", "127.0.0.1"][..])
+        } else {
+            ("/bin/sleep", &["30"][..])
+        };
+        let mut command = Command::new(tool);
+        command.args(args);
         let started = Instant::now();
         let output = run(command, Duration::from_millis(100)).unwrap();
         assert!(!output.status.success());

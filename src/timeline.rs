@@ -1006,12 +1006,21 @@ pub fn store(media: &Path, source: &Path, extension: &str) -> io::Result<String>
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
         }
+        // On Windows the copy of a read-only file is read-only too, and cannot be flushed.
+        #[cfg(windows)]
+        {
+            let mut permissions = fs::metadata(&temp)?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(&temp, permissions)?;
+        }
         let name = asset_name(&temp, extension)?;
         let target = media.join(&name);
         if target.exists() {
             fs::remove_file(&temp)?;
         } else {
-            File::open(&temp)?.sync_all()?;
+            // Opened for writing: Windows flushes no other kind of handle.
+            OpenOptions::new().write(true).open(&temp)?.sync_all()?;
             fs::rename(&temp, target)?;
         }
         Ok(name)
