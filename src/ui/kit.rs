@@ -379,6 +379,76 @@ pub(super) fn chip(title: impl Into<String>, ink: Color, max_w: f32) -> El {
         .child(caption(title, 14.5, 600.0, WHITE).truncate())
 }
 
+/// The spring the map moves on: a quick stretch that overshoots once and is still.
+pub(super) const SNAP: rune::Spring = rune::Spring::new(0.34, 0.32);
+
+/// How long the map makes room before something new arrives in it.
+const ROOM: f32 = 0.12;
+
+/// The spring the camera follows the map on: as quick, without the overshoot.
+pub(super) const GLIDE: rune::Spring = rune::Spring::new(0.36, 0.0);
+
+/// One place on the map, keyed by the branch it belongs to. What sits in it pops in when it
+/// arrives and out when it goes, and snaps across when its place only shifts.
+pub(super) fn place(key: impl Into<String>, at: [f32; 2], node: El) -> El {
+    el().key(key.into())
+        .absolute(at[0], at[1])
+        .transition(rune::Transition::scale(0.55).allow_small_scale().springs(
+            rune::SpringPair::new(rune::Spring::new(0.36, 0.42), rune::Spring::new(0.16, 0.0)),
+        ))
+        // Its neighbours make room first.
+        .enter_delay(ROOM)
+        .motion(SNAP)
+        .motion_intent(rune::MotionIntent::OVERSHOOT)
+        .child(node)
+}
+
+/// Which way each stroke of the map ran when it was last drawn, and how often it has turned
+/// over since it first appeared.
+pub(super) type Bearings = std::cell::RefCell<std::collections::HashMap<String, (bool, u32)>>;
+
+/// One stroke of the map on a canvas that spans exactly from `from` to `to`, so the stroke
+/// stretches with the nodes it joins while they move. `draw` receives both ends in the
+/// canvas's own coordinates. A new stroke traces itself on from its start.
+pub(super) fn span(
+    bearings: &Bearings,
+    key: String,
+    (from, to): ([f32; 2], [f32; 2]),
+    draw: impl FnOnce(Shape, [f32; 2], [f32; 2]) -> Shape,
+) -> El {
+    // A level stroke still needs a box to stretch from.
+    let size = [0, 1].map(|axis| (to[axis] - from[axis]).abs().max(1.0));
+    // A canvas stretches but cannot turn over. A level stroke keeps the bearing it had, so it
+    // stretches from there; one that now runs the other way is drawn afresh.
+    let rise = to[1] - from[1];
+    let mut bearings = bearings.borrow_mut();
+    let (was, turns) = bearings.get(&key).copied().unwrap_or((rise < 0.0, 0));
+    let up = if rise.abs() < 1.0 { was } else { rise < 0.0 };
+    let turns = turns + u32::from(up != was);
+    let start = [
+        if to[0] < from[0] { size[0] } else { 0.0 },
+        if up { size[1] } else { 0.0 },
+    ];
+    let end = [size[0] - start[0], size[1] - start[1]];
+    let stroke = canvas(draw(Shape::new().view_box(size[0], size[1]), start, end))
+        .key(format!("{key}-{turns}"));
+    bearings.insert(key, (up, turns));
+    stroke
+        .absolute(from[0].min(to[0]), from[1].min(to[1]))
+        .size(size[0], size[1])
+        .transition(
+            rune::Transition::asymmetric(rune::Transition::draw(), rune::Transition::opacity())
+                .springs(rune::SpringPair::new(
+                    rune::Spring::new(0.24, 0.0),
+                    rune::Spring::new(0.12, 0.0),
+                )),
+        )
+        // It starts from a fork that has come to rest.
+        .enter_delay(ROOM)
+        .motion(SNAP)
+        .motion_intent(rune::MotionIntent::OVERSHOOT)
+}
+
 fn pressable(control: El, key: &str, action: impl Fn(&mut State) + 'static) -> El {
     control
         .key(key)

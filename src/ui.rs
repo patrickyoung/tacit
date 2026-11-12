@@ -116,6 +116,14 @@ pub struct State {
     zoom_readout: rune::LiveText,
     map_size: std::cell::Cell<[f32; 2]>,
     framing: std::cell::Cell<workspace::Framing>,
+    /// What the following camera last framed: the map, the canvas and the window.
+    framed: std::cell::Cell<Option<[[f32; 2]; 3]>>,
+    /// The camera is bound to a spring, to follow the map as it grows.
+    gliding: std::cell::Cell<bool>,
+    /// Which way each stroke of the map ran, and how often it has turned over.
+    bearings: std::cell::RefCell<std::collections::HashMap<String, (bool, u32)>>,
+    /// The maps a `file` scene has yet to show, and the second each is due.
+    steps: std::collections::VecDeque<(f64, Session)>,
     drag_pan: [f32; 2],
     transcript_expanded: bool,
     transcript_following: bool,
@@ -148,7 +156,6 @@ pub struct State {
     agent: Option<tacit::agent::Worker>,
     pace: tacit::agent::pace::Pace,
     worker: Option<tacit::organizer::Worker>,
-    settling: f32,
     settled_at: f64,
     busy: bool,
     pulse: f32,
@@ -425,6 +432,10 @@ impl State {
             zoom_readout: rune::LiveText::new("100%"),
             map_size: std::cell::Cell::new([1100.0, 600.0]),
             framing: std::cell::Cell::new(workspace::Framing::Follow),
+            framed: Default::default(),
+            gliding: Default::default(),
+            bearings: Default::default(),
+            steps: Default::default(),
             drag_pan: [0.0; 2],
             transcript_expanded: false,
             transcript_following: true,
@@ -456,7 +467,6 @@ impl State {
             agent: None,
             pace: Default::default(),
             worker: None,
-            settling: 1.0,
             settled_at: -10.0,
             busy: false,
             pulse: 0.0,
@@ -533,12 +543,27 @@ impl State {
     /// A map as the agent leaves it: keyword labels, a repeat combined with the thought it
     /// repeats, cross-links, a thread to read, and a parking lot of each kind.
     /// A map saved as JSON by `agent_eval frames=DIR`, named by `TACIT_SCENE_SESSION`, shown
-    /// as a snapshot. Without one it is the plain demo.
+    /// as a snapshot. Without one it is the plain demo. `TACIT_SCENE_STORY` names a directory
+    /// written by `story_video` instead, and its maps are shown in turn, each at its time on
+    /// the timeline.
     pub fn file_demo() -> Self {
         let mut s = Self::demo();
-        let saved = std::env::var("TACIT_SCENE_SESSION")
-            .ok()
-            .and_then(|path| std::fs::read_to_string(path).ok())
+        let read = |path: PathBuf| std::fs::read_to_string(path).ok();
+        if let Some(dir) = std::env::var_os("TACIT_SCENE_STORY").map(PathBuf::from) {
+            let timeline = read(dir.join("timeline.json"))
+                .and_then(|text| serde_json::from_str::<Vec<serde_json::Value>>(&text).ok());
+            for step in timeline.unwrap_or_default() {
+                let map = step["file"].as_str().and_then(|file| read(dir.join(file)));
+                if let Some(session) = map.and_then(|text| serde_json::from_str(&text).ok()) {
+                    s.steps
+                        .push_back((step["at"].as_f64().unwrap_or(0.0), session));
+                }
+            }
+            s.projection.session = s.steps.pop_front().map(|step| step.1).unwrap_or_default();
+            return s;
+        }
+        let saved = std::env::var_os("TACIT_SCENE_SESSION")
+            .and_then(|path| read(path.into()))
             .and_then(|text| serde_json::from_str(&text).ok());
         if let Some(session) = saved {
             s.projection.session = session;
@@ -1139,7 +1164,7 @@ impl State {
                 self.organizer_status = AGENT_IDLE.into();
                 return;
             }
-            (self.settled_at, self.settling) = (now, 0.0);
+            self.settled_at = now;
             if self.direction_draft.text.trim() == instruction {
                 self.direction_draft = TextEdit::new("");
             }
@@ -1456,7 +1481,6 @@ impl State {
         self.reduced_motion = scene.reduced_motion;
         self.busy = scene.busy;
         self.settled_at = scene.settled_at;
-        self.settling = ((render_now - self.settled_at) / 0.85).clamp(0.0, 1.0) as f32;
         self.pulse = ((render_now * 3.0).sin() as f32 + 1.0) / 2.0;
         self.organizer_status = scene.organizer_status;
         self.voice_status = scene.voice_status;
@@ -2412,9 +2436,9 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             },
         ]
     });
-    let mut drawing = Shape::new();
+    let mut strokes = Vec::new();
     let mut labels = Vec::new();
-    for (group, (_, name, role)) in groups.iter().enumerate() {
+    for (group, (id, name, role)) in groups.iter().enumerate() {
         let role = *role;
         let left = group % 2 == 0;
         // Toward the middle of the map, where every branch comes from.
@@ -2451,52 +2475,67 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 center[1] + if top { -24.0 } else { 24.0 },
             ]
         };
-        drawing = curve(drawing, start, [fork_x, fork_y], ink, 9.0);
+        // Places and strokes are keyed by the branch they belong to: a node that changes
+        // branch pops out of one and into the other instead of crossing the map.
+        let theme = id.clone().unwrap_or_else(|| format!("lens-{group}"));
+        strokes.push(kit::span(
+            &s.bearings,
+            format!("branch-{group}-{theme}"),
+            (start, [fork_x, fork_y]),
+            |shape, from, to| curve(shape, from, to, ink, 9.0),
+        ));
         let leaf_x = if left {
             12.0 + indent
         } else {
             width - leaf_w - 12.0 - indent
         };
         let mut heading = row()
-            .key(format!(
-                "theme-heading-{}",
-                groups[group]
-                    .0
-                    .clone()
-                    .unwrap_or_else(|| format!("lens-{group}"))
-            ))
-            .absolute(leaf_x, first_y - 46.0)
+            .key(format!("theme-heading-{theme}"))
             .gap(8.0)
             .center_y();
         if !mural {
             heading = heading.child(canvas(illustration(role)).size(38.0, 34.0));
         }
-        labels.push(heading.child(kit::chip(
-            name,
-            ink,
-            leaf_w - if mural { 0.0 } else { 46.0 },
-        )));
+        labels.push(kit::place(
+            format!("place-{group}-theme-{theme}"),
+            [leaf_x, first_y - 46.0],
+            heading.child(kit::chip(
+                name,
+                ink,
+                leaf_w - if mural { 0.0 } else { 46.0 },
+            )),
+        ));
         // Each card meets its twig at a bud on the edge that faces the middle of the map.
         let port = |x: f32, y: f32| [if left { x + leaf_w + 4.0 } else { x - 4.0 }, y + 27.0];
-        let bud = |shape: Shape, at: [f32; 2], size: f32, ink: Color| {
-            shape.line(
-                [at[0] - 0.25, at[1]],
-                [at[0] + 0.25, at[1]],
-                size,
-                LineCap::Round,
-                ink,
-            )
-        };
         // Twigs bend inside the clear channel beside their parent's cards, then run straight
         // to their own, so no stroke ever crosses a neighbor's paper.
-        let twig = |shape: Shape, (from, reach): ([f32; 2], f32), to: [f32; 2], ink, thick| {
-            let knee = [from[0] - inward * reach, to[1]];
-            let shape = curve(shape, from, knee, ink, thick);
-            if (knee[0] - to[0]).abs() < 0.5 {
-                shape
-            } else {
-                shape.line(knee, to, thick * 0.37, LineCap::Round, ink)
-            }
+        let twig = |key: String,
+                    (from, reach): ([f32; 2], f32),
+                    to: [f32; 2],
+                    ink: Color,
+                    (thick, bud): (f32, f32)| {
+            kit::span(
+                &s.bearings,
+                format!("twig-{group}-{key}"),
+                (from, to),
+                |shape, from, to| {
+                    let knee = [from[0] - inward * reach, to[1]];
+                    let mut shape = curve(shape, from, knee, ink, thick);
+                    if (knee[0] - to[0]).abs() >= 0.5 {
+                        shape = shape.line(knee, to, thick * 0.37, LineCap::Round, ink);
+                    }
+                    if bud > 0.0 {
+                        shape = shape.line(
+                            [to[0] - 0.25, to[1]],
+                            [to[0] + 0.25, to[1]],
+                            bud,
+                            LineCap::Round,
+                            ink,
+                        );
+                    }
+                    shape
+                },
+            )
         };
         let fork = ([fork_x, fork_y], 39.0);
         let entries = &entries[group];
@@ -2505,10 +2544,11 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             anchors.insert(id.clone(), fork);
         }
         if entries.is_empty() {
-            labels.push(
+            labels.push(kit::place(
+                format!("place-{group}-empty"),
+                [leaf_x, first_y],
                 row()
                     .key(format!("empty-branch-{group}"))
-                    .absolute(leaf_x, first_y)
                     .w(leaf_w)
                     .h(54.0)
                     .px(14.0)
@@ -2517,8 +2557,14 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                     .fill(ink.alpha(0.05))
                     .border(1.0, ink.alpha(0.16))
                     .child(label("Let a thought take root…", 13.0, MUTED)),
-            );
-            drawing = twig(drawing, fork, port(leaf_x, first_y), ink.alpha(0.4), 2.5);
+            ));
+            strokes.push(twig(
+                "empty".into(),
+                fork,
+                port(leaf_x, first_y),
+                ink.alpha(0.4),
+                (2.5, 0.0),
+            ));
         }
         for (index, entry) in entries.iter().enumerate() {
             let id = entry.id;
@@ -2532,28 +2578,34 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 .and_then(|id| anchors.get(id))
                 .copied()
                 .unwrap_or(fork);
-            drawing = twig(
-                drawing,
+            // A draft already holds the place of the thought it will become.
+            let name = match &entry.theme {
+                Some(theme) => format!("theme-{theme}"),
+                None => format!("thought-{}", id.unwrap_or(s.projection.session.next_id)),
+            };
+            strokes.push(twig(
+                name.clone(),
                 parent,
                 end,
                 ink,
                 if entry.theme.is_some() {
-                    5.0 - entry.depth as f32
+                    (5.0 - entry.depth as f32, 9.0)
                 } else if depth == 0 {
-                    3.5
+                    (3.5, 7.0)
                 } else {
-                    2.5
+                    (2.5, 7.0)
                 },
-            );
+            ));
+            let place = format!("place-{group}-{name}");
             if let Some(theme) = &entry.theme {
                 // Its own thoughts peel off the incoming branch just before it lands.
                 anchors.insert(theme.clone(), ([end[0] + inward * 30.0, end[1]], 30.0));
-                drawing = bud(drawing, end, 9.0, ink);
-                labels.push(
+                labels.push(kit::place(
+                    place,
+                    [leaf_x, y],
                     kit::bough(
                         col()
                             .key(format!("theme-heading-{theme}"))
-                            .absolute(leaf_x, y)
                             .w(leaf_w)
                             .h(54.0)
                             .px(14.0)
@@ -2570,10 +2622,9 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                         ink.alpha(0.72),
                     ))
                     .child(kit::caption(words, 15.0, 600.0, ink).truncate()),
-                );
+                ));
                 continue;
             }
-            drawing = bud(drawing, end, 7.0, ink);
             let selected = id.is_some() && id == s.selected;
             let pinned = id.is_some_and(|id| {
                 s.projection
@@ -2590,13 +2641,10 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             let mut node = kit::leaf(
                 col()
                     .key(id.map_or_else(|| "draft-preview".into(), |id| format!("thought-{id}")))
-                    // A kept draft becomes its thought where it grew, instead of trading places
-                    // with a copy of itself.
-                    .matched(format!(
-                        "thought-{}",
-                        id.unwrap_or(s.projection.session.next_id)
-                    ))
-                    .absolute(leaf_x, y)
+                    // A kept draft becomes its thought on the spot; the place it holds does the
+                    // arriving and the leaving.
+                    .transition(rune::Transition::none())
+                    .instant_changes()
                     .w(leaf_w)
                     .h(54.0)
                     .px(14.0)
@@ -2608,7 +2656,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                 } else if id.is_none() {
                     0.45
                 } else {
-                    (1.0 - s.settling) * 0.6
+                    0.0
                 },
             )
             .role("button")
@@ -2633,7 +2681,7 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
                     }
                 });
             }
-            labels.push(node);
+            labels.push(kit::place(place, [leaf_x, y], node));
         }
     }
     // Rounded, overlapping cloud lobes leave a calm interior for the title.
@@ -2650,11 +2698,15 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
         .cubic_to(p(-126.0, 30.0), p(-126.0, -13.0), p(-101.0, -27.0))
         .cubic_to(p(-100.0, -38.0), p(-92.0, -43.0), p(-82.0, -43.0))
         .close();
-    if !mural {
-        drawing = drawing
-            .fill_path(&cloud, WHITE)
-            .stroke_path(&cloud, 2.5, LineCap::Round, GOLD);
-    }
+    let cloud_paper = || {
+        canvas(
+            Shape::new()
+                .fill_path(&cloud, WHITE)
+                .stroke_path(&cloud, 2.5, LineCap::Round, GOLD),
+        )
+        .absolute(0.0, 0.0)
+        .size(width, height)
+    };
     let synthesis_size = (width - 2.0 * (leaf_w + indent + 26.0)).clamp(250.0, 420.0);
     let synthesis_coverage = if cx.is_reduced_motion() {
         if s.gallery
@@ -2816,32 +2868,21 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             art_layer = art_layer.child(art);
         }
     }
-    let branches = canvas(drawing)
-        .key("tree-branches")
-        .size(width, height)
-        .opacity(if cx.is_reduced_motion() {
-            1.0
-        } else {
-            0.35 + 0.65 * s.settling
-        });
+    let mut branches = el().key("tree-branches").size(width, height);
+    for stroke in strokes {
+        branches = branches.child(stroke);
+    }
+    if !mural {
+        branches = branches.child(cloud_paper().key("tree-cloud"));
+    }
     sheet = if mural {
         sheet.child(branches).child(art_layer)
     } else {
         sheet.child(art_layer).child(branches)
     };
     if !mural && synthesis_coverage > 0.0 && s.art_style != Style::Off {
-        // Keep the title legible even while branch transitions fade their canvas.
-        sheet = sheet.child(
-            canvas(Shape::new().fill_path(&cloud, WHITE).stroke_path(
-                &cloud,
-                2.5,
-                LineCap::Round,
-                GOLD,
-            ))
-            .key("synthesis-title-mask")
-            .absolute(0.0, 0.0)
-            .size(width, height),
-        );
+        // Keep the title legible over the synthesis artwork.
+        sheet = sheet.child(cloud_paper().key("synthesis-title-mask"));
     }
     for node in labels {
         sheet = sheet.child(node);
@@ -2881,6 +2922,9 @@ fn tree(s: &State, cx: &Cx<State>) -> El {
             .absolute(hub[0] - 190.0, hub[1] - 60.0)
             .size(380.0, 120.0)
             .center()
+            // The hub moves with the branches that start from it.
+            .motion(kit::SNAP)
+            .motion_intent(rune::MotionIntent::OVERSHOOT)
             .child(card.max_w(380.0))
     } else if mural {
         col()
@@ -4160,7 +4204,11 @@ pub fn poll(s: &mut State, frame_now: f64, tx: &mut Tx) -> bool {
         .journal
         .as_ref()
         .map_or(frame_now, |j| j.now_ms() as f64 / 1000.0);
-    let changed = poll_live(s, now, tx);
+    let mut changed = poll_live(s, now, tx);
+    while s.steps.front().is_some_and(|step| step.0 <= frame_now) {
+        s.projection.session = s.steps.pop_front().expect("a step is due").1;
+        changed = true;
+    }
     // The compositor commits the final layout and original pixels together. Polling
     // before layout must not serialize and sync a second presentation for that frame.
     if !s.capturing_pixels() {
@@ -4241,12 +4289,7 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         s.direction_status = "The map agent is not running; your instruction is kept here".into();
         changed = true;
     }
-    let progress = ((now - s.settled_at) / 0.85).clamp(0.0, 1.0) as f32;
-    if s.settling != progress {
-        s.settling = progress;
-        changed = true;
-    }
-    if s.settling < 1.0 || s.busy {
+    if s.busy {
         s.pulse = ((now * 3.0).sin() as f32 + 1.0) / 2.0;
         changed = true;
     }
@@ -4257,7 +4300,7 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     } else {
         std::mem::take(&mut s.busy)
     };
-    if s.busy || s.settling < 1.0 {
+    if s.busy {
         tx.wake_after(std::time::Duration::from_millis(33));
     }
     changed
@@ -4321,7 +4364,7 @@ fn attend(s: &mut State, now: f64, tx: &mut Tx) -> bool {
                 s.organizer_status = error;
                 continue;
             }
-            (s.settled_at, s.settling) = (now, 0.0);
+            s.settled_at = now;
             s.save();
         }
         s.pace
@@ -4430,7 +4473,7 @@ fn organize_locally(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         }) {
             Ok(()) => {
                 s.organizer_status = "Organized by local model · suggestions".into();
-                (s.settled_at, s.settling) = (now, 0.0);
+                s.settled_at = now;
                 s.save();
             }
             Err(e) => s.organizer_status = format!("{e} · keeping local organization"),
