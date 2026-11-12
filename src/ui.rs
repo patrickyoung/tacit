@@ -532,6 +532,19 @@ impl State {
     }
     /// A map as the agent leaves it: keyword labels, a repeat combined with the thought it
     /// repeats, cross-links, a thread to read, and a parking lot of each kind.
+    /// A map saved as JSON by `agent_eval frames=DIR`, named by `TACIT_SCENE_SESSION`, shown
+    /// as a snapshot. Without one it is the plain demo.
+    pub fn file_demo() -> Self {
+        let mut s = Self::demo();
+        let saved = std::env::var("TACIT_SCENE_SESSION")
+            .ok()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str(&text).ok());
+        if let Some(session) = saved {
+            s.projection.session = session;
+        }
+        s
+    }
     pub fn mapped_demo() -> Self {
         let mut s = Self::demo();
         let session = &mut s.projection.session;
