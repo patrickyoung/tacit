@@ -20,9 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-/// Text up to this many words goes onto the map as written, like a recording of that length.
-/// Past it the reader writes down what the text says instead.
-pub const VERBATIM_WORDS: usize = 800;
+/// Text up to this many words goes onto the map as written, like a recording of that length:
+/// the listener cuts it into thoughts and keeps every word. Past it the reader writes down
+/// what the text says instead, so that one file does not fill the map.
+pub const VERBATIM_WORDS: usize = 3_000;
 /// More text than this is not read at all: about a hundred and fifty pages.
 const MAX_TEXT: usize = 400_000;
 const MAX_FILE: u64 = 2 * 1024 * 1024 * 1024;
@@ -678,8 +679,7 @@ mod tests {
     #[test]
     fn short_text_goes_on_as_written_and_long_text_is_told_in_brief() {
         assert_eq!(statements_for(VERBATIM_WORDS), None);
-        assert_eq!(statements_for(VERBATIM_WORDS + 1), Some(16));
-        assert_eq!(statements_for(1_200), Some(24));
+        assert_eq!(statements_for(VERBATIM_WORDS + 1), Some(40));
         assert_eq!(statements_for(60_000), Some(40));
         let reader = Reader {
             runtime: None,
