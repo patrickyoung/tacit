@@ -75,6 +75,11 @@ pub const DIRECT_EFFORT: &str = STEWARD_EFFORT;
 /// one takes images and PDFs and is the careful one; this choice has not been measured.
 pub const READ_MODEL: &str = STEWARD_MODEL;
 pub const READ_EFFORT: &str = STEWARD_EFFORT;
+/// The librarian files what a dropped file says as notes in the knowledge base
+/// (`knowledge::librarian`). It is the steward's model for the same reason as the reader, and
+/// like it this choice has not been measured.
+pub const LIBRARY_MODEL: &str = STEWARD_MODEL;
+pub const LIBRARY_EFFORT: &str = STEWARD_EFFORT;
 
 #[derive(Clone)]
 pub struct CloudConfig {
@@ -89,6 +94,8 @@ pub struct CloudConfig {
     pub direct_effort: String,
     pub read_model: String,
     pub read_effort: String,
+    pub library_model: String,
+    pub library_effort: String,
 }
 impl CloudConfig {
     /// One client is one connection pool: keep it for as long as the calls keep coming.
@@ -140,6 +147,8 @@ impl CloudConfig {
             direct_effort: var("TACIT_DIRECT_EFFORT", DIRECT_EFFORT),
             read_model: var("TACIT_READ_MODEL", READ_MODEL),
             read_effort: var("TACIT_READ_EFFORT", READ_EFFORT),
+            library_model: var("TACIT_LIBRARY_MODEL", LIBRARY_MODEL),
+            library_effort: var("TACIT_LIBRARY_EFFORT", LIBRARY_EFFORT),
         }))
     }
 }

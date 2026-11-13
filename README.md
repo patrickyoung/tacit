@@ -90,6 +90,37 @@ cargo run -- --check-file /path/to/file          # uses OpenRouter where the tab
 cargo run -- --check-file /path/to/file --local  # never leaves this Mac
 ```
 
+## The knowledge base
+
+A dragged file has a second place to land. While files are over the window, the map shows two targets: **Drop to add to this map**, as above, and **Drop to file in the knowledge base**. A file dropped on the second is not turned into thoughts. It is kept, read the same way (the table above applies), and written up by the librarian as a zettelkasten: small notes of one idea each, with a title that states the idea, a one-sentence gist, a topic, keywords, and links to the notes it builds on. Nothing is added to the map. The header shows which file is being filed and how far along it is, and afterwards a button with the number of notes, which opens their folder.
+
+There is one knowledge base for the whole library of sessions. It is a folder beside the notebook, `session.knowledge/` next to `session.json`:
+
+- `notes/`: one Markdown file per note, with a short front matter (`id`, `title`, `topic`, `keywords`, `source`), the gist as a quoted line under the title, and `[[links]]` in the text. They are yours to edit, and Markdown notes you put there yourself are read as notes when the app starts.
+- `sources/`: each filed file, kept whole, and beside it the text read from it, so a filing that failed is not read or transcribed twice.
+
+`TACIT_KNOWLEDGE=/path/to/folder` keeps it somewhere else, and `TACIT_KNOWLEDGE=off` removes the second target and everything below.
+
+### How the map agent reads it
+
+The knowledge base informs how a map is organised. It is never content: no note is put on a map, and the agents are told that a note is something the user knows, not something they said in this session. It reaches them a level at a time, so that a large knowledge base costs a turn little:
+
+1. **The index**: the topics, how many notes each holds, and the keywords its notes share. The steward and a directed turn always see it.
+2. **Cards**: one line of a note (id, title, topic, gist, and the ids it links to) for the notes nearest the map. The placer sees up to five, chosen by what the thoughts it is filing say, and nothing else, so it stays as quick as before. The steward and a directed turn see up to ten, chosen by the whole map and the instruction, and the notes those link to.
+3. **Whole notes**: the steward and a directed turn may answer by naming notes or topics to open. Nothing in that answer is applied; they are asked again with the notes in full (or a topic's cards), at most twice in a turn.
+
+Nearness is worked out on this Mac from the words a note is called by, with no model call. With no knowledge base, or an empty one, every prompt and brief is exactly what it was.
+
+Filing needs OpenRouter: what a filed file says goes to the librarian model a part at a time, about 1,300 words each, together with the index and the cards of notes near that part. Without a key the file is kept in `sources/` and nothing is written; drop it again once a key is configured. The cards and opened notes shown to the map agents go to OpenRouter with the rest of a turn. A file that is already in the knowledge base is refused by name.
+
+A knowledge base can be filled and looked at from the command line, without opening a session. With `--say`, the thoughts are then mapped with the notes in hand, by the placer and the steward, and with `--ask` a directed turn carries out an instruction on that map. The notes a turn opened are listed under it:
+
+```sh
+cargo run -- --check-knowledge /path/to/folder file.pdf notes.md
+cargo run -- --check-knowledge /path/to/folder --say "Agendas arrive late." --say "No one keeps time." \
+  --ask "Arrange this the way my handbook says meetings should run."
+```
+
 ## Saved sessions and replay
 
 Beside `session.json`, Tacit creates a private `session.tacit/` archive:
@@ -206,12 +237,13 @@ Thought labels spring into their new positions, colored branches fade back in, a
 | Steward | `openai/gpt-6.1-terra` | low | 3–7 s | `TACIT_STEWARD_MODEL`, `TACIT_STEWARD_EFFORT` |
 | Directed turn | `openai/gpt-6.1-terra` | low | 2–5 s, 5–9 s to reorganise a whole map | `TACIT_DIRECT_MODEL`, `TACIT_DIRECT_EFFORT` |
 | Reader: says what a dropped image, scan or long text holds | `openai/gpt-6.1-terra` | low | 2–5 s | `TACIT_READ_MODEL`, `TACIT_READ_EFFORT` |
+| Librarian: writes a filed file up as notes | `openai/gpt-6.1-terra` | low | not yet measured | `TACIT_LIBRARY_MODEL`, `TACIT_LIBRARY_EFFORT` |
 
-The defaults were chosen by measurement with the evaluations under **Development**, on synthetic talks scored against what a facilitator would have left on the wall. The placer is the quickest of the small models tried and the one with the tidiest labels. The steward at low effort kept every map sound; more reasoning and dearer models took two to five times as long without leaving a better map. The directed turn needs the larger model: the small ones answered sooner and fell short on every run, reaching only some of the thoughts an instruction covered. The listener cuts a recording in about a third of the time of the larger model used before, at a thirtieth of the cost. The reader is the one default not yet measured: it uses the steward's model because that one reads images and PDFs, and has only been tried on a few synthetic files. A 36-capture talk mapped end to end (nine placer turns, three to five steward turns) cost between one and two cents. On a third talk, which announces seven kinds of plot and then describes each, the map ends with the seven in families beside the framework that introduces them, each steward turn taking one call. Asked there for a branch per plot, a directed turn of three to seven seconds leaves eight main branches; asked to put all seven under one branch, it takes about five. The steward lets either stand, and is not sent back to them.
+The defaults were chosen by measurement with the evaluations under **Development**, on synthetic talks scored against what a facilitator would have left on the wall. The placer is the quickest of the small models tried and the one with the tidiest labels. The steward at low effort kept every map sound; more reasoning and dearer models took two to five times as long without leaving a better map. The directed turn needs the larger model: the small ones answered sooner and fell short on every run, reaching only some of the thoughts an instruction covered. The listener cuts a recording in about a third of the time of the larger model used before, at a thirtieth of the cost. The reader and the librarian are the defaults not yet measured: both use the steward's model, the reader because that one reads images and PDFs, and each has only been tried on a few synthetic files. A 36-capture talk mapped end to end (nine placer turns, three to five steward turns) cost between one and two cents. On a third talk, which announces seven kinds of plot and then describes each, the map ends with the seven in families beside the framework that introduces them, each steward turn taking one call. Asked there for a branch per plot, a directed turn of three to seven seconds leaves eight main branches; asked to put all seven under one branch, it takes about five. The steward lets either stand, and is not sent back to them.
 
 An effort of `off` disables reasoning; anything else is passed on as OpenRouter's reasoning effort (`low`, `medium`, `high`). A replacement model must support strict structured output. Provider routing favors latency for the listener and the placer, whose answers are short, and throughput for the steward and directed turns.
 
-Kept thoughts, their labels and branches, the parking lot, and the guidance you submitted go to OpenRouter and its model providers; unsent drafts and Hex audio stay out of these requests. A dropped image, scan or long text goes to the reader as **Dropping files onto the map** sets out. The placer sees the map as an outline with the latest words; the steward and directed turns also read the original words behind the labels, newest first, up to about 24,000 characters. Cloud calls use your OpenRouter credits. The agent keeps a map of up to 400 thoughts, counting parked ones; a larger map remains editable by hand. Provider error text is never shown or logged, since it can echo a private prompt. Older notebooks load without migration.
+Kept thoughts, their labels and branches, the parking lot, and the guidance you submitted go to OpenRouter and its model providers; unsent drafts and Hex audio stay out of these requests. A dropped image, scan or long text goes to the reader as **Dropping files onto the map** sets out, and what a filed file says to the librarian, as do the notes near a map to the map agents, as **The knowledge base** sets out. The placer sees the map as an outline with the latest words; the steward and directed turns also read the original words behind the labels, newest first, up to about 24,000 characters. Cloud calls use your OpenRouter credits. The agent keeps a map of up to 400 thoughts, counting parked ones; a larger map remains editable by hand. Provider error text is never shown or logged, since it can echo a private prompt. Older notebooks load without migration.
 
 A small live diagnostic sends only the built-in fictional demo: the placer files it, the steward reads the whole map, the placer files one more thought, and a directed turn renames the map. Each turn's edits are applied the way the journal replays them, and its time, calls and resulting shape are printed:
 
@@ -326,6 +358,7 @@ Headless runs do not read or write your real notebook or contact OpenRouter, Oll
 - `src/agent/`: `prompt` (the mapper's method told to each tier, and the answer schemas), `brief` (the map as the outline a turn is shown), `wire` (answers read into edits), `step` (one edit against the map), `health` (the rule-based check of the map's shape), `pace` (when each tier is due), `turn` (one model turn, its self-check, and what is remembered from one turn to the next), `worker` (the three lanes, off the UI thread).
 - `src/recording.rs`: the listener, which cuts a finished recording into thoughts without changing a word.
 - `src/ingest.rs`: dropped files, kept in the archive and read into text on this Mac or by the reader model.
+- `src/knowledge.rs`: the knowledge base: notes as Markdown files, their links, which notes are near a text, and the three levels an agent is shown them at. `src/knowledge/librarian.rs` writes a filed file up as notes.
 - `src/capture.rs`: original render-texture capture and exact presentation.
 - `src/video_archive.rs`: lossless PNG masters, timestamped FFV1/PCM video export.
 - `src/timeline.rs`: durable event log, shared projection, media integrity, WebVTT, and recovery.

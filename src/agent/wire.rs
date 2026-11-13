@@ -313,6 +313,21 @@ pub(crate) fn first<T: DeserializeOwned>(raw: &str) -> Option<T> {
     let mut values = serde_json::Deserializer::from_str(object).into_iter();
     values.next()?.ok()
 }
+/// The notes and topics an answer asks to read before it says anything else.
+pub fn open(raw: &str) -> Vec<String> {
+    #[derive(Deserialize)]
+    struct Wanted {
+        #[serde(rename = "OPEN", default, deserialize_with = "lenient")]
+        open: Vec<String>,
+    }
+    let wanted = first::<Wanted>(raw).map(|wanted| wanted.open);
+    let named = |name: &String| !name.trim().is_empty();
+    wanted
+        .unwrap_or_default()
+        .into_iter()
+        .filter(named)
+        .collect()
+}
 pub fn read(raw: &str, session: &Session, tier: Tier) -> Result<Reply, String> {
     match tier {
         Tier::Place => first(raw).map(|wire| placement(wire, session)),

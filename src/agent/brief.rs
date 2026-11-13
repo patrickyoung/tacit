@@ -1,7 +1,8 @@
 //! What a turn is shown: the map as a mapper reads it from the wall, as an outline rather than
 //! the session's JSON. Small enough to send every few seconds.
 use super::turn::Stands;
-use super::{MAX_ROOTS, health};
+use super::{MAX_ROOTS, Tier, health};
+use crate::knowledge::{Library, Note};
 use crate::model::{ParkKind, Session, Thought};
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -10,6 +11,11 @@ use std::fmt::Write;
 pub const BATCH: usize = 12;
 /// Characters of original words the steward reads in one turn, newest first.
 const WORDS: usize = 24_000;
+/// Notes of the knowledge base a turn is shown a line of: the placer, the others, and for
+/// those the notes one link on.
+const NEAR_PLACE: usize = 5;
+const NEAR: usize = 10;
+const LINKED: usize = 4;
 
 /// One line of someone's words, however long they spoke.
 fn clip(text: &str, max: usize) -> String {
@@ -324,8 +330,107 @@ pub fn steward(session: &Session, holds: &BTreeSet<u64>, stands: &Stands) -> Str
 /// A directed turn's brief: the whole map, then what the user asked of it. No checklist: the
 /// instruction decides what changes, and the steward tends the rest.
 pub fn direct(session: &Session, holds: &BTreeSet<u64>, instruction: &str) -> String {
+    directed(session, holds, instruction, "")
+}
+/// The same with what the knowledge base holds on the map, from [`knowledge`]. The
+/// instruction stays last.
+pub fn directed(
+    session: &Session,
+    holds: &BTreeSet<u64>,
+    instruction: &str,
+    knowledge: &str,
+) -> String {
     let mut out = whole(session, holds, true);
+    out.push_str(knowledge);
     let _ = writeln!(out, "\nINSTRUCTION\n{}", instruction.trim());
+    out
+}
+
+/// What the user's knowledge base holds that bears on this map, as a section of a brief, or
+/// nothing when it has nothing to show. Context is loaded a level at a time. The placer is
+/// shown a line of each note near the thoughts it is filing, and no section when none is.
+/// The steward and a directed turn are shown the topics, a line of each note near the map
+/// and of the notes those link to, and open whole notes by asking.
+pub fn knowledge(
+    library: &Library,
+    session: &Session,
+    holds: &BTreeSet<u64>,
+    tier: Tier,
+    instruction: &str,
+) -> String {
+    let mut out = String::new();
+    if library.is_empty() {
+        return out;
+    }
+    // What the map is about, in parts: the more a part says of the subject, or of what the
+    // turn is there to do, the more its words count.
+    let mut about: Vec<(f32, &str)> = vec![];
+    if session.title != Session::default().title {
+        about.push((3.0, &session.title));
+    }
+    if let Some(charter) = &session.charter {
+        about.push((3.0, &charter.focus));
+    }
+    about.extend(session.categories.iter().map(|c| (2.0, c.name.as_str())));
+    let mut filed: Vec<&Thought> = session
+        .thoughts
+        .iter()
+        .filter(|t| t.category.is_some())
+        .collect();
+    filed.sort_unstable_by_key(|t| t.id);
+    let unfiled = waiting(session, holds);
+    let unfiled = |limit: usize| {
+        let new = move |t: &&Thought| unfiled.iter().take(limit).any(|id| *id == t.id);
+        session.thoughts.iter().filter(new)
+    };
+    let place = tier == Tier::Place;
+    if place {
+        about.extend(unfiled(BATCH).map(|t| (3.0, t.text.as_str())));
+        let recent = &filed[filed.len().saturating_sub(4)..];
+        about.extend(recent.iter().map(|t| (1.0, t.text.as_str())));
+    } else {
+        about.push((3.0, instruction));
+        about.extend(unfiled(usize::MAX).map(|t| (2.0, t.text.as_str())));
+        about.extend(filed.iter().map(|t| (1.0, t.map_label())));
+        let recent = &filed[filed.len().saturating_sub(12)..];
+        about.extend(recent.iter().map(|t| (1.0, t.text.as_str())));
+    }
+    let near = library.nearest(&about, if place { NEAR_PLACE } else { NEAR });
+    if place && near.is_empty() {
+        return out;
+    }
+    out.push_str("\nKNOWLEDGE\n");
+    let cards = |out: &mut String, notes: &[&Note]| {
+        for note in notes {
+            let _ = writeln!(out, "{}", library.card(note));
+        }
+    };
+    if place {
+        cards(&mut out, &near);
+        return out;
+    }
+    out.push_str(&library.index());
+    if near.is_empty() {
+        out.push_str("No note is near this map so far.\n");
+        return out;
+    }
+    out.push_str("Nearest this map:\n");
+    cards(&mut out, &near);
+    // One link on from the nearest: what a note builds on is often what explains it.
+    let mut linked: Vec<&Note> = vec![];
+    for note in near.iter().take(3) {
+        let to = note.links.iter().filter_map(|id| library.get(id));
+        for other in to.chain(library.linked_from(&note.id)) {
+            let shown = |n: &&Note| n.id == other.id;
+            if linked.len() < LINKED && !near.iter().any(shown) && !linked.iter().any(shown) {
+                linked.push(other);
+            }
+        }
+    }
+    if !linked.is_empty() {
+        out.push_str("Linked to those:\n");
+        cards(&mut out, &linked);
+    }
     out
 }
 
