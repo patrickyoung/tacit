@@ -1,4 +1,5 @@
 mod kit;
+mod room;
 mod workspace;
 use rune::{
     Color, Cx, El, Key, KeyEvent, LineCap, Path, ScrollSpec, Shape, TextEdit, TextStyle, Tx,
@@ -94,6 +95,12 @@ struct FileJob {
     read: bool,
     note: String,
 }
+/// A dropped file on its way into the knowledge base.
+struct Filing {
+    id: u64,
+    name: String,
+    note: String,
+}
 struct Replay {
     at_ms: u64,
     playing: bool,
@@ -187,6 +194,16 @@ pub struct State {
     /// What went wrong with a dropped file, and the attachment to read again if it was kept.
     file_notice: String,
     file_retry: Option<String>,
+    /// The knowledge base the map agents read from, and the librarian that files into it.
+    librarian: Option<tacit::knowledge::librarian::Worker>,
+    library: Option<std::sync::Arc<tacit::knowledge::Library>>,
+    knowledge_root: Option<PathBuf>,
+    /// Dropped files not yet filed as notes, in the order they are filed.
+    filing: Vec<Filing>,
+    know_over: bool,
+    /// Where the notes are read, and the researcher that answers questions from them.
+    room: room::Room,
+    researcher: Option<tacit::knowledge::research::Worker>,
     voice_worker: Option<voice::Worker>,
     voice_state: VoiceState,
     voice_status: String,
@@ -345,12 +362,13 @@ impl State {
                 | VoiceState::Cancelling
         ) || !self.pending_recordings.is_empty()
             || !self.reading.is_empty()
+            || !self.filing.is_empty()
             || self.video_busy()
             || self.directing()
             || self.queued_direction.is_some()
         {
             self.status =
-                "Finish recording, transcription, reading files, map guidance, or video export before switching sessions".into();
+                "Finish recording, transcription, reading or filing files, map guidance, or video export before switching sessions".into();
             return false;
         }
         true
@@ -505,6 +523,13 @@ impl State {
             drop_over: false,
             file_notice: String::new(),
             file_retry: None,
+            librarian: None,
+            library: None,
+            knowledge_root: None,
+            filing: vec![],
+            know_over: false,
+            room: room::Room::default(),
+            researcher: None,
             voice_worker: None,
             voice_state: VoiceState::Unavailable,
             voice_status: "Hex is not connected".into(),
@@ -676,6 +701,31 @@ impl State {
             note: "Transcribing with Hex · part 2 of 5".into(),
         });
         s.file_notice = "Reading images needs OpenRouter · Whiteboard.heic is kept".into();
+        s
+    }
+    /// A file held over the knowledge base while an earlier one is filed as notes.
+    pub fn knowledge_demo() -> Self {
+        use tacit::knowledge::{Library, Note, librarian};
+        let mut s = Self::mapped_demo();
+        s.selected = None;
+        s.know_over = true;
+        // A librarian nobody answers: the scene only shows where a file would go.
+        let (send, _) = std::sync::mpsc::channel();
+        let (_, receive) = std::sync::mpsc::channel();
+        s.librarian = Some(librarian::Worker { send, receive });
+        s.knowledge_root = Some(PathBuf::from("session.knowledge"));
+        let notes = (1..=37).map(|n| Note {
+            id: format!("note-{n}"),
+            title: format!("Note {n}"),
+            topic: "Decision making".into(),
+            ..Note::default()
+        });
+        s.library = Some(std::sync::Arc::new(Library::of(notes.collect())));
+        s.filing.push(Filing {
+            id: 1,
+            name: "Team handbook.pdf".into(),
+            note: "Writing notes · part 2 of 4".into(),
+        });
         s
     }
     pub fn generated_demo() -> Self {
@@ -1135,6 +1185,7 @@ impl State {
             session: self.projection.session.clone(),
             holds: self.pending_recordings.clone(),
             instruction,
+            knowledge: self.library.clone(),
         };
         if self.agent.as_ref().is_some_and(|a| a.ask(tier, request)) {
             return true;
@@ -1310,8 +1361,93 @@ impl State {
             });
         }
     }
+    /// Files dropped into the knowledge base. Each is kept there and filed as notes the map
+    /// agents read from. Nothing of it goes onto the map.
+    fn file_knowledge(&mut self, files: &[PathBuf]) {
+        self.drop_over = false;
+        self.know_over = false;
+        if self.replay.is_some() || self.read_only {
+            return;
+        }
+        self.file_notice.clear();
+        self.file_retry = None;
+        for path in files {
+            let name = file_name(path);
+            let Some(kind) = tacit::ingest::Kind::of(path) else {
+                self.file_notice = format!("Tacit cannot read {name} yet");
+                continue;
+            };
+            let job = self.next_file;
+            let request = tacit::knowledge::librarian::Request {
+                job,
+                name: name.clone(),
+                kind,
+                path: path.clone(),
+            };
+            if !self
+                .librarian
+                .as_ref()
+                .is_some_and(|w| w.send.send(request).is_ok())
+            {
+                self.file_notice =
+                    format!("The knowledge base is not open here · {name} was not filed");
+                break;
+            }
+            self.next_file += 1;
+            self.filing.push(Filing {
+                id: job,
+                name,
+                note: String::new(),
+            });
+        }
+    }
+    fn receive_knowledge(&mut self, response: tacit::knowledge::librarian::Response) {
+        use tacit::knowledge::librarian::Outcome;
+        let job = self.filing.iter().position(|j| j.id == response.job);
+        match (response.outcome, job) {
+            // Every turn asked from here on is informed by the knowledge base as it now is.
+            (Outcome::Library(library), _) => self.library = Some(library),
+            (Outcome::Progress(note), Some(job)) => self.filing[job].note = note,
+            (Outcome::Filed(filed), Some(job)) => {
+                let name = self.filing.remove(job).name;
+                match filed {
+                    Ok(0) => {
+                        self.status = format!("{name} says nothing the knowledge base did not hold")
+                    }
+                    Ok(1) => self.status = format!("{name} is one note in the knowledge base"),
+                    Ok(notes) => {
+                        self.status = format!("{name} is {notes} notes in the knowledge base")
+                    }
+                    Err(error) => {
+                        self.file_retry = None;
+                        self.file_notice = error;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    /// The notes are plain files: show the folder they are kept in.
+    fn show_knowledge(&mut self) {
+        let Some(root) = &self.knowledge_root else {
+            return;
+        };
+        let notes = root.join("notes");
+        #[cfg(target_os = "macos")]
+        let opener = "open";
+        #[cfg(target_os = "windows")]
+        let opener = "explorer";
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let opener = "xdg-open";
+        // Explorer reports failure even when it opens the folder.
+        match std::process::Command::new(opener).arg(&notes).status() {
+            Ok(status) if status.success() || cfg!(target_os = "windows") => {}
+            _ => self.status = format!("Notes are kept in {}", notes.display()),
+        }
+    }
     fn refuse_files(&mut self, files: &[PathBuf]) {
         self.drop_over = false;
+        self.know_over = false;
         if let Some(path) = files.first() {
             self.file_retry = None;
             self.file_notice = format!(
@@ -1569,7 +1705,9 @@ impl State {
         &mut self,
         pixels: Option<tacit::timeline::PixelFrame>,
     ) -> Result<(), String> {
-        if self.sessions_open || self.replay.is_some() || self.read_only || self.journal.is_none() {
+        // What is read in the knowledge room is not part of the session's recording.
+        let aside = self.sessions_open || self.room.open;
+        if aside || self.replay.is_some() || self.read_only || self.journal.is_none() {
             return Ok(());
         }
         let result = (|| -> std::io::Result<()> {
@@ -1940,7 +2078,8 @@ impl State {
         }
     }
     pub fn capturing_pixels(&self) -> bool {
-        self.journal.is_some() && !self.read_only && self.replay.is_none() && !self.sessions_open
+        let aside = self.sessions_open || self.room.open;
+        self.journal.is_some() && !self.read_only && self.replay.is_none() && !aside
     }
     pub fn capture_failed(&mut self, error: String) {
         self.timeline_event(tacit::timeline::Event::Failure {
@@ -4212,7 +4351,7 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     }
 }
 pub fn on_key(s: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
-    if s.modern_ui && s.replay.is_none() && !s.story {
+    if s.modern_ui && s.replay.is_none() && !s.story && !s.room.open {
         match event.key {
             Key::Command('+') | Key::Command('=') => {
                 s.zoom_center(1.2);
@@ -4245,6 +4384,10 @@ pub fn on_key(s: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Escape => {
             if s.sessions_open {
                 s.sessions_open = false;
+                return true;
+            }
+            if s.reading_notes() {
+                s.room_back();
                 return true;
             }
             if s.replay.is_some() {
@@ -4315,7 +4458,19 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
     s.voice_command(VoiceCommand::Check);
     // Text, documents, audio and video are read on this machine, so files can be dropped
     // with no model at all. Images and long files then say that they need one.
-    let files = |s: &mut State, config| {
+    let files = |s: &mut State, config: Option<tacit::organizer::CloudConfig>| {
+        // One knowledge base serves every session of the library.
+        let knowledge = s.library_base.as_deref().and_then(tacit::knowledge::root);
+        if let Some(root) = &knowledge {
+            let (reader, woken) = (config.clone(), wake.clone());
+            let (config, wake) = (config.clone(), wake.clone());
+            let librarian = tacit::knowledge::librarian::Worker::start;
+            s.librarian = Some(librarian(root.clone(), config, move || wake()));
+            // Questions asked of the notes are answered beside the filing, not after it.
+            let researcher = tacit::knowledge::research::Worker::start;
+            s.researcher = Some(researcher(reader, move || woken()));
+        }
+        s.knowledge_root = knowledge;
         let wake = wake.clone();
         s.ingest = Some(tacit::ingest::Worker::start(config, move || wake()));
     };
@@ -4584,6 +4739,18 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
     }
     while let Some(response) = s.ingest.as_ref().and_then(|w| w.receive.try_recv().ok()) {
         s.receive_file(response);
+        changed = true;
+    }
+    while let Some(response) = s.librarian.as_ref().and_then(|w| w.receive.try_recv().ok()) {
+        s.receive_knowledge(response);
+        changed = true;
+    }
+    while let Some(response) = s
+        .researcher
+        .as_ref()
+        .and_then(|w| w.receive.try_recv().ok())
+    {
+        s.receive_research(response);
         changed = true;
     }
     // Guidance waits for the agent, and without one nothing would ever take it from the queue.
@@ -6019,6 +6186,7 @@ mod tests {
             refused: vec![],
             unmet: 0,
             garbled: false,
+            opened: vec![],
             usage: Default::default(),
         };
         tacit::agent::worker::Response {
@@ -7535,6 +7703,412 @@ mod tests {
         rt.state.selected = None;
         rt.frame(5.0);
         assert!(rt.find("file-attachment-1").is_some());
+    }
+    /// A librarian whose requests the test reads and answers by hand.
+    fn librarian(
+        s: &mut State,
+    ) -> (
+        std::sync::mpsc::Receiver<tacit::knowledge::librarian::Request>,
+        std::sync::mpsc::Sender<tacit::knowledge::librarian::Response>,
+    ) {
+        let (send, requests) = std::sync::mpsc::channel();
+        let (responses, receive) = std::sync::mpsc::channel();
+        s.librarian = Some(tacit::knowledge::librarian::Worker { send, receive });
+        s.knowledge_root = Some(PathBuf::from("/nowhere/session.knowledge"));
+        (requests, responses)
+    }
+    fn noted(id: &str, title: &str) -> tacit::knowledge::Note {
+        tacit::knowledge::Note {
+            id: id.into(),
+            title: title.into(),
+            topic: "Meetings".into(),
+            gist: format!("{title}."),
+            body: format!("{title}, as the handbook has it."),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn files_dropped_on_the_knowledge_base_are_filed_as_notes_and_kept_off_the_map() {
+        use tacit::ingest::Kind;
+        use tacit::knowledge::Library;
+        use tacit::knowledge::librarian::{Outcome, Response};
+        let mut rt = runtime((1280.0, 860.0));
+        let (reading, _read) = file_worker(&mut rt.state);
+        let (requests, responses) = librarian(&mut rt.state);
+        let before = rt.state.projection.session.clone();
+        let zone = rt.find("drop-zone");
+        assert!(rt.find("drop-knowledge").is_none() && rt.find("knowledge").is_none());
+        let handbook = PathBuf::from("/nowhere/Team handbook.pdf");
+        // The drag comes in over the map, which offers both places to let go.
+        rt.drag_files(vec![handbook.clone()], zone);
+        rt.frame(0.1);
+        rt.frame(0.2);
+        assert!(rt.state.drop_over && !rt.state.know_over);
+        let know = rt.find("drop-knowledge");
+        assert!(know.is_some() && rt.find("drop-hint").is_some());
+        rt.drag_files_to(know);
+        rt.frame(0.3);
+        rt.frame(0.4);
+        assert!(rt.state.know_over && !rt.state.drop_over);
+        assert_eq!(rt.drop_hovered().as_deref(), Some("drop-knowledge"));
+        assert!(rt.find("drop-hint").is_some() && rt.find("drop-knowledge").is_some());
+        rt.drag_files_to(zone);
+        rt.frame(0.5);
+        rt.frame(0.6);
+        assert!(rt.state.drop_over && !rt.state.know_over);
+        assert_eq!(rt.drop_hovered().as_deref(), Some("drop-zone"));
+        rt.drag_files_to(know);
+        rt.frame(0.7);
+        rt.frame(0.8);
+        rt.drop_files(
+            vec![handbook.clone(), PathBuf::from("/nowhere/retro.mp3")],
+            know,
+        );
+        rt.frame(0.9);
+        rt.frame(1.0);
+        assert!(!rt.state.know_over && !rt.state.drop_over);
+        assert!(rt.find("drop-knowledge").is_none() && rt.find("drop-hint").is_none());
+        let first = requests.try_recv().unwrap();
+        assert_eq!(
+            (first.job, first.name.as_str(), first.kind, &first.path),
+            (1, "Team handbook.pdf", Kind::Pdf, &handbook)
+        );
+        let second = requests.try_recv().unwrap();
+        assert_eq!((second.job, second.kind), (2, Kind::Audio));
+        // Nothing of it is read for the map.
+        assert!(reading.try_recv().is_err() && rt.state.reading.is_empty());
+        assert!(rt.find("knowledge-progress").is_some() && rt.find("file-progress").is_none());
+        assert!(!rt.state.can_switch_session());
+
+        let notes = vec![
+            noted("agendas-go-out-a-day-ahead", "Agendas go out a day ahead"),
+            noted("one-owner-per-decision", "One owner per decision"),
+        ];
+        for outcome in [
+            Outcome::Progress("Writing notes · part 1 of 2".into()),
+            Outcome::Library(std::sync::Arc::new(Library::of(notes))),
+            Outcome::Filed(Ok(2)),
+        ] {
+            responses.send(Response { job: 1, outcome }).unwrap();
+        }
+        rt.frame(2.0);
+        rt.frame(2.1);
+        assert_eq!(rt.state.filing.len(), 1);
+        assert_eq!(
+            rt.state.status,
+            "Team handbook.pdf is 2 notes in the knowledge base"
+        );
+        assert_eq!(rt.state.library.as_ref().map(|l| l.len()), Some(2));
+        assert!(rt.find("knowledge").is_some() && rt.find("knowledge-progress").is_some());
+        // A file that could not be filed says so, and the notes there stay.
+        let failed = Outcome::Filed(Err("No speech was found in retro.mp3".into()));
+        responses
+            .send(Response {
+                job: 2,
+                outcome: failed,
+            })
+            .unwrap();
+        rt.frame(3.0);
+        rt.frame(3.1);
+        assert!(rt.state.filing.is_empty() && rt.find("knowledge-progress").is_none());
+        assert_eq!(rt.state.file_notice, "No speech was found in retro.mp3");
+        assert!(rt.find("file-notice").is_some() && rt.find("retry-file").is_none());
+        assert_eq!(rt.state.library.as_ref().map(|l| l.len()), Some(2));
+        assert!(rt.state.can_switch_session());
+        // The map is as it was: knowledge informs it and is never put on it.
+        assert_eq!(rt.state.projection.session, before);
+        assert!(rt.state.projection.attachments.is_empty());
+    }
+    #[test]
+    fn a_window_with_no_knowledge_base_offers_only_the_map() {
+        let mut rt = runtime((1280.0, 860.0));
+        let _files = file_worker(&mut rt.state);
+        let zone = rt.find("drop-zone");
+        rt.drag_files(vec![PathBuf::from("/nowhere/plan.pdf")], zone);
+        rt.frame(0.1);
+        rt.frame(0.2);
+        assert!(rt.find("drop-hint").is_some() && rt.find("drop-knowledge").is_none());
+        // And a drop with no librarian to take it says so rather than losing the file silently.
+        rt.state
+            .file_knowledge(&[PathBuf::from("/nowhere/plan.pdf")]);
+        assert_eq!(
+            rt.state.file_notice,
+            "The knowledge base is not open here · plan.pdf was not filed"
+        );
+        assert!(rt.state.filing.is_empty());
+    }
+    /// A window whose knowledge base holds the room's shelf of notes.
+    fn reader() -> Runtime<State> {
+        let mut rt = runtime((1280.0, 860.0));
+        // Escape is the app's key here, as it is in the window.
+        rt.on_key = Some(on_key);
+        rt.state.knowledge_root = Some(PathBuf::from("/nowhere/session.knowledge"));
+        rt.state.library = Some(std::sync::Arc::new(room::shelf()));
+        rt.frame(0.1);
+        rt
+    }
+    /// A researcher whose questions the test reads and answers by hand.
+    fn researcher(
+        s: &mut State,
+    ) -> (
+        std::sync::mpsc::Receiver<tacit::knowledge::research::Request>,
+        std::sync::mpsc::Sender<tacit::knowledge::research::Response>,
+    ) {
+        let (send, requests) = std::sync::mpsc::channel();
+        let (responses, receive) = std::sync::mpsc::channel();
+        s.researcher = Some(tacit::knowledge::research::Worker { send, receive });
+        (requests, responses)
+    }
+    fn press(rt: &mut Runtime<State>, key: Key) {
+        rt.key(KeyEvent {
+            key,
+            mods: Mods::default(),
+        });
+        rt.frame(1.0);
+    }
+    #[test]
+    fn the_notes_are_read_by_topic_and_along_their_links() {
+        use room::Place;
+        let mut rt = reader();
+        let before = rt.state.projection.session.clone();
+        click(&mut rt, "knowledge");
+        // The room takes the map's place, and the capture dock goes with the map.
+        assert!(rt.state.reading_notes() && rt.find("room").is_some());
+        assert!(rt.find("map").is_none() && rt.find("thought-input").is_none());
+        assert_eq!(rt.state.room.place(), &Place::Entry);
+        assert!(rt.find("room-file-s9ada4").is_some() && rt.find("room-latest-k8f862").is_some());
+
+        // In by a topic, whose overview comes before its notes.
+        click(&mut rt, "room-topic-0");
+        assert_eq!(rt.state.room.place(), &Place::Topic("Meetings".into()));
+        assert!(rt.find("room-overview").is_some());
+        click(&mut rt, "room-in-kefba9");
+        assert_eq!(rt.state.room.place(), &Place::Note("kefba9".into()));
+        assert!(rt.find("room-title").is_some() && rt.find("room-body").is_some());
+        // A note shows where it leads and what leads to it, the disputing note among them.
+        assert!(rt.find("room-to-kde39a").is_some() && rt.find("room-from-k8f862").is_some());
+        click(&mut rt, "room-from-k8f862");
+        assert_eq!(rt.state.room.place(), &Place::Note("k8f862".into()));
+        // And back to the file it was taken from, which lists what else came from it.
+        click(&mut rt, "room-source");
+        assert_eq!(rt.state.room.place(), &Place::Note("s37e59".into()));
+        assert!(rt.find("room-taken-k07098").is_some() && rt.find("room-source").is_none());
+
+        // Back retraces the way, by the button and by Escape, and then leaves the room.
+        click(&mut rt, "room-back");
+        assert_eq!(rt.state.room.place(), &Place::Note("k8f862".into()));
+        for place in [
+            Place::Note("kefba9".into()),
+            Place::Topic("Meetings".into()),
+            Place::Entry,
+        ] {
+            press(&mut rt, Key::Escape);
+            assert_eq!(rt.state.room.place(), &place);
+        }
+        assert!(rt.state.reading_notes());
+        press(&mut rt, Key::Escape);
+        assert!(!rt.state.reading_notes() && rt.find("room").is_none());
+        assert!(rt.find("map").is_some() && rt.find("thought-input").is_some());
+        // Reading changed nothing on the map.
+        assert_eq!(rt.state.projection.session, before);
+
+        // The header's way in is also the way out, and the room is where it was left.
+        click(&mut rt, "knowledge");
+        assert_eq!(rt.state.room.place(), &Place::Entry);
+        click(&mut rt, "knowledge");
+        assert!(!rt.state.reading_notes());
+        // A note that has since gone from the knowledge base says so.
+        rt.state.open_room();
+        rt.state.room_go(Place::Note("gone".into()));
+        rt.frame(2.0);
+        assert!(rt.find("room-gone").is_some());
+    }
+    #[test]
+    fn the_notes_are_searched_here_and_asked_through_the_researcher() {
+        use room::Place;
+        use tacit::knowledge::research::{Finding, Outcome, Point, Response};
+        let mut rt = reader();
+        let (requests, responses) = researcher(&mut rt.state);
+        click(&mut rt, "knowledge");
+        // With nothing written there is nothing to look for or ask.
+        click(&mut rt, "room-find");
+        click(&mut rt, "room-ask");
+        assert_eq!(rt.state.room.place(), &Place::Entry);
+
+        // Enter looks for the words on this machine: no question goes to a model.
+        click(&mut rt, "room-input");
+        press(&mut rt, Key::Text("incident reviews".into()));
+        press(&mut rt, Key::Enter);
+        assert_eq!(
+            rt.state.room.place(),
+            &Place::Found("incident reviews".into())
+        );
+        assert!(rt.find("room-hit-k8f862").is_some() && rt.find("room-nothing").is_none());
+        assert!(requests.try_recv().is_err());
+        // Escape first leaves the field, as it does everywhere, and then steps back. The
+        // words stay in the field.
+        press(&mut rt, Key::Escape);
+        assert_eq!(
+            rt.state.room.place(),
+            &Place::Found("incident reviews".into())
+        );
+        press(&mut rt, Key::Escape);
+        assert_eq!(rt.state.room.place(), &Place::Entry);
+        assert_eq!(rt.state.room.edit.text, "incident reviews");
+        click(&mut rt, "room-find");
+        click(&mut rt, "room-hit-k8f862");
+        assert_eq!(rt.state.room.place(), &Place::Note("k8f862".into()));
+        rt.state.room.edit = TextEdit::new("zebra crossing");
+        click(&mut rt, "room-find");
+        assert!(rt.find("room-nothing").is_some());
+
+        // Asking sends the question and the notes as they stand to the researcher.
+        rt.state.room.edit = TextEdit::new("How many people should be in a meeting?");
+        click(&mut rt, "room-ask");
+        let asked = requests.try_recv().unwrap();
+        assert_eq!(asked.question, "How many people should be in a meeting?");
+        assert_eq!(
+            asked.library.len(),
+            rt.state.library.as_ref().unwrap().len()
+        );
+        assert_eq!(rt.state.room.place(), &Place::Answer);
+        assert!(rt.find("room-progress").is_some() && rt.find("room-reply").is_none());
+        // One question at a time: a second press while it is answered asks nothing.
+        click(&mut rt, "room-ask");
+        assert!(requests.try_recv().is_err());
+
+        let finding = |reply: &str| {
+            Outcome::Found(Ok(Box::new(Finding {
+                question: asked.question.clone(),
+                reply: reply.into(),
+                points: vec![Point {
+                    note: "kefba9".into(),
+                    says: "Sets the limit of six.".into(),
+                }],
+                read: 1,
+                ..Finding::default()
+            })))
+        };
+        // An answer to some other question is not this one's.
+        let stale = Response {
+            job: asked.job + 7,
+            outcome: finding("Stale."),
+        };
+        responses.send(stale).unwrap();
+        let progress = Outcome::Progress("Reading 2 notes".into());
+        let job = asked.job;
+        responses
+            .send(Response {
+                job,
+                outcome: progress,
+            })
+            .unwrap();
+        rt.frame(2.0);
+        rt.frame(2.1);
+        assert_eq!(rt.state.room.progress, "Reading 2 notes");
+        assert!(rt.state.room.finding.is_none() && rt.find("room-progress").is_some());
+        let outcome = finding("At most six [1].");
+        responses.send(Response { job, outcome }).unwrap();
+        rt.frame(3.0);
+        rt.frame(3.1);
+        assert!(rt.find("room-progress").is_none() && rt.find("room-reply").is_some());
+        assert_eq!(
+            rt.state.room.finding.as_ref().unwrap().reply,
+            "At most six [1]."
+        );
+        // The answer leads to the note it rests on, and Back returns to the answer.
+        click(&mut rt, "room-basis-1");
+        assert_eq!(rt.state.room.place(), &Place::Note("kefba9".into()));
+        click(&mut rt, "room-back");
+        assert!(rt.find("room-reply").is_some() && rt.find("room-cost").is_some());
+
+        // A question that could not be answered says why, and one asked where there is
+        // nobody to ask says that.
+        click(&mut rt, "room-ask");
+        let again = requests.try_recv().unwrap();
+        assert!(again.job != job && rt.state.room.finding.is_none());
+        let failed = Outcome::Found(Err("The notes could not be read through".into()));
+        let failed = Response {
+            job: again.job,
+            outcome: failed,
+        };
+        responses.send(failed).unwrap();
+        rt.frame(4.0);
+        rt.frame(4.1);
+        assert!(rt.find("room-failure").is_some() && rt.find("room-reply").is_none());
+        assert_eq!(rt.state.room.failure, "The notes could not be read through");
+        rt.state.researcher = None;
+        click(&mut rt, "room-ask");
+        assert!(rt.state.room.asking.is_none() && rt.find("room-failure").is_some());
+        assert_eq!(
+            rt.state.room.failure,
+            "Asking is not available here · search and the notes are still here"
+        );
+    }
+    #[test]
+    fn there_is_no_room_without_notes_or_while_a_session_replays() {
+        let mut s = State::demo();
+        s.knowledge_root = Some(PathBuf::from("/nowhere/session.knowledge"));
+        // Nothing filed: nothing to read.
+        s.open_room();
+        assert!(!s.reading_notes());
+        s.library = Some(std::sync::Arc::new(tacit::knowledge::Library::of(vec![])));
+        s.open_room();
+        assert!(!s.reading_notes());
+        s.library = Some(std::sync::Arc::new(room::shelf()));
+        // What is read is no part of the session, so the room is not recorded with it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        s.journal = Some(tacit::timeline::Journal::open(&path, Session::default()).unwrap());
+        assert!(s.capturing_pixels());
+        s.open_room();
+        assert!(s.reading_notes() && !s.capturing_pixels());
+        s.close_room();
+        assert!(s.capturing_pixels());
+        // A session that cannot be edited can still read: reading changes nothing.
+        s.close_room();
+        s.read_only = true;
+        s.open_room();
+        assert!(s.reading_notes());
+        // The room keeps no more of the way back than it can hold.
+        for step in 0..200 {
+            s.room_go(room::Place::Found(format!("word {step}")));
+        }
+        assert_eq!(s.room.trail.len(), 64);
+        s.room_go(room::Place::Found("word 199".into()));
+        assert_eq!(s.room.trail.len(), 64, "going where one stands is no step");
+    }
+    #[test]
+    fn every_turn_is_asked_with_the_knowledge_base_as_it_stands() {
+        use tacit::knowledge::Library;
+        use tacit::knowledge::librarian::{Outcome, Response};
+        let mut s = State::empty();
+        let (mut placing, _stewarding, answer) = agent(&mut s);
+        let (_requests, responses) = librarian(&mut s);
+        let mut tx = Tx::default();
+        s.draft = TextEdit::new("Meetings eat the whole morning");
+        s.capture();
+        poll(&mut s, 1.0, &mut tx);
+        let request = placing
+            .try_recv()
+            .expect("asked the moment a thought waits");
+        assert!(request.knowledge.is_none(), "nothing is known yet");
+        // The librarian says what the knowledge base holds when it opens.
+        let library = Library::of(vec![noted("one-owner", "One owner per decision")]);
+        let outcome = Outcome::Library(std::sync::Arc::new(library));
+        responses.send(Response { job: 0, outcome }).unwrap();
+        poll(&mut s, 2.0, &mut tx);
+        assert_eq!(s.library.as_ref().map(|l| l.len()), Some(1));
+        let ops = vec![grow("time", "Time"), file(1, "time")];
+        let placed = turned(request.epoch, tacit::agent::Tier::Place, ops, "");
+        answer.send(placed).unwrap();
+        poll(&mut s, 2.5, &mut tx);
+        s.draft = TextEdit::new("Nobody knows who decides");
+        s.capture();
+        poll(&mut s, 3.0, &mut tx);
+        let request = placing.try_recv().expect("asked again");
+        let known = request.knowledge.expect("the turn is informed");
+        assert!(known.get("one-owner").is_some());
     }
     #[test]
     fn a_dropped_file_is_kept_read_and_split_like_a_recording() {

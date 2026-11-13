@@ -449,7 +449,9 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (uploaded, upload_received) = mpsc::channel();
         let server = std::thread::spawn(move || {
-            for _ in 0..4 {
+            // Served until the stream is finished: a slow machine sends heartbeats meanwhile.
+            let mut served = vec![];
+            while served.last() != Some(&"finish") {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -477,6 +479,7 @@ mod tests {
                 let mut body = vec![0; len];
                 reader.read_exact(&mut body).unwrap();
                 let (status, response) = if first.starts_with("POST /streams ") {
+                    served.push("stream");
                     (200, json!({"id":7,"ownerToken":"owned"}).to_string())
                 } else {
                     assert!(headers.contains("x-hex-stream-token: owned"));
@@ -489,16 +492,22 @@ mod tests {
                                 .all(|b| *b == 321i16.to_le_bytes())
                         );
                         uploaded.send(()).unwrap();
+                        served.push("audio");
+                        (204, String::new())
+                    } else if first.contains("/heartbeat ") {
                         (204, String::new())
                     } else if first.contains("/events ") {
+                        served.push("events");
                         (200, "data: {\"type\":\"partial\",\"stable\":\"Hello\",\"tentative\":\"\"}\n\ndata: {\"type\":\"segment\",\"segment\":0,\"startMs\":0,\"endMs\":500,\"text\":\"Hello\"}\n\ndata: {\"type\":\"final\"}\n\n".into())
                     } else {
-                        assert!(first.contains("/finish "));
+                        assert!(first.contains("/finish "), "{first}");
+                        served.push("finish");
                         (200, json!({"text":"Hello","segments":[{"startMs":0,"endMs":500,"text":"Hello"}]}).to_string())
                     }
                 };
                 write!(socket, "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
             }
+            served
         });
         let (commands, receive_commands) = mpsc::channel();
         let (events, receive_events) = mpsc::channel();
@@ -530,7 +539,9 @@ mod tests {
         let (text, cues) = task.join().unwrap().unwrap();
         assert_eq!(text, "Hello");
         assert_eq!(cues[0].end_ms, 500);
-        server.join().unwrap();
+        let mut served = server.join().unwrap();
+        served.sort_unstable();
+        assert_eq!(served, ["audio", "events", "finish", "stream"]);
     }
 
     #[test]

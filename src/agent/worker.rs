@@ -2,6 +2,7 @@
 //! user asks for waits for neither.
 use super::Tier;
 use super::turn::{self, Stands, Turn};
+use crate::knowledge::Library;
 use crate::model::Session;
 use crate::organizer::CloudConfig;
 use std::collections::BTreeSet;
@@ -17,6 +18,8 @@ pub struct Request {
     pub holds: BTreeSet<u64>,
     /// What the user asked of the map, for a directed turn.
     pub instruction: Option<String>,
+    /// The user's knowledge base as it was when the turn was asked for, when they keep one.
+    pub knowledge: Option<Arc<Library>>,
 }
 pub struct Response {
     pub epoch: u64,
@@ -73,9 +76,10 @@ impl Worker {
                                     }
                                     heard = asked.len();
                                 }
-                                let stands = &mut stands;
-                                let turn =
-                                    turn::run(client, &config, tier, session, holds, wish, stands);
+                                let (stands, known) = (&mut stands, request.knowledge.as_deref());
+                                let turn = turn::run(
+                                    client, &config, tier, session, holds, wish, known, stands,
+                                );
                                 let turn = turn.await;
                                 if tier.user() {
                                     asked().push(std::mem::take(stands));

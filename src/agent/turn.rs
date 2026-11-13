@@ -1,6 +1,7 @@
 //! One turn of the agent: brief the model, take its edits, check them against the map, and
 //! let it correct what the map refused.
 use super::{AT_LIMIT, Op, Rejection, Tier, apply, at_limit, brief, health, prompt, wire};
+use crate::knowledge::Library;
 use crate::model::{Category, Session, Thought};
 use crate::organizer::CloudConfig;
 use openrouter_rs::{
@@ -37,8 +38,13 @@ pub struct Turn {
     pub unmet: usize,
     /// The first answer could not be read and was asked for again.
     pub garbled: bool,
+    /// Notes of the knowledge base the turn asked to read in full, by id.
+    pub opened: Vec<String>,
     pub usage: Usage,
 }
+/// Times one turn may ask to open notes before it answers. They are not counted as calls: a
+/// turn that read up has still to do its work.
+const CONSULTS: u32 = 2;
 
 impl Tier {
     pub fn name(self) -> &'static str {
@@ -70,13 +76,26 @@ pub fn request(
     messages: Vec<Message>,
     budget: u32,
 ) -> Result<ChatCompletionRequest, String> {
+    request_with(tier, false, model, effort, messages, budget)
+}
+/// The same for a turn that may be `informed` by a knowledge base, and so may ask to open
+/// its notes.
+pub fn request_with(
+    tier: Tier,
+    informed: bool,
+    model: &str,
+    effort: &str,
+    messages: Vec<Message>,
+    budget: u32,
+) -> Result<ChatCompletionRequest, String> {
     // The placer answers in a few dozen tokens, so first-token latency is what counts.
     // The steward writes at length after thinking, so throughput is, as for a directed turn.
-    let (sort, name, schema) = match tier {
-        Tier::Place => ("latency", "placement", prompt::placer_schema()),
-        Tier::Steward => ("throughput", "stewardship", prompt::steward_schema()),
-        Tier::Direct => ("throughput", "direction", prompt::director_schema()),
+    let (sort, name) = match tier {
+        Tier::Place => ("latency", "placement"),
+        Tier::Steward => ("throughput", "stewardship"),
+        Tier::Direct => ("throughput", "direction"),
     };
+    let schema = prompt::schema(tier, informed);
     structured(model, effort, sort, name, schema, messages, budget)
 }
 
@@ -271,7 +290,7 @@ pub async fn drive(
     stands: &mut Stands,
     ask: impl AsyncFnMut(&[Message], u32) -> Result<String, String>,
 ) -> Result<Turn, String> {
-    work(tier, session, holds, "", stands, ask).await
+    work(tier, session, holds, "", None, stands, ask).await
 }
 /// The same for a turn that carries out what the user asked of the map. The branches it
 /// rearranges, and whatever strains that did not before, go to `stands`: the user asked.
@@ -282,7 +301,23 @@ pub async fn follow(
     stands: &mut Stands,
     ask: impl AsyncFnMut(&[Message], u32) -> Result<String, String>,
 ) -> Result<Turn, String> {
-    work(Tier::Direct, session, holds, instruction, stands, ask).await
+    work(Tier::Direct, session, holds, instruction, None, stands, ask).await
+}
+/// A turn of any tier that is shown what the user's knowledge base holds on the map. The
+/// steward and a directed turn may answer by asking to read notes in full: they are asked
+/// again with those opened, and `ask` must then offer the format of
+/// [`prompt::schema`]`(tier, true)`. With no knowledge base, or an empty one, this is
+/// [`drive`] or [`follow`] to the letter.
+pub async fn informed(
+    tier: Tier,
+    session: &Session,
+    holds: &BTreeSet<u64>,
+    instruction: &str,
+    knowledge: Option<&Library>,
+    stands: &mut Stands,
+    ask: impl AsyncFnMut(&[Message], u32) -> Result<String, String>,
+) -> Result<Turn, String> {
+    work(tier, session, holds, instruction, knowledge, stands, ask).await
 }
 fn strains(session: &Session) -> impl Iterator<Item = health::Finding> {
     health::review(session).into_iter().filter(|f| f.strain)
@@ -327,6 +362,7 @@ async fn work(
     session: &Session,
     holds: &BTreeSet<u64>,
     instruction: &str,
+    knowledge: Option<&Library>,
     stands: &mut Stands,
     mut ask: impl AsyncFnMut(&[Message], u32) -> Result<String, String>,
 ) -> Result<Turn, String> {
@@ -336,21 +372,24 @@ async fn work(
     if !tier.user() {
         stands.settle(session);
     }
-    let (system, brief, targets) = match tier {
+    let knowledge = knowledge.filter(|library| !library.is_empty());
+    let known = |wish| match knowledge {
+        Some(library) => brief::knowledge(library, session, holds, tier, wish),
+        None => String::new(),
+    };
+    let (brief, targets) = match tier {
         Tier::Place => {
             let brief = brief::place(session, holds, stands);
             let (brief, targets) = brief.ok_or("No thoughts are waiting for a branch")?;
-            (prompt::PLACER, brief, targets)
+            (brief + &known(""), targets)
         }
-        Tier::Steward => {
-            let brief = brief::steward(session, holds, stands);
-            (prompt::STEWARD, brief, vec![])
-        }
+        Tier::Steward => (brief::steward(session, holds, stands) + &known(""), vec![]),
         Tier::Direct => {
-            let brief = brief::direct(session, holds, super::instruction(instruction)?);
-            (prompt::DIRECTOR, brief, vec![])
+            let wish = super::instruction(instruction)?;
+            (brief::directed(session, holds, wish, &known(wish)), vec![])
         }
     };
+    let system = prompt::system(tier, knowledge.is_some());
     // Reasoning is billed as completion, so the budget leaves it room.
     let budget = match tier {
         Tier::Place => 2000 + 160 * targets.len() as u32,
@@ -369,19 +408,42 @@ async fn work(
         refused: vec![],
         unmet: 0,
         garbled: false,
+        opened: vec![],
         usage: Usage::default(),
     };
     let (mut work, mut heard, mut whole) = (session.clone(), false, false);
     // Strains the model was sent back to: those still waiting for its answer, and those it
     // has answered for.
     let (mut named, mut judged) = (vec![], vec![]);
-    for _ in 0..tier.calls() {
+    // The placer files in seconds and reads no further than the lines in its brief.
+    let library = knowledge.filter(|_| tier != Tier::Place);
+    let (mut calls, mut consults, mut seen) = (0, 0, BTreeSet::new());
+    while calls < tier.calls() {
         let raw = match ask(&messages, budget).await {
             Ok(raw) => raw,
             // A failed correction costs nothing: what already held is still good.
             Err(_) if heard => break,
             Err(error) => return Err(error),
         };
+        // An answer that asks to read is no answer yet: nothing in it is applied, and the
+        // turn is asked again with the notes in hand.
+        let wanted = match library {
+            Some(_) if consults < CONSULTS => wire::open(&raw),
+            _ => vec![],
+        };
+        if let (Some(library), false) = (library, wanted.is_empty()) {
+            consults += 1;
+            let (notes, opened) = library.open(&wanted, &mut seen);
+            turn.opened.extend(opened);
+            let last = match consults < CONSULTS {
+                true => prompt::OPENED,
+                false => prompt::OPENED_LAST,
+            };
+            messages.push(Message::new(Role::Assistant, raw));
+            messages.push(Message::new(Role::User, format!("OPENED\n{notes}{last}")));
+            continue;
+        }
+        calls += 1;
         let reply = match wire::read(&raw, &work, tier) {
             Ok(reply) => reply,
             Err(_) if heard => break,
@@ -454,6 +516,8 @@ async fn work(
 /// Run one turn with the configured model for its tier. `instruction` is what the user asked
 /// of the map, which only a directed turn reads, and `stands` what the steward is not sent
 /// back to: a directed turn adds to it, the others read it and the steward's keeps it.
+/// `knowledge` is the user's knowledge base, when they keep one.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: &openrouter_rs::OpenRouterClient,
     config: &CloudConfig,
@@ -461,9 +525,11 @@ pub async fn run(
     session: &Session,
     holds: &BTreeSet<u64>,
     instruction: &str,
+    knowledge: Option<&Library>,
     stands: &mut Stands,
 ) -> Result<Turn, String> {
     let started = Instant::now();
+    let informed = knowledge.is_some_and(|library| !library.is_empty());
     let (model, effort) = match tier {
         Tier::Place => (&config.place_model, &config.place_effort),
         Tier::Steward => (&config.steward_model, &config.steward_effort),
@@ -475,9 +541,10 @@ pub async fn run(
         session,
         holds,
         instruction,
+        knowledge,
         stands,
         async |messages, budget| {
-            let request = request(tier, model, effort, messages.to_vec(), budget)?;
+            let request = request_with(tier, informed, model, effort, messages.to_vec(), budget)?;
             call(client, &request, tier.patience(), &mut usage).await
         },
     )

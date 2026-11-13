@@ -74,6 +74,154 @@ fn main() {
         }
         return;
     }
+    if let Some(index) = args.iter().position(|a| a == "--ask-knowledge") {
+        let result = (|| -> Result<(), String> {
+            use tacit::knowledge::research::{Lead, Outcome, Request, Worker};
+            let usage = "--ask-knowledge needs the folder the notes are in, then a question";
+            let root = std::path::PathBuf::from(args.get(index + 1).ok_or(usage)?);
+            let question = args.get(index + 2).ok_or(usage)?.clone();
+            let library = std::sync::Arc::new(tacit::knowledge::Library::load(&root));
+            let title = |id: &str| match library.get(id) {
+                Some(note) => format!("{} [[{id}]]", note.title),
+                None => format!("[[{id}]]"),
+            };
+            let researcher = Worker::start(tacit::organizer::CloudConfig::from_env()?, || {});
+            let request = Request {
+                job: 1,
+                question,
+                library: library.clone(),
+            };
+            researcher.send.send(request).map_err(|e| e.to_string())?;
+            let finding = loop {
+                let heard = researcher.receive.recv().map_err(|e| e.to_string())?;
+                match heard.outcome {
+                    Outcome::Progress(note) => eprintln!("{note}"),
+                    Outcome::Found(found) => break found?,
+                }
+            };
+            println!("{}", finding.reply);
+            for (at, point) in finding.points.iter().enumerate() {
+                println!("  [{}] {} · {}", at + 1, title(&point.note), point.says);
+            }
+            for clash in &finding.clashes {
+                let sides = clash.notes.iter().map(|id| title(id)).collect::<Vec<_>>();
+                println!("Disagree · {} · {}", clash.over, sides.join(" / "));
+            }
+            for gap in &finding.gaps {
+                println!("Not in the notes · {gap}");
+            }
+            for onward in &finding.next {
+                let to = match &onward.to {
+                    Lead::Note(id) => title(id),
+                    Lead::Topic(name) => format!("the topic {name}"),
+                };
+                println!("Read next · {to} · {}", onward.why);
+            }
+            for step in &finding.trail {
+                println!("Way · {}", step.text);
+            }
+            println!("{} note(s) read in full · {}", finding.read, finding.spent);
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(index) = args.iter().position(|a| a == "--check-knowledge") {
+        let result = (|| -> Result<(), String> {
+            use tacit::knowledge::librarian::{Outcome, Request, Worker};
+            let usage = "--check-knowledge needs a folder for the notes, then files to file there, then --say THOUGHT for each thought to map with them and --ask INSTRUCTION to direct that map";
+            let mut rest = args[index + 1..].iter();
+            let root = std::path::PathBuf::from(rest.next().ok_or(usage)?);
+            let (mut files, mut said, mut asked) = (vec![], vec![], vec![]);
+            while let Some(arg) = rest.next() {
+                match arg.as_str() {
+                    "--say" => said.push(rest.next().ok_or(usage)?),
+                    "--ask" => asked.push(rest.next().ok_or(usage)?),
+                    _ => files.push(std::path::PathBuf::from(arg)),
+                }
+            }
+            let config = tacit::organizer::CloudConfig::from_env()?;
+            let librarian = Worker::start(root.clone(), config.clone(), || {});
+            for (job, path) in files.iter().enumerate() {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                let name = name.ok_or(usage)?;
+                let kind =
+                    tacit::ingest::Kind::of(path).ok_or(format!("Tacit cannot read {name} yet"))?;
+                let (job, path) = (job as u64 + 1, path.clone());
+                let request = Request {
+                    job,
+                    name: name.clone(),
+                    kind,
+                    path,
+                };
+                librarian.send.send(request).map_err(|e| e.to_string())?;
+                loop {
+                    let heard = librarian.receive.recv().map_err(|e| e.to_string())?;
+                    match heard.outcome {
+                        Outcome::Library(_) => {}
+                        Outcome::Progress(note) => eprintln!("{name}: {note}"),
+                        Outcome::Filed(filed) => break println!("{name}: {} note(s)", filed?),
+                    }
+                }
+            }
+            let library = tacit::knowledge::Library::load(&root);
+            print!("{}", library.index());
+            for note in library.notes() {
+                println!("{}", library.card(note));
+            }
+            for (topic, _) in library.topics() {
+                if let Some(outline) = library.outline(topic) {
+                    print!("\n{outline}");
+                }
+            }
+            // What the librarian did, as the user reads it.
+            if let Ok(log) = std::fs::read_to_string(root.join("changes.md")) {
+                print!("\n{log}");
+            }
+            if said.is_empty() {
+                return Ok(());
+            }
+            // What is said next is mapped with the notes in hand.
+            let config = config.ok_or("OpenRouter key is not configured")?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let client = config.client()?;
+            let mut session = tacit::model::Session::default();
+            for thought in said {
+                session.add(thought);
+            }
+            let known = Some(&library);
+            for tier in [tacit::agent::Tier::Place, tacit::agent::Tier::Steward] {
+                turn(&runtime, &client, &config, tier, &mut session, "", known)?;
+            }
+            let direct = tacit::agent::Tier::Direct;
+            for wish in asked {
+                turn(
+                    &runtime,
+                    &client,
+                    &config,
+                    direct,
+                    &mut session,
+                    wish,
+                    known,
+                )?;
+            }
+            for thought in &session.thoughts {
+                println!("{}: {}", session.placement_path(thought), thought.text);
+            }
+            filed(&session)
+        })();
+        if let Err(e) = result {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().any(|a| a == "--check-recording") {
         let result = (|| -> Result<(), String> {
             let config = tacit::organizer::CloudConfig::from_env()?
@@ -154,10 +302,18 @@ fn main() {
             // What is said next is filed at once, and what the user asks for is done as asked.
             session.add("We could protect an hour each morning for focused work.");
             let place = tacit::agent::Tier::Place;
-            turn(&runtime, &client, &config, place, &mut session, "")?;
+            turn(&runtime, &client, &config, place, &mut session, "", None)?;
             let asked = "Call this map Room for focused work.";
             let direct = tacit::agent::Tier::Direct;
-            turn(&runtime, &client, &config, direct, &mut session, asked)?;
+            turn(
+                &runtime,
+                &client,
+                &config,
+                direct,
+                &mut session,
+                asked,
+                None,
+            )?;
             filed(&session)
         })();
         if let Err(e) = result {
@@ -187,6 +343,9 @@ fn main() {
                 ("mapped", |s| *s = ui::State::mapped_demo()),
                 ("parked", |s| *s = ui::State::parked_demo()),
                 ("dropping", |s| *s = ui::State::dropping_demo()),
+                ("knowledge", |s| *s = ui::State::knowledge_demo()),
+                ("room", |s| *s = ui::State::room_demo()),
+                ("answer", |s| *s = ui::State::answer_demo()),
                 ("file", |s| *s = ui::State::file_demo()),
                 ("art-draw", |s| *s = ui::State::art_demo()),
                 ("generated", |s| *s = ui::State::generated_demo()),
@@ -205,8 +364,9 @@ fn main() {
     );
 }
 
-/// One turn of the map agent, asked of its tier's model. Its edits go onto the map the way
-/// the journal replays them, so a turn the journal could not keep fails the check.
+/// One turn of the map agent, asked of its tier's model, with the knowledge base when there
+/// is one. Its edits go onto the map the way the journal replays them, so a turn the journal
+/// could not keep fails the check.
 fn turn(
     runtime: &tokio::runtime::Runtime,
     client: &openrouter_rs::OpenRouterClient,
@@ -214,11 +374,21 @@ fn turn(
     tier: tacit::agent::Tier,
     session: &mut tacit::model::Session,
     instruction: &str,
+    knowledge: Option<&tacit::knowledge::Library>,
 ) -> Result<(), String> {
     use tacit::agent::{guided, health, replay, turn};
     let holds = std::collections::BTreeSet::new();
     let stands = &mut Default::default();
-    let asked = turn::run(client, config, tier, session, &holds, instruction, stands);
+    let asked = turn::run(
+        client,
+        config,
+        tier,
+        session,
+        &holds,
+        instruction,
+        knowledge,
+        stands,
+    );
     let done = runtime.block_on(asked)?;
     *session = if tier.user() {
         guided(session, instruction, &done.ops)?
@@ -237,6 +407,9 @@ fn turn(
         shape.unfiled,
         shape.parked
     );
+    if !done.opened.is_empty() {
+        println!("  opened {}", done.opened.join(", "));
+    }
     Ok(())
 }
 /// File what waits, then step back and read the whole map, as the app does when the talk
@@ -248,8 +421,8 @@ fn settle(
     session: &mut tacit::model::Session,
 ) -> Result<(), String> {
     use tacit::agent::Tier;
-    turn(runtime, client, config, Tier::Place, session, "")?;
-    turn(runtime, client, config, Tier::Steward, session, "")?;
+    turn(runtime, client, config, Tier::Place, session, "", None)?;
+    turn(runtime, client, config, Tier::Steward, session, "", None)?;
     filed(session)
 }
 /// Every thought ends on a branch or in the parking lot.

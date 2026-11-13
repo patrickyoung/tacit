@@ -8,7 +8,7 @@ use crate::{organizer::CloudConfig, timeline};
 use base64::Engine as _;
 use openrouter_rs::{
     OpenRouterClient,
-    api::chat::{ContentPart, Message},
+    api::chat::{ChatCompletionRequest, ContentPart, Message},
     types::Role,
 };
 use serde::{Deserialize, Serialize};
@@ -131,11 +131,12 @@ impl Worker {
                 }
                 // Kept before it is read, off the interface's thread: a film takes a while.
                 let kept = match &request.media {
-                    Some(media) => store(media, &request).map(|asset| {
+                    Some(media) => keep(media, &request.path, &request.name).map(|asset| {
                         let path = media.join(&asset);
                         (asset, path)
                     }),
-                    None => name_of(&request).map(|asset| (asset, request.path.clone())),
+                    None => name_of(&request.path, &request.name)
+                        .map(|asset| (asset, request.path.clone())),
                 };
                 let (asset, path) = match kept {
                     Ok(kept) => kept,
@@ -168,9 +169,8 @@ impl Worker {
         Self { send, receive }
     }
 }
-fn checked(request: &Request) -> Result<String, String> {
-    let name = &request.name;
-    let size = std::fs::metadata(&request.path)
+fn checked(path: &Path, name: &str) -> Result<String, String> {
+    let size = std::fs::metadata(path)
         .ok()
         .filter(|m| m.is_file())
         .map(|m| m.len())
@@ -181,17 +181,37 @@ fn checked(request: &Request) -> Result<String, String> {
     if size > MAX_FILE {
         return Err(format!("{name} is larger than 2 GB, too large to keep"));
     }
-    extension(&request.path).ok_or_else(|| format!("Tacit cannot read {name}"))
+    extension(path).ok_or_else(|| format!("Tacit cannot read {name}"))
 }
-fn store(media: &Path, request: &Request) -> Result<String, String> {
-    let extension = checked(request)?;
-    timeline::store(media, &request.path, &extension)
-        .map_err(|error| format!("{} could not be kept: {error}", request.name))
+/// Keep a copy of the file in `media`, named for what it holds. Returns that name.
+pub(crate) fn keep(media: &Path, path: &Path, name: &str) -> Result<String, String> {
+    let extension = checked(path, name)?;
+    timeline::store(media, path, &extension)
+        .map_err(|error| format!("{name} could not be kept: {error}"))
 }
-fn name_of(request: &Request) -> Result<String, String> {
-    let extension = checked(request)?;
-    timeline::asset_name(&request.path, &extension)
-        .map_err(|_| format!("{} could not be opened", request.name))
+fn name_of(path: &Path, name: &str) -> Result<String, String> {
+    let extension = checked(path, name)?;
+    timeline::asset_name(path, &extension).map_err(|_| format!("{name} could not be opened"))
+}
+
+/// What a file holds: its own words, or a model's account of what it shows.
+enum Words {
+    Written(String),
+    Seen(Reading),
+}
+/// A file's words, when there are some and no more than can be read at once.
+fn whole(name: &str, text: String) -> Result<String, String> {
+    let text = text.trim().to_owned();
+    if text.is_empty() {
+        return Err(format!("{name} holds no text"));
+    }
+    if text.len() > MAX_TEXT {
+        return Err(format!(
+            "{name} is too long to read at once ({} words)",
+            text.split_whitespace().count()
+        ));
+    }
+    Ok(text)
 }
 
 /// Reads one file at a time, with a model for what this machine cannot read alone.
@@ -222,6 +242,52 @@ impl Reader {
         progress: &dyn Fn(String),
         heard: &dyn Fn(&str),
     ) -> Result<Reading, String> {
+        match self.words(path, name, kind, progress)? {
+            Words::Written(text) => self.written(name, text, heard),
+            Words::Seen(reading) => Ok(reading),
+        }
+    }
+    /// Everything a file says and nothing in brief, however long it is: what the knowledge
+    /// base is filed from.
+    pub fn text(
+        &self,
+        path: &Path,
+        name: &str,
+        kind: Kind,
+        progress: &dyn Fn(String),
+    ) -> Result<String, String> {
+        match self.words(path, name, kind, progress)? {
+            Words::Written(text) => whole(name, text),
+            Words::Seen(reading) => Ok(reading.text),
+        }
+    }
+    /// There is a model to ask.
+    pub(crate) fn connected(&self) -> bool {
+        self.runtime.is_some() && self.cloud.is_some()
+    }
+    /// One answer from a model, on this reader's connection, to the request `ask` builds from
+    /// the settings. What it cost is added to `usage`. `None` without OpenRouter.
+    pub(crate) fn answer(
+        &self,
+        ask: impl FnOnce(&CloudConfig) -> Result<ChatCompletionRequest, String>,
+        patience: Duration,
+        usage: &mut Usage,
+    ) -> Option<Result<String, String>> {
+        let (runtime, (config, client)) = (self.runtime.as_ref()?, self.cloud.as_ref()?);
+        Some(
+            ask(config).and_then(|request| {
+                runtime.block_on(turn::call(client, &request, patience, usage))
+            }),
+        )
+    }
+    fn words(
+        &self,
+        path: &Path,
+        name: &str,
+        kind: Kind,
+        progress: &dyn Fn(String),
+    ) -> Result<Words, String> {
+        let seen = |reading| Ok(Words::Seen(reading));
         match kind {
             Kind::Text => {
                 let bytes =
@@ -229,13 +295,13 @@ impl Reader {
                 if bytes.contains(&0) {
                     return Err(format!("{name} is not text"));
                 }
-                self.written(name, String::from_utf8_lossy(&bytes).into_owned(), heard)
+                Ok(Words::Written(String::from_utf8_lossy(&bytes).into_owned()))
             }
-            Kind::Document => self.written(name, document(path, name)?, heard),
+            Kind::Document => Ok(Words::Written(document(path, name)?)),
             Kind::Pdf => {
                 let text = pdf(path).unwrap_or_default();
                 if !text.trim().is_empty() {
-                    return self.written(name, text, heard);
+                    return Ok(Words::Written(text));
                 }
                 // No text layer: the pages are pictures of text, which takes a model to read.
                 let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX);
@@ -250,19 +316,19 @@ impl Reader {
                     data_url("application/pdf", &bytes),
                     "document.pdf",
                 );
-                self.seen(name, "a scanned document", "scanned PDFs", vec![part], 40)
+                seen(self.seen(name, "a scanned document", "scanned PDFs", vec![part], 40)?)
             }
             Kind::Image => {
                 let scratch = Scratch::new()?;
                 let part = picture(path, &scratch.0.join("image.jpg"))
                     .ok_or_else(|| format!("{name} is not an image this Mac can open"))?;
-                self.seen(name, "an image", "images", vec![part], 24)
+                seen(self.seen(name, "an image", "images", vec![part], 24)?)
             }
             Kind::Audio | Kind::Video => {
                 let scratch = Scratch::new()?;
                 let said = speech(path, name, kind, &scratch.0, progress)?;
                 if !said.trim().is_empty() {
-                    return self.written(name, said, heard);
+                    return Ok(Words::Written(said));
                 }
                 if kind == Kind::Audio {
                     return Err(format!("No speech was found in {name}"));
@@ -272,28 +338,19 @@ impl Reader {
                 if parts.is_empty() {
                     return Err(format!("{name} has no speech and no picture to read"));
                 }
-                self.seen(
+                seen(self.seen(
                     name,
                     "frames from a video with no speech, in order",
                     "video without speech",
                     parts,
                     16,
-                )
+                )?)
             }
         }
     }
     /// Text that was written or said: itself when short, else the reader's account of it.
     fn written(&self, name: &str, text: String, heard: &dyn Fn(&str)) -> Result<Reading, String> {
-        let text = text.trim().to_owned();
-        if text.is_empty() {
-            return Err(format!("{name} holds no text"));
-        }
-        if text.len() > MAX_TEXT {
-            return Err(format!(
-                "{name} is too long to read at once ({} words)",
-                text.split_whitespace().count()
-            ));
-        }
+        let text = whole(name, text)?;
         let Some(limit) = statements_for(text.split_whitespace().count()) else {
             let thought = text.split_whitespace().collect::<Vec<_>>().join(" ");
             return Ok(Reading { text, thought });

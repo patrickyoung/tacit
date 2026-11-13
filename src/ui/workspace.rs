@@ -1582,8 +1582,44 @@ pub(super) fn video(s: &State, cx: &mut Cx<State>) -> El {
     window(s, cx, center)
 }
 
-/// The map or the thread, as the place files from outside are dropped. Each file is kept in
-/// the session, read into text, and goes onto the map the way a recording does.
+/// One of the places a dragged file can be let go of, lit while the drag is over it.
+fn drop_target(key: &str, lit: bool, share: f32, title: &str, lines: [&str; 2]) -> El {
+    let (ink, edge) = if lit {
+        (INK, GREEN.alpha(0.7))
+    } else {
+        (MUTED, MUTED.alpha(0.25))
+    };
+    let small = |text: &str, size| {
+        label(text, size, MUTED)
+            .w_full()
+            .align(rune::Align::Center)
+            .wrap()
+    };
+    col()
+        .key(key)
+        .w(0.0)
+        .grow(share)
+        .min_w(0.0)
+        .center()
+        .gap(8.0)
+        .padding(28.0)
+        .radius(kit::CARD)
+        .fill(PAPER.alpha(0.97))
+        .border(2.0, edge)
+        .child(
+            label(title, 22.0, ink)
+                .font(TextStyle::new(22.0, 600.0).tracking(-0.5))
+                .w_full()
+                .align(rune::Align::Center)
+                .wrap(),
+        )
+        .child(small(lines[0], 14.0))
+        .child(small(lines[1], 12.0))
+}
+
+/// The map or the thread, as the place files from outside are dropped. A file let go of on
+/// the map is kept in the session, read into text, and goes onto the map the way a recording
+/// does. One let go of on the knowledge base is filed as notes the map agents read from.
 fn drop_zone(s: &State, main: El) -> El {
     let zone = row()
         .key("drop-zone")
@@ -1594,47 +1630,69 @@ fn drop_zone(s: &State, main: El) -> El {
     if s.replay.is_some() || s.read_only {
         return zone;
     }
+    let reads = |path: &std::path::Path| tacit::ingest::Kind::of(path).is_some();
     let zone = zone
-        .accepts_files(|path| tacit::ingest::Kind::of(path).is_some())
+        .accepts_files(reads)
         .on_drop_files(|s: &mut State, files, _| s.drop_files(files))
         .on_drop_hover(|s: &mut State, over, _| s.drop_over = over)
         .on_drop_rejected(|s: &mut State, files, _| s.refuse_files(files));
-    if !s.drop_over {
+    if !s.drop_over && !s.know_over {
         return zone;
     }
-    // Says where each kind of file is read before it is let go of.
-    zone.child(
-        col()
-            .key("drop-hint")
-            .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-            .inert()
-            .center()
-            .gap(8.0)
-            .padding(32.0)
-            .radius(kit::CARD)
-            .fill(PAPER.alpha(0.97))
-            .border(2.0, GREEN.alpha(0.7))
-            .child(
-                label("Drop to add to the map", 24.0, INK)
-                    .font(TextStyle::new(24.0, 600.0).tracking(-0.5)),
-            )
-            .child(label(
-                "Kept in this session, read into text, then organized like anything you say.",
-                14.0,
-                MUTED,
-            ))
-            .child(label(
-                if s.ingest.is_none() {
-                    "Files cannot be read in this window."
-                } else if s.agent.is_some() {
-                    "Documents are read on this Mac · audio and video are transcribed here by Hex · images, scans and long files are read with OpenRouter"
+    // Each target says where a file is read before it is let go of.
+    let map = drop_target(
+        "drop-hint",
+        !s.know_over,
+        if s.librarian.is_some() { 1.6 } else { 1.0 },
+        "Drop to add to the map",
+        [
+            "Kept in this session, read into text, then organized like anything you say.",
+            if s.ingest.is_none() {
+                "Files cannot be read in this window."
+            } else if s.agent.is_some() {
+                "Documents are read on this Mac · audio and video are transcribed here by Hex · images, scans and long files are read with OpenRouter"
+            } else {
+                "Documents are read on this Mac · audio and video are transcribed here by Hex · images, scans and long files need OpenRouter"
+            },
+        ],
+    );
+    // The map's target lets the drag through to the zone under it.
+    let mut targets = row()
+        .key("drop-targets")
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .gap(10.0)
+        .radius(kit::CARD)
+        .fill(PAPER.alpha(0.97))
+        .child(map.inert());
+    if s.librarian.is_some() {
+        let held = s.library.as_ref().map_or(0, |library| library.len());
+        let about = match held {
+            0 => "Filed as linked notes that inform how your maps are organized. Nothing is added to this map.".to_string(),
+            1 => "Filed as linked notes beside the one kept so far. They inform how your maps are organized, and nothing is added to this map.".to_string(),
+            held => format!("Filed as linked notes beside the {held} kept so far. They inform how your maps are organized, and nothing is added to this map."),
+        };
+        let know = drop_target(
+            "drop-knowledge",
+            s.know_over,
+            1.0,
+            "Drop to file in the knowledge base",
+            [
+                &about,
+                if s.agent.is_some() {
+                    "Read like any dropped file · what it says is written into notes with OpenRouter"
                 } else {
-                    "Documents are read on this Mac · audio and video are transcribed here by Hex · images, scans and long files need OpenRouter"
+                    "Writing notes needs OpenRouter · the file is kept until then"
                 },
-                12.0,
-                MUTED,
-            )),
-    )
+            ],
+        );
+        targets = targets.child(
+            know.accepts_files(reads)
+                .on_drop_files(|s: &mut State, files, _| s.file_knowledge(files))
+                .on_drop_hover(|s: &mut State, over, _| s.know_over = over)
+                .on_drop_rejected(|s: &mut State, files, _| s.refuse_files(files)),
+        );
+    }
+    zone.child(targets)
 }
 
 pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
@@ -1658,14 +1716,41 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
             }
             header = header.child(kit::progress(reading, "file-progress"));
         }
-        if !s.story {
+        if let Some(job) = s.filing.first() {
+            let mut filing = if job.note.is_empty() {
+                format!("Filing {}…", job.name)
+            } else {
+                format!("{} · {}…", job.name, job.note)
+            };
+            if s.filing.len() > 1 {
+                filing = format!("{filing} +{} more", s.filing.len() - 1);
+            }
+            header = header.child(kit::progress(filing, "knowledge-progress"));
+        }
+        let held = s.library.as_ref().map_or(0, |library| library.len());
+        if held > 0 && s.knowledge_root.is_some() {
+            let title = if held == 1 {
+                "1 note".to_string()
+            } else {
+                format!("{held} notes")
+            };
+            header = header.child(if s.reading_notes() {
+                kit::tool(Some(Icon::Map), "Back to map", "knowledge", State::close_room)
+            } else {
+                kit::tool(Some(Icon::Folder), &title, "knowledge", State::open_room)
+                    .help("The knowledge base that informs how your maps are organized. Opens it to read, search and ask.")
+            });
+        }
+        if !s.story && !s.reading_notes() {
             header = artwork(s, header);
         }
-        if !s.read_only && (!s.history.is_empty() || s.queued_direction.is_some() || s.directing())
+        if !s.read_only
+            && !s.reading_notes()
+            && (!s.history.is_empty() || s.queued_direction.is_some() || s.directing())
         {
             header = header.child(kit::tool(Some(Icon::Undo), "Undo", "undo", State::undo));
         }
-        if !empty || s.story {
+        if (!empty || s.story) && !s.reading_notes() {
             header = header.child(kit::tool(
                 Some(if s.story { Icon::Map } else { Icon::Thread }),
                 if s.story {
@@ -1678,7 +1763,9 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
             ));
         }
     }
-    let main = if s.story {
+    let main = if s.reading_notes() {
+        room::view(s)
+    } else if s.story {
         kit::stage(col().key("story"))
             .grow(1.0)
             .min_h(0.0)
@@ -1714,8 +1801,11 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
         .h_full()
         .gap(12.0)
         .child(header)
-        .child(drop_zone(s, main))
-        .child(dock(s));
+        .child(drop_zone(s, main));
+    // Reading is not adding: the dock that takes thoughts waits until the map is back.
+    if !s.reading_notes() {
+        center = center.child(dock(s));
+    }
     if s.replay.is_some() {
         center = center.child(replay_controls(s));
     } else if s.art_style != Style::Off
