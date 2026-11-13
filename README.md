@@ -92,12 +92,34 @@ cargo run -- --check-file /path/to/file --local  # never leaves this Mac
 
 ## The knowledge base
 
-A dragged file has a second place to land. While files are over the window, the map shows two targets: **Drop to add to this map**, as above, and **Drop to file in the knowledge base**. A file dropped on the second is not turned into thoughts. It is kept, read the same way (the table above applies), and written up by the librarian as a zettelkasten: small notes of one idea each, with a title that states the idea, a one-sentence gist, a topic, keywords, and links to the notes it builds on. Nothing is added to the map. The header shows which file is being filed and how far along it is, and afterwards a button with the number of notes, which opens their folder.
+A dragged file has a second place to land. While files are over the window, the map shows two targets: **Drop to add to this map**, as above, and **Drop to file in the knowledge base**. A file dropped on the second is not turned into thoughts. It is kept, read the same way (the table above applies), and filed by the librarian as a zettelkasten: small notes of one idea each, fitted into what the knowledge base already holds. Nothing is added to the map. The header shows which file is being filed and how far along it is, and afterwards a button with the number of notes, which opens their folder.
+
+### How the librarian works
+
+The librarian works the way someone practised at a zettelkasten does, in three roles. Each is a turn of the librarian model with its own instructions, and code checks what comes back.
+
+1. **The reader** goes through the whole file first (a long one by how each part opens) and writes a note on the source: what the file is, how it runs, and the topic it belongs to. Every part is then filed knowing where it sits.
+2. **The writer** takes the file a part at a time, about 1,300 words each. It lists the ideas in the part and decides for each what the knowledge base already holds:
+   - **new**: no note holds it, so a note is written;
+   - **same**: a note already says it, so none is written, and the source note records that this file says it too;
+   - **adds**: a note holds it and the file brings a reason, a case or a number, so a note of only what is added is written and linked to it;
+   - **disputes**: the file contradicts a note, so a note states the file's position and is linked as a contradiction. Disagreements are kept, never smoothed over.
+
+   When a one-line card does not settle it, the writer opens the notes in full before it decides. A note holds one idea, has a title that states the idea as a claim, can be read without the file, and gives a reason for every link. Code checks each answer against that (a title that only names a subject, a text that says "the author", a text too long for one idea or too thin to be one, a link with no reason) and sends it back once, saying what fell short.
+3. **The curator** then goes over the topics where the new notes met notes held before, or that have grown to four notes. It merges notes that hold the same idea, rewrites a note that does not stand alone, moves notes to the topic they belong in, links notes across topics, and writes the topic's **overview**: a short way in that says what the rest stands on, which note is the evidence for which, and where two notes disagree.
+
+Three things keep your notes safe from it:
+
+- A note you wrote or edited is yours. The librarian links to it and never rewrites, moves or removes it. It tells the two apart by the `seal` line it puts in the pages it writes: change such a page, or delete the line, and the page is yours from then on.
+- Every page the librarian replaces or takes out is kept in `history/`.
+- `changes.md` says in plain lines what it did: what each file was filed as, every merge, rewrite, move, link and overview, and what the filing cost.
 
 There is one knowledge base for the whole library of sessions. It is a folder beside the notebook, `session.knowledge/` next to `session.json`:
 
-- `notes/`: one Markdown file per note, with a short front matter (`id`, `title`, `topic`, `keywords`, `source`), the gist as a quoted line under the title, and `[[links]]` in the text. They are yours to edit, and Markdown notes you put there yourself are read as notes when the app starts.
+- `notes/`: one Markdown file per note, with a short front matter (`id`, `title`, `topic`, `keywords`, `source`, `kind` for a note on a source or an overview, `seal`), the gist as a quoted line under the title, the text, and a `See also:` list of `[[links]]`, each with its reason. Markdown notes you put there yourself are read as notes when the app starts.
 - `sources/`: each filed file, kept whole, and beside it the text read from it, so a filing that failed is not read or transcribed twice.
+- `history/`: the pages the librarian replaced or took out, named by the note and the time.
+- `changes.md`: what the librarian did, newest last.
 
 `TACIT_KNOWLEDGE=/path/to/folder` keeps it somewhere else, and `TACIT_KNOWLEDGE=off` removes the second target and everything below.
 
@@ -105,15 +127,16 @@ There is one knowledge base for the whole library of sessions. It is a folder be
 
 The knowledge base informs how a map is organised. It is never content: no note is put on a map, and the agents are told that a note is something the user knows, not something they said in this session. It reaches them a level at a time, so that a large knowledge base costs a turn little:
 
-1. **The index**: the topics, how many notes each holds, and the keywords its notes share. The steward and a directed turn always see it.
-2. **Cards**: one line of a note (id, title, topic, gist, and the ids it links to) for the notes nearest the map. The placer sees up to five, chosen by what the thoughts it is filing say, and nothing else, so it stays as quick as before. The steward and a directed turn see up to ten, chosen by the whole map and the instruction, and the notes those link to.
-3. **Whole notes**: the steward and a directed turn may answer by naming notes or topics to open. Nothing in that answer is applied; they are asked again with the notes in full (or a topic's cards), at most twice in a turn.
+1. **The index**: the topics, how many notes each holds, whether it has an overview, and the keywords its notes share. The steward and a directed turn always see it.
+2. **Overviews**: for up to two of the topics the map falls in, the overview the curator wrote, so that a turn sees how a subject is built before it reads single notes. The steward and a directed turn see them.
+3. **Cards**: one line of a note (id, title, topic, gist, and the ids it links to) for the notes nearest the map. The placer sees up to five, chosen by what the thoughts it is filing say, and nothing else, so it stays as quick as before. The steward and a directed turn see up to ten, chosen by the whole map and the instruction, and the notes those link to. Only notes of an idea have a card here; a note on a source or an overview is reached through them.
+4. **Whole notes**: the steward and a directed turn may answer by naming notes or topics to open. Nothing in that answer is applied; they are asked again with the notes in full, each with the notes it is linked with and why (or a topic's overview and cards), at most twice in a turn.
 
 Nearness is worked out on this Mac from the words a note is called by, with no model call. With no knowledge base, or an empty one, every prompt and brief is exactly what it was.
 
-Filing needs OpenRouter: what a filed file says goes to the librarian model a part at a time, about 1,300 words each, together with the index and the cards of notes near that part. Without a key the file is kept in `sources/` and nothing is written; drop it again once a key is configured. The cards and opened notes shown to the map agents go to OpenRouter with the rest of a turn. A file that is already in the knowledge base is refused by name.
+Filing needs OpenRouter. What a filed file says goes to the librarian model: how each part opens to the reader, then each part to the writer together with the index and the cards of notes near it, and the cards of a tended topic to the curator, with any notes they open. A short file takes three to five model calls. Without a key the file is kept in `sources/` and nothing is written; drop it again once a key is configured. The overviews, cards and opened notes shown to the map agents go to OpenRouter with the rest of a turn. A file that is already in the knowledge base is refused by name.
 
-A knowledge base can be filled and looked at from the command line, without opening a session. With `--say`, the thoughts are then mapped with the notes in hand, by the placer and the steward, and with `--ask` a directed turn carries out an instruction on that map. The notes a turn opened are listed under it:
+A knowledge base can be filled and looked at from the command line, without opening a session: it prints the index, every card, the overviews and `changes.md`. With `--say`, the thoughts are then mapped with the notes in hand, by the placer and the steward, and with `--ask` a directed turn carries out an instruction on that map. The notes a turn opened are listed under it:
 
 ```sh
 cargo run -- --check-knowledge /path/to/folder file.pdf notes.md
@@ -237,7 +260,7 @@ Thought labels spring into their new positions, colored branches fade back in, a
 | Steward | `openai/gpt-6.1-terra` | low | 3–7 s | `TACIT_STEWARD_MODEL`, `TACIT_STEWARD_EFFORT` |
 | Directed turn | `openai/gpt-6.1-terra` | low | 2–5 s, 5–9 s to reorganise a whole map | `TACIT_DIRECT_MODEL`, `TACIT_DIRECT_EFFORT` |
 | Reader: says what a dropped image, scan or long text holds | `openai/gpt-6.1-terra` | low | 2–5 s | `TACIT_READ_MODEL`, `TACIT_READ_EFFORT` |
-| Librarian: writes a filed file up as notes | `openai/gpt-6.1-terra` | low | not yet measured | `TACIT_LIBRARY_MODEL`, `TACIT_LIBRARY_EFFORT` |
+| Librarian: reads a filed file, writes its notes, tends the topics | `openai/gpt-6.1-terra` | low | not yet measured | `TACIT_LIBRARY_MODEL`, `TACIT_LIBRARY_EFFORT` |
 
 The defaults were chosen by measurement with the evaluations under **Development**, on synthetic talks scored against what a facilitator would have left on the wall. The placer is the quickest of the small models tried and the one with the tidiest labels. The steward at low effort kept every map sound; more reasoning and dearer models took two to five times as long without leaving a better map. The directed turn needs the larger model: the small ones answered sooner and fell short on every run, reaching only some of the thoughts an instruction covered. The listener cuts a recording in about a third of the time of the larger model used before, at a thirtieth of the cost. The reader and the librarian are the defaults not yet measured: both use the steward's model, the reader because that one reads images and PDFs, and each has only been tried on a few synthetic files. A 36-capture talk mapped end to end (nine placer turns, three to five steward turns) cost between one and two cents. On a third talk, which announces seven kinds of plot and then describes each, the map ends with the seven in families beside the framework that introduces them, each steward turn taking one call. Asked there for a branch per plot, a directed turn of three to seven seconds leaves eight main branches; asked to put all seven under one branch, it takes about five. The steward lets either stand, and is not sent back to them.
 
@@ -358,7 +381,7 @@ Headless runs do not read or write your real notebook or contact OpenRouter, Oll
 - `src/agent/`: `prompt` (the mapper's method told to each tier, and the answer schemas), `brief` (the map as the outline a turn is shown), `wire` (answers read into edits), `step` (one edit against the map), `health` (the rule-based check of the map's shape), `pace` (when each tier is due), `turn` (one model turn, its self-check, and what is remembered from one turn to the next), `worker` (the three lanes, off the UI thread).
 - `src/recording.rs`: the listener, which cuts a finished recording into thoughts without changing a word.
 - `src/ingest.rs`: dropped files, kept in the archive and read into text on this Mac or by the reader model.
-- `src/knowledge.rs`: the knowledge base: notes as Markdown files, their links, which notes are near a text, and the three levels an agent is shown them at. `src/knowledge/librarian.rs` writes a filed file up as notes.
+- `src/knowledge.rs`: the knowledge base: notes as Markdown files, their links, which notes are near a text, which pages are the user's own, and the levels an agent is shown them at. `src/knowledge/librarian.rs` is the librarian: the reader, the writer and the curator, and the checks on what they return.
 - `src/capture.rs`: original render-texture capture and exact presentation.
 - `src/video_archive.rs`: lossless PNG masters, timestamped FFV1/PCM video export.
 - `src/timeline.rs`: durable event log, shared projection, media integrity, WebVTT, and recovery.

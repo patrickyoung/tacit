@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
 use tacit::agent::turn::Stands;
 use tacit::agent::{Op, Tier, Turn, brief, prompt, replay, turn};
-use tacit::knowledge::{Library, Note};
+use tacit::knowledge::{Kind, Library, Note};
 use tacit::model::Session;
 
 fn none() -> BTreeSet<u64> {
@@ -299,6 +299,56 @@ fn the_steward_is_shown_the_topics_and_opens_notes_before_it_answers() {
         turn.note,
         "Filed both under meetings, as the handbook treats them."
     );
+}
+
+#[test]
+fn an_overview_is_read_before_the_notes_of_its_topic() {
+    let session = fresh();
+    let mut notes = library().notes().to_vec();
+    let text = "Meetings run on [[agendas-a-day-ahead|Agendas go out a day ahead of meetings]] and on a timekeeper.";
+    let about = |id: &str, kind: Kind, title: &str, gist: &str| Note {
+        kind,
+        ..note(id, title, "Meetings", gist, &["agendas-a-day-ahead"])
+    };
+    let mut overview = about(
+        "overview-meetings",
+        Kind::Overview,
+        "Overview of Meetings",
+        "How the team meets.",
+    );
+    overview.body = text.into();
+    notes.push(overview);
+    notes.push(about(
+        "s00001",
+        Kind::Source,
+        "Team handbook",
+        "A handbook on meetings, agendas and who keeps time.",
+    ));
+    let library = Library::of(notes);
+    let knowledge = brief::knowledge(&library, &session, &none(), Tier::Steward, "");
+    // The index, then how the topic hangs together, then a line of each idea near the map.
+    let from = knowledge.find("- Baking (1): ").unwrap();
+    let levels = format!("\nOverview of Meetings: {text}\nNearest this map:\n[");
+    assert!(knowledge[from..].contains(&levels), "{knowledge}");
+    assert!(
+        knowledge.contains("- Meetings (3, with an overview): "),
+        "{knowledge}"
+    );
+    assert_eq!(knowledge.matches("Overview of").count(), 1, "{knowledge}");
+    // A note on a file and an overview have no line of their own, for either tier.
+    let placed = brief::knowledge(&library, &session, &none(), Tier::Place, "");
+    for shown in [&knowledge, &placed] {
+        assert!(
+            shown.contains("\n[a-timekeeper-for-every-meeting] "),
+            "{shown}"
+        );
+        assert!(
+            !shown.contains("[s00001]") && !shown.contains("[overview-meetings]"),
+            "{shown}"
+        );
+    }
+    assert!(!placed.contains("Overview of"), "{placed}");
+    assert!(prompt::system(Tier::Steward, true).contains("the overview where one is written"));
 }
 
 #[test]

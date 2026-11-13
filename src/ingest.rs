@@ -266,21 +266,19 @@ impl Reader {
         self.runtime.is_some() && self.cloud.is_some()
     }
     /// One answer from a model, on this reader's connection, to the request `ask` builds from
-    /// the settings. `None` without OpenRouter.
+    /// the settings. What it cost is added to `usage`. `None` without OpenRouter.
     pub(crate) fn answer(
         &self,
         ask: impl FnOnce(&CloudConfig) -> Result<ChatCompletionRequest, String>,
         patience: Duration,
+        usage: &mut Usage,
     ) -> Option<Result<String, String>> {
         let (runtime, (config, client)) = (self.runtime.as_ref()?, self.cloud.as_ref()?);
-        Some(ask(config).and_then(|request| {
-            runtime.block_on(turn::call(
-                client,
-                &request,
-                patience,
-                &mut Usage::default(),
-            ))
-        }))
+        Some(
+            ask(config).and_then(|request| {
+                runtime.block_on(turn::call(client, &request, patience, usage))
+            }),
+        )
     }
     fn words(
         &self,

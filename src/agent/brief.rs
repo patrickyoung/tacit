@@ -2,7 +2,7 @@
 //! the session's JSON. Small enough to send every few seconds.
 use super::turn::Stands;
 use super::{MAX_ROOTS, Tier, health};
-use crate::knowledge::{Library, Note};
+use crate::knowledge::{Kind, Library, Note};
 use crate::model::{ParkKind, Session, Thought};
 use std::collections::BTreeSet;
 use std::fmt::Write;
@@ -16,6 +16,10 @@ const WORDS: usize = 24_000;
 const NEAR_PLACE: usize = 5;
 const NEAR: usize = 10;
 const LINKED: usize = 4;
+/// How many of the topics the nearest notes are in have their overview shown.
+const OVERVIEWS: usize = 2;
+/// How many more notes are asked for than shown, since only ideas are.
+const SPARE: usize = 6;
 
 /// One line of someone's words, however long they spoke.
 fn clip(text: &str, max: usize) -> String {
@@ -349,8 +353,9 @@ pub fn directed(
 /// What the user's knowledge base holds that bears on this map, as a section of a brief, or
 /// nothing when it has nothing to show. Context is loaded a level at a time. The placer is
 /// shown a line of each note near the thoughts it is filing, and no section when none is.
-/// The steward and a directed turn are shown the topics, a line of each note near the map
-/// and of the notes those link to, and open whole notes by asking.
+/// The steward and a directed turn are shown the topics, the overview of the topics the map
+/// falls in, a line of each note near the map and of the notes those link to, and open whole
+/// notes by asking.
 pub fn knowledge(
     library: &Library,
     session: &Session,
@@ -395,7 +400,11 @@ pub fn knowledge(
         let recent = &filed[filed.len().saturating_sub(12)..];
         about.extend(recent.iter().map(|t| (1.0, t.text.as_str())));
     }
-    let near = library.nearest(&about, if place { NEAR_PLACE } else { NEAR });
+    // Ideas only: a note on a source or an overview of a topic is reached through them.
+    let limit = if place { NEAR_PLACE } else { NEAR };
+    let idea = |note: &&Note| note.kind == Kind::Idea;
+    let near = library.nearest(&about, limit + SPARE);
+    let near: Vec<&Note> = near.into_iter().filter(idea).take(limit).collect();
     if place && near.is_empty() {
         return out;
     }
@@ -414,6 +423,21 @@ pub fn knowledge(
         out.push_str("No note is near this map so far.\n");
         return out;
     }
+    // How the topics most of the nearest notes are in hang together, where that is written.
+    let mut topics: Vec<(&str, usize)> = vec![];
+    for note in &near {
+        match topics.iter_mut().find(|(topic, _)| *topic == note.topic) {
+            Some((_, notes)) => *notes += 1,
+            None => topics.push((&note.topic, 1)),
+        }
+    }
+    topics.sort_by_key(|(_, notes)| std::cmp::Reverse(*notes));
+    let outlines = topics
+        .iter()
+        .filter_map(|(topic, _)| library.outline(topic));
+    for outline in outlines.take(OVERVIEWS) {
+        out.push_str(&outline);
+    }
     out.push_str("Nearest this map:\n");
     cards(&mut out, &near);
     // One link on from the nearest: what a note builds on is often what explains it.
@@ -422,7 +446,8 @@ pub fn knowledge(
         let to = note.links.iter().filter_map(|id| library.get(id));
         for other in to.chain(library.linked_from(&note.id)) {
             let shown = |n: &&Note| n.id == other.id;
-            if linked.len() < LINKED && !near.iter().any(shown) && !linked.iter().any(shown) {
+            let new = !near.iter().any(shown) && !linked.iter().any(shown);
+            if linked.len() < LINKED && new && other.kind == Kind::Idea {
                 linked.push(other);
             }
         }

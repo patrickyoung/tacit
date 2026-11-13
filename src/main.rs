@@ -117,6 +117,15 @@ fn main() {
             for note in library.notes() {
                 println!("{}", library.card(note));
             }
+            for (topic, _) in library.topics() {
+                if let Some(outline) = library.outline(topic) {
+                    print!("\n{outline}");
+                }
+            }
+            // What the librarian did, as the user reads it.
+            if let Ok(log) = std::fs::read_to_string(root.join("changes.md")) {
+                print!("\n{log}");
+            }
             if said.is_empty() {
                 return Ok(());
             }

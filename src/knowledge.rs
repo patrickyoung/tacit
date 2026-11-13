@@ -2,14 +2,22 @@
 //! map agent a level at a time.
 //!
 //! A file dropped into the knowledge base is kept whole, read into text, and filed by the
-//! [`librarian`] as notes that each hold one idea: a zettelkasten. The notes are markdown files
-//! in `notes/`, linked as `[[id|Title]]`, so the folder can be read and edited with any notes
-//! tool, and a note written by hand is taken in like the rest.
+//! [`librarian`] as a zettelkasten. Three kinds of note are kept apart ([`Kind`]): a note that
+//! holds one idea, the note on a source that says what a file is and how it runs, and the
+//! overview of a topic that says how its ideas hang together. A link says why it is there.
+//! The notes are markdown files in `notes/`, linked as `[[id|Title]]`, so the folder can be
+//! read and edited with any notes tool, and a note written by hand is taken in like the rest.
+//!
+//! The librarian tends what it wrote: it merges, rewrites and re-sorts its own notes. A note
+//! written or changed by hand is the user's ([`Note::hand`]) and is never rewritten. Every
+//! page the librarian replaces or takes out is first copied to `history/`, and `changes.md`
+//! says in plain words what was done ([`Library::apply`]).
 //!
 //! No turn reads all of it. The levels, each loaded only when the one before calls for it:
-//! the index of topics ([`Library::index`]), the cards of the notes nearest a map
-//! ([`Library::nearest`], [`Library::card`]), and whole notes with the cards of what they link
-//! to ([`Library::open`]), which the steward and a directed turn ask for by name.
+//! the index of topics ([`Library::index`]), the overview of a topic near a map
+//! ([`Library::overview`]), the cards of the notes nearest it ([`Library::nearest`],
+//! [`Library::card`]), and whole notes with the cards of what they link to
+//! ([`Library::open`]), which the steward and a directed turn ask for by name.
 //!
 //! Knowledge tells the agent how a subject is organised. It is never put on a map.
 use crate::timeline;
@@ -20,8 +28,10 @@ use std::{fs, io};
 
 pub mod librarian;
 
-/// Notes one consultation opens in full, and the cards it shows of one topic.
+/// Notes one consultation opens in full, the cards it shows of one topic, and the linked
+/// notes it shows each way of a note opened.
 const OPENED: usize = 6;
+const LINKS: usize = 6;
 const TOPIC_CARDS: usize = 15;
 /// Characters of a note's text shown when it is opened: about four hundred words.
 const BODY: usize = 2_400;
@@ -29,8 +39,35 @@ const BODY: usize = 2_400;
 const TOPICS: usize = 24;
 /// A note file larger than this was not written as a note.
 const MAX_NOTE: u64 = 256 * 1024;
+/// Characters of the reason a link is there.
+const WHY: usize = 160;
+/// Characters of an overview shown where a turn did not ask for it.
+const OVERVIEW: usize = 1_600;
+/// Cards one search shows.
+const FOUND: usize = 6;
 
-/// One idea, written to stand alone.
+/// What a note is there for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Kind {
+    /// One idea, written to stand alone.
+    #[default]
+    Idea,
+    /// What one filed file is and how it runs, pointing to the ideas taken from it.
+    Source,
+    /// How the ideas of one topic hang together: where to start reading it.
+    Overview,
+}
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Idea => "idea",
+            Self::Source => "source",
+            Self::Overview => "overview",
+        }
+    }
+}
+
+/// One note of the knowledge base.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Note {
     /// Its file name in `notes/`, and what links and the map agent call it.
@@ -44,6 +81,12 @@ pub struct Note {
     pub body: String,
     /// The ids of the notes this one points to.
     pub links: Vec<String>,
+    /// Why a link is there, by the id it leads to: "an example of it", "contradicts it: …".
+    pub why: BTreeMap<String, String>,
+    pub kind: Kind,
+    /// Written or changed by hand. Such a note is the user's: the librarian reads it, links
+    /// to it, and never rewrites it or takes it out.
+    pub hand: bool,
     /// The name of the file it was filed from, and that file as kept in `sources/`.
     pub source: String,
     pub asset: String,
@@ -106,15 +149,36 @@ fn links_in(text: &str, out: &mut Vec<String>) {
     }
 }
 
+/// What a page is sealed with: a hash of all of it but the seal. A page whose seal still
+/// fits is as the librarian wrote it.
+fn seal(page: &str) -> String {
+    let lines = page.lines().filter(|line| !line.starts_with("seal:"));
+    let sealed = lines.collect::<Vec<_>>().join("\n");
+    blake3::hash(sealed.trim_end().as_bytes()).to_hex()[..16].to_owned()
+}
+/// A link's reason as written after it: "— an example of it".
+fn reason(text: &str) -> String {
+    let dashes = |c: char| c.is_whitespace() || ['—', '–', '-', ':', '·'].contains(&c);
+    clip(text.trim_start_matches(dashes), WHY)
+}
+
 impl Note {
-    /// The note as its markdown file. `titled` names the notes it links to.
+    /// The note as its markdown file, sealed as the librarian's own. `titled` names the notes
+    /// it links to.
     fn page(&self, titled: &dyn Fn(&str) -> Option<String>) -> String {
         let mut out = format!(
-            "---\nid: {}\ntitle: {}\ntopic: {}\nkeywords: {}\nsource: {}\nasset: {}\ncreated: {}\n---\n\n# {}\n\n> {}\n\n{}\n",
+            "---\nid: {}\ntitle: {}\ntopic: {}\nkeywords: {}\n",
             self.id,
             flat(&self.title),
             flat(&self.topic),
             self.keywords.join(", "),
+        );
+        if self.kind != Kind::Idea {
+            let _ = writeln!(out, "kind: {}", self.kind.name());
+        }
+        let _ = write!(
+            out,
+            "source: {}\nasset: {}\ncreated: {}\n---\n\n# {}\n\n> {}\n\n{}\n",
             flat(&self.source),
             self.asset,
             self.created,
@@ -122,19 +186,33 @@ impl Note {
             flat(&self.gist),
             self.body.trim()
         );
-        if !self.links.is_empty() {
-            let links: Vec<String> = self
-                .links
-                .iter()
-                .map(|id| match titled(id) {
-                    // A `|` or `]` in a title would end the link early.
-                    Some(title) => format!("[[{id}|{}]]", title.replace(['|', '[', ']'], " ")),
-                    None => format!("[[{id}]]"),
-                })
-                .collect();
-            let _ = writeln!(out, "\nSee also: {}", links.join(" · "));
+        // A link the text makes is not listed again under it.
+        let mut made = vec![];
+        links_in(&self.body, &mut made);
+        let listed = |id: &&String| !made.contains(id) || self.why.contains_key(*id);
+        let listed: Vec<&String> = self.links.iter().filter(listed).collect();
+        if !listed.is_empty() {
+            out.push_str("\nSee also:\n");
         }
-        out
+        for id in listed {
+            match titled(id) {
+                // A `|` or `]` in a title would end the link early.
+                Some(title) => {
+                    let _ = write!(out, "- [[{id}|{}]]", title.replace(['|', '[', ']'], " "));
+                }
+                None => {
+                    let _ = write!(out, "- [[{id}]]");
+                }
+            }
+            match self.why.get(id).map(|why| flat(why)) {
+                Some(why) if !why.is_empty() => {
+                    let _ = writeln!(out, " — {why}");
+                }
+                _ => out.push('\n'),
+            }
+        }
+        let seal = seal(&out);
+        out.replacen("\n---\n", &format!("\nseal: {seal}\n---\n"), 1)
     }
     /// A note from its file, however much of the layout a hand has changed. `stem` is the
     /// file's name, which names the note when nothing inside does.
@@ -142,6 +220,7 @@ impl Note {
         let raw = raw.replace("\r\n", "\n");
         let mut note = Note {
             id: id_of(stem),
+            hand: true,
             ..Default::default()
         };
         let mut rest = raw.as_str();
@@ -162,15 +241,25 @@ impl Note {
                         let words = value.trim_matches(['[', ']']).split(',');
                         note.keywords = words.map(flat).filter(|w| !w.is_empty()).collect();
                     }
+                    "kind" | "type" => {
+                        note.kind = match value.to_lowercase().as_str() {
+                            "source" | "literature" => Kind::Source,
+                            "overview" | "structure" | "hub" | "moc" => Kind::Overview,
+                            _ => Kind::Idea,
+                        }
+                    }
                     "source" => note.source = value.into(),
                     "asset" => note.asset = value.into(),
                     "created" => note.created = value.parse().unwrap_or_default(),
+                    "seal" => note.hand = value != seal(&raw),
                     _ => {}
                 }
             }
             rest = after.split_once('\n').map_or("", |(_, body)| body);
         }
-        let (mut body, mut gist, mut started) = (vec![], vec![], false);
+        // `listing`: under a "See also:" heading, where each line is a link and why.
+        let (mut body, mut gist, mut started, mut listing) = (vec![], vec![], false, false);
+        let mut also = vec![];
         for line in rest.lines() {
             let text = line.trim();
             if !started && text.is_empty() {
@@ -189,13 +278,38 @@ impl Note {
             }
             started = true;
             if let Some(links) = text.strip_prefix("See also:") {
-                links_in(links, &mut note.links);
+                links_in(links, &mut also);
+                listing = true;
                 continue;
             }
+            let item = text.strip_prefix(['-', '*']).map(str::trim_start);
+            if listing && let Some(link) = item.and_then(|item| item.strip_prefix("[[")) {
+                let (to, why) = link.split_once("]]").unwrap_or((link, ""));
+                let (to, why) = (id_of(to), reason(why));
+                if !to.is_empty() {
+                    if !why.is_empty() {
+                        note.why.insert(to.clone(), why);
+                    }
+                    if !also.contains(&to) {
+                        also.push(to);
+                    }
+                }
+                continue;
+            }
+            // A blank line in or after the list belongs to it, not to the text.
+            if listing && text.is_empty() {
+                continue;
+            }
+            listing = false;
             body.push(line);
         }
         note.body = body.join("\n").trim().to_owned();
         links_in(&note.body, &mut note.links);
+        for id in also {
+            if !note.links.contains(&id) {
+                note.links.push(id);
+            }
+        }
         note.gist = flat(&gist.join(" "));
         if note.title.is_empty() {
             note.title = stem.trim().to_owned();
@@ -208,8 +322,36 @@ impl Note {
         }
         let own = note.id.clone();
         note.links.retain(|id| *id != own);
+        note.why.retain(|id, _| *id != own);
         note
     }
+}
+
+/// Changes to the knowledge base that are written together.
+#[derive(Clone, Debug, Default)]
+pub struct Changes {
+    /// Notes that are new, or that replace the note of the same id.
+    pub notes: Vec<Note>,
+    /// The ids of notes taken out.
+    pub retired: Vec<String>,
+    /// What was done, a line each, in words the user can read.
+    pub log: Vec<String>,
+}
+/// A time as the log gives it: "2026-11-12 14:03" in UTC.
+fn date(seconds: u64) -> String {
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    // Days since 1970 as a date of the Gregorian calendar, counting eras of 400 years from
+    // a first of March.
+    let shifted = days + 719_468;
+    let (era, day) = (shifted / 146_097, shifted % 146_097);
+    let year = (day - day / 1_460 + day / 36_524 - day / 146_096) / 365;
+    let of_year = day - (365 * year + year / 4 - year / 100);
+    let month = (5 * of_year + 2) / 153;
+    let (day, march) = (of_year - (153 * month + 2) / 5 + 1, month < 10);
+    let month = if march { month + 3 } else { month - 9 };
+    let year = year + era * 400 + u64::from(!march);
+    let (hour, minute) = (rest / 3_600, rest % 3_600 / 60);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
 }
 
 /// Words that say nothing about what a note or a map is about.
@@ -468,6 +610,7 @@ impl Library {
         };
         for (at, note) in notes.iter_mut().enumerate() {
             note.links.retain(|id| library.by_id.contains_key(id));
+            note.why.retain(|id, _| note.links.contains(id));
             let fields = [
                 (note.title.clone(), 3.0, true),
                 (note.keywords.join(" "), 3.0, true),
@@ -533,23 +676,96 @@ impl Library {
         self.notes.iter().find(same).map(|note| note.topic.as_str())
     }
 
+    /// The overview of a topic, when one was written.
+    pub fn overview(&self, topic: &str) -> Option<&Note> {
+        let of = |note: &&Note| {
+            note.kind == Kind::Overview && note.topic.eq_ignore_ascii_case(topic.trim())
+        };
+        self.notes.iter().find(of)
+    }
+    /// The level between the index and the cards: how a topic's notes hang together, as its
+    /// overview says it, or nothing when none was written.
+    pub fn outline(&self, topic: &str) -> Option<String> {
+        let overview = self.overview(topic)?;
+        let text = clip(&overview.body, OVERVIEW);
+        Some(format!("{}: {text}\n", flat(&overview.title)))
+    }
+
     /// Write `notes` into the folder and take them in.
     pub fn add(&mut self, root: &Path, notes: Vec<Note>) -> io::Result<()> {
+        let changes = Changes {
+            notes,
+            ..Default::default()
+        };
+        self.apply(root, changes, 0).map(|_| ())
+    }
+    /// Write a set of changes into the folder and take them in. A page that is replaced or
+    /// taken out is first copied to `history/`, and what was done is added to `changes.md`.
+    /// A page a hand has written or changed, as the folder holds it now, is left alone
+    /// whatever `changes` says. Returns the ids of the notes that were left alone for that.
+    pub fn apply(&mut self, root: &Path, changes: Changes, now: u64) -> io::Result<Vec<String>> {
         timeline::private_dir(root)?;
         let folder = root.join("notes");
         timeline::private_dir(&folder)?;
+        let page = |id: &str| folder.join(format!("{id}.md"));
+        // The page as it is on disk decides, not what was read when the app started: the
+        // user may have edited it since.
+        let mut spared = vec![];
+        let mut old: BTreeMap<&str, String> = BTreeMap::new();
+        let touched = changes.notes.iter().map(|note| note.id.as_str());
+        for id in touched.chain(changes.retired.iter().map(String::as_str)) {
+            let Ok(raw) = fs::read_to_string(page(id)) else {
+                continue;
+            };
+            if Note::parse(id, &raw).hand {
+                spared.push(id.to_owned());
+            } else {
+                old.insert(id, raw);
+            }
+        }
+        if !old.is_empty() {
+            let history = root.join("history");
+            timeline::private_dir(&history)?;
+            for (id, raw) in &old {
+                let kept = history.join(format!("{id}-{now}.md"));
+                timeline::atomic_write(&kept, raw.as_bytes())?;
+            }
+        }
+        let retired = |id: &str| changes.retired.iter().any(|gone| gone == id);
+        let written = |note: &&Note| !spared.contains(&note.id) && !retired(&note.id);
+        let written: Vec<&Note> = changes.notes.iter().filter(written).collect();
         let titled = |id: &str| {
-            let new = notes.iter().find(|note| note.id == id);
+            let new = written.iter().find(|note| note.id == id).copied();
             new.or_else(|| self.get(id)).map(|note| note.title.clone())
         };
-        for note in &notes {
-            let path = folder.join(format!("{}.md", note.id));
-            timeline::atomic_write(&path, note.page(&titled).as_bytes())?;
+        for note in &written {
+            timeline::atomic_write(&page(&note.id), note.page(&titled).as_bytes())?;
         }
-        let mut all = std::mem::take(&mut self.notes);
-        all.extend(notes);
+        for id in changes.retired.iter().filter(|id| !spared.contains(id)) {
+            match fs::remove_file(page(id)) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+        }
+        if !changes.log.is_empty() {
+            let path = root.join("changes.md");
+            let mut log = fs::read_to_string(&path).unwrap_or_default();
+            if log.is_empty() {
+                log.push_str("# What the librarian changed\n\nEvery page it replaced or took out is kept in `history/`, named by the note and the time.\n\n");
+            }
+            for line in &changes.log {
+                let _ = writeln!(log, "- {} · {}", date(now), flat(line));
+            }
+            timeline::atomic_write(&path, log.as_bytes())?;
+        }
+        let gone = |note: &Note| {
+            let replaced = written.iter().any(|new| new.id == note.id);
+            replaced || (retired(&note.id) && !spared.contains(&note.id))
+        };
+        let mut all: Vec<Note> = self.notes.iter().filter(|n| !gone(n)).cloned().collect();
+        all.extend(written.into_iter().cloned());
         *self = Self::of(all);
-        Ok(())
+        Ok(spared)
     }
 
     /// The notes nearest a text, nearest first: at most `limit`, and none that only happen to
@@ -606,7 +822,10 @@ impl Library {
         let points = |note: &&Note| note.links.iter().any(|link| link == id);
         self.notes.iter().filter(points).collect()
     }
-
+    /// The notes nearest some words someone is looking for, of every kind, nearest first.
+    pub fn find(&self, words: &str, limit: usize) -> Vec<&Note> {
+        self.nearest(&[(1.0, words)], limit)
+    }
     /// The first level: what the knowledge base holds, by topic.
     pub fn index(&self) -> String {
         let topics = self.topics();
@@ -621,7 +840,14 @@ impl Library {
             let mut words: Vec<(&str, usize)> = counted.into_iter().collect();
             words.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
             let words: Vec<&str> = words.iter().take(5).map(|(word, _)| *word).collect();
-            let _ = writeln!(out, "- {name} ({}): {}", notes.len(), words.join(", "));
+            let overview = match self.overview(name) {
+                Some(_) => ", with an overview",
+                None => "",
+            };
+            // The overview is named beside the count, so it is not counted in it.
+            let held = notes.iter().filter(|note| note.kind != Kind::Overview);
+            let (held, words) = (held.count(), words.join(", "));
+            let _ = writeln!(out, "- {name} ({held}{overview}): {words}");
         }
         if topics.len() > TOPICS {
             let _ = writeln!(out, "- and {} smaller topics", topics.len() - TOPICS);
@@ -631,6 +857,9 @@ impl Library {
     /// The second level: one line of a note, enough to tell whether it bears on a map.
     pub fn card(&self, note: &Note) -> String {
         let mut out = format!("[{}] {}", note.id, flat(&note.title));
+        if note.kind != Kind::Idea {
+            out.insert_str(note.id.len() + 2, &format!(" ({})", note.kind.name()));
+        }
         if !note.topic.is_empty() {
             let _ = write!(out, " · {}", flat(&note.topic));
         }
@@ -655,16 +884,64 @@ impl Library {
             let notes: Vec<&Note> = notes;
             if !notes.is_empty() {
                 let _ = writeln!(out, "{heading}:");
-                for linked in notes.iter().take(6) {
-                    let _ = writeln!(out, "  {}", self.card(linked));
+                for linked in notes.iter().take(LINKS) {
+                    // The reason is the one the note that holds the link gives.
+                    let why = match heading {
+                        "Links to" => note.why.get(&linked.id),
+                        _ => linked.why.get(&note.id),
+                    };
+                    let _ = write!(out, "  {}", self.card(linked));
+                    match why {
+                        Some(why) => {
+                            let _ = writeln!(out, " — why: {why}");
+                        }
+                        None => out.push('\n'),
+                    }
+                }
+                if notes.len() > LINKS {
+                    let _ = writeln!(out, "  and {} more", notes.len() - LINKS);
                 }
             }
         }
         out
     }
+    /// What a search for each of `phrases` finds, as cards: the way in when no overview leads
+    /// to what is wanted. A card says when its note is already open in `seen`. Returns the
+    /// text and the ids of the notes found.
+    pub fn found(&self, phrases: &[String], seen: &BTreeSet<String>) -> (String, Vec<String>) {
+        let (mut out, mut ids) = (String::new(), vec![]);
+        for words in phrases
+            .iter()
+            .map(|p| clip(p, 120))
+            .filter(|p| !p.is_empty())
+        {
+            let notes = self.find(&words, FOUND);
+            if notes.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "FOUND {words:?}: nothing. The notes may put it in other words.\n"
+                );
+                continue;
+            }
+            let _ = writeln!(out, "FOUND {words:?} ({})", count(notes.len(), "note"));
+            for note in notes {
+                let open = match seen.contains(&note.id) {
+                    true => " · open above",
+                    false => "",
+                };
+                let _ = writeln!(out, "{}{open}", self.card(note));
+                if !ids.contains(&note.id) {
+                    ids.push(note.id.clone());
+                }
+            }
+            out.push('\n');
+        }
+        (out, ids)
+    }
     /// What a turn asked to read: notes by id or title, in full, and topics by name, as the
-    /// cards of their notes. `seen` holds what the turn was shown before, and takes what it
-    /// is shown now. Returns the text and the ids of the notes opened.
+    /// cards of their notes. A name that is neither is searched for. `seen` holds what the
+    /// turn was shown before, and takes what it is shown now. Returns the text and the ids of
+    /// the notes opened.
     pub fn open(&self, wanted: &[String], seen: &mut BTreeSet<String>) -> (String, Vec<String>) {
         let (mut out, mut opened) = (String::new(), vec![]);
         for name in wanted
@@ -691,12 +968,16 @@ impl Library {
                     opened.push(note.id.clone());
                 }
             } else if let Some(topic) = self.topic(&name) {
-                let notes = self
-                    .notes
-                    .iter()
-                    .filter(|n| n.topic.eq_ignore_ascii_case(topic));
-                let notes: Vec<&Note> = notes.collect();
+                let within =
+                    |n: &&Note| n.topic.eq_ignore_ascii_case(topic) && n.kind != Kind::Overview;
+                let notes: Vec<&Note> = self.notes.iter().filter(within).collect();
                 let _ = writeln!(out, "TOPIC {topic} ({})", count(notes.len(), "note"));
+                // Its overview comes first: it says how the notes below hang together.
+                if let Some(overview) = self.overview(topic)
+                    && seen.insert(overview.id.clone())
+                {
+                    let _ = writeln!(out, "Overview: {}", clip(&overview.body, BODY));
+                }
                 for note in notes.iter().take(TOPIC_CARDS) {
                     let _ = writeln!(out, "{}", self.card(note));
                 }
@@ -707,8 +988,13 @@ impl Library {
             } else {
                 let _ = writeln!(
                     out,
-                    "The knowledge base holds no note or topic called {name:?}.\n"
+                    "The knowledge base holds no note or topic called {name:?}."
                 );
+                // Words that name nothing are what someone is looking for.
+                match self.found(std::slice::from_ref(&name), seen) {
+                    (found, ids) if !ids.is_empty() => out.push_str(&found),
+                    _ => out.push('\n'),
+                }
             }
         }
         (out, opened)
@@ -776,7 +1062,12 @@ mod tests {
             "First paragraph.\n\nSecond, with a [[k00002|Limits]] link.",
         );
         written.gist = "Smaller batches mean faster feedback.".into();
-        written.links = vec!["k00002".into(), "k00009".into()];
+        written.links = vec!["k00002".into(), "k00009".into(), "k00010".into()];
+        let why = [
+            ("k00002", "an example of it"),
+            ("k00010", "contradicts it: weekly, not daily"),
+        ];
+        written.why = why.map(|(id, why)| (id.into(), why.into())).into();
         written.source = "lean notes.pdf".into();
         written.asset = "abc.pdf".into();
         written.created = 1_794_000_000;
@@ -786,13 +1077,63 @@ mod tests {
             "{page}"
         );
         assert!(page.contains("\n# Small batches\n\n> Smaller batches mean faster feedback.\n"));
+        // A link says why it is there. One the text makes is listed again only for that.
         assert!(
-            page.ends_with("\nSee also: [[k00002|Limits   on  work ]] · [[k00009]]\n"),
+            page.ends_with(
+                "\nSee also:\n- [[k00002|Limits   on  work ]] — an example of it\n- [[k00009]]\n- [[k00010]] — contradicts it: weekly, not daily\n"
+            ),
             "{page}"
         );
         assert_eq!(Note::parse("k3fa2c", &page), written);
         // Windows line endings, as an editor there would save it.
         assert_eq!(Note::parse("k3fa2c", &page.replace('\n', "\r\n")), written);
+        // The page is sealed as the librarian's. One edit and it is the user's.
+        assert!(page.contains("\ncreated: 1794000000\nseal: "), "{page}");
+        let edited = Note::parse("k3fa2c", &page.replace("First paragraph", "My paragraph"));
+        assert!(edited.hand && edited.body.starts_with("My paragraph."));
+        let unsealed: Vec<&str> = page.lines().filter(|l| !l.starts_with("seal:")).collect();
+        assert!(Note::parse("k3fa2c", &unsealed.join("\n")).hand);
+    }
+    #[test]
+    fn a_note_says_what_kind_it_is() {
+        let mut overview = note(
+            "overview-flow",
+            "Overview of Flow",
+            "Flow",
+            &[],
+            "Start at [[k00001|Small batches]].",
+        );
+        overview.kind = Kind::Overview;
+        overview.links = vec!["k00001".into()];
+        let page = overview.page(&|_| None);
+        assert!(page.contains("\nkind: overview\n"), "{page}");
+        assert!(!page.contains("See also"), "{page}");
+        assert_eq!(Note::parse("overview-flow", &page), overview);
+        // As other tools name them.
+        let kind = |kind: &str| Note::parse("x", &format!("---\ntype: {kind}\n---\nBody.")).kind;
+        assert_eq!(kind("MOC"), Kind::Overview);
+        assert_eq!(kind("literature"), Kind::Source);
+        assert_eq!(kind("permanent"), Kind::Idea);
+        // Reasons the user wrote by hand, in a list or on one line.
+        let by_hand = Note::parse(
+            "mine",
+            "# Mine\n\nA thought.\n\nSee also: [[k00003]]\n* [[k00001|Small batches]] - the reason behind it\n- [[k00002]]\n\nAfter the list.\n- [[k00004]] is in the text\n",
+        );
+        assert!(by_hand.hand);
+        assert_eq!(by_hand.links, ["k00004", "k00003", "k00001", "k00002"]);
+        assert_eq!(by_hand.why["k00001"], "the reason behind it");
+        assert_eq!(by_hand.why.len(), 1);
+        assert_eq!(
+            by_hand.body,
+            "A thought.\n\nAfter the list.\n- [[k00004]] is in the text"
+        );
+    }
+    #[test]
+    fn a_time_is_written_as_a_date() {
+        assert_eq!(date(0), "1970-01-01 00:00");
+        assert_eq!(date(951_782_400), "2000-02-29 00:00");
+        assert_eq!(date(951_782_400 + 86_400), "2000-03-01 00:00");
+        assert_eq!(date(1_794_018_420), "2026-11-07 02:27");
     }
     #[test]
     fn a_note_written_by_hand_is_taken_as_it_is() {
@@ -830,7 +1171,9 @@ mod tests {
         assert_eq!(kept.len(), 4);
         let page = fs::read_to_string(root.join("notes/k00001.md")).unwrap();
         assert!(
-            page.contains("See also: [[k00002|Limits on work in progress expose bottlenecks]]"),
+            page.ends_with(
+                "\nSee also:\n- [[k00002|Limits on work in progress expose bottlenecks]]\n"
+            ),
             "{page}"
         );
         fs::write(
@@ -856,6 +1199,56 @@ mod tests {
             assert_eq!(mode(&root.join("notes")), 0o700);
             assert_eq!(mode(&root.join("notes/k00001.md")), 0o600);
         }
+    }
+    #[test]
+    fn what_the_user_wrote_is_spared_and_what_is_replaced_is_kept() {
+        let folder = tempfile::tempdir().unwrap();
+        let root = folder.path();
+        let mut kept = Library::default();
+        kept.add(root, library().notes().to_vec()).unwrap();
+        assert!(!root.join("history").exists() && !root.join("changes.md").exists());
+        let page = |id: &str| root.join(format!("notes/{id}.md"));
+        let read = |path: PathBuf| fs::read_to_string(path).unwrap();
+        // The user edits one page after the app read it.
+        let (first, second) = (read(page("k00001")), read(page("k00002")));
+        let edited = second.replace("A cap on work", "My own words: a cap on work");
+        fs::write(page("k00002"), &edited).unwrap();
+        let rewritten = |id: &str| {
+            let mut note = kept.get(id).unwrap().clone();
+            note.gist = "Rewritten.".into();
+            note
+        };
+        let changes = Changes {
+            notes: vec![rewritten("k00001"), rewritten("k00002")],
+            retired: vec!["k00004".into(), "k99999".into()],
+            log: vec!["Rewrote [k00001].".into(), "Took out\n[k00004].".into()],
+        };
+        let now = 1_794_018_420;
+        assert_eq!(kept.apply(root, changes, now).unwrap(), ["k00002"]);
+        assert_eq!(kept.get("k00001").unwrap().gist, "Rewritten.");
+        assert_ne!(kept.get("k00002").unwrap().gist, "Rewritten.");
+        assert!(kept.get("k00004").is_none() && !page("k00004").exists());
+        assert_eq!(read(page("k00002")), edited);
+        // What a page was is kept, named by the note and the time.
+        assert_eq!(read(root.join(format!("history/k00001-{now}.md"))), first);
+        assert!(root.join(format!("history/k00004-{now}.md")).exists());
+        assert!(!root.join(format!("history/k00002-{now}.md")).exists());
+        let log = read(root.join("changes.md"));
+        assert!(log.starts_with("# What the librarian changed\n"), "{log}");
+        assert!(
+            log.ends_with(
+                "\n- 2026-11-07 02:27 · Rewrote [k00001].\n- 2026-11-07 02:27 · Took out [k00004].\n"
+            ),
+            "{log}"
+        );
+        // Read again, the folder holds what the knowledge base does, and the user's page
+        // as they left it.
+        let found = Library::load(root);
+        assert_eq!(found.len(), 3);
+        assert_eq!(found.get("k00001"), kept.get("k00001"));
+        let mine = found.get("k00002").unwrap();
+        assert!(mine.hand && mine.body.starts_with("My own words"));
+        assert!(!root.join("history/.md").exists());
     }
     #[test]
     fn words_meet_in_their_stems() {
@@ -926,6 +1319,76 @@ mod tests {
         assert!(full.ends_with("Linked from:\n  [k00001] Small batches shorten feedback loops · Delivery flow: Small batches shorten feedback loops. · see k00002\n"), "{full}");
     }
     #[test]
+    fn an_overview_leads_into_its_topic() {
+        let mut notes = library().notes().to_vec();
+        let mut overview = note(
+            "overview-delivery-flow",
+            "Overview of Delivery flow",
+            "Delivery flow",
+            &["feedback"],
+            "Start with [[k00001|Small batches]], then [[k00002|Limits]].",
+        );
+        overview.kind = Kind::Overview;
+        overview.links = vec!["k00001".into(), "k00002".into()];
+        let mut source = note(
+            "s00001",
+            "Lean handbook",
+            "Delivery flow",
+            &[],
+            "How it runs:\n- One.",
+        );
+        source.kind = Kind::Source;
+        source.links = vec!["k00001".into(), "k00003".into()];
+        source.why = [("k00003".to_owned(), "says the same".to_owned())].into();
+        notes.extend([overview, source]);
+        let library = Library::of(notes);
+        assert_eq!(
+            library.overview("delivery FLOW").unwrap().id,
+            "overview-delivery-flow"
+        );
+        assert!(library.overview("Pricing").is_none());
+        let index = library.index();
+        assert!(
+            index.starts_with(
+                "6 notes in 3 topics:\n- Delivery flow (3, with an overview): feedback, "
+            ),
+            "{index}"
+        );
+        assert!(index.contains("\n- Pricing (1): "), "{index}");
+        let card = library.card(library.get("s00001").unwrap());
+        assert!(
+            card.starts_with("[s00001] (source) Lean handbook · Delivery flow: "),
+            "{card}"
+        );
+        // A link's reason is shown with the note that holds it.
+        let full = library.full(library.get("s00001").unwrap());
+        assert!(
+            full.contains("\nLinks to:\n  [k00001] Small batches"),
+            "{full}"
+        );
+        assert!(
+            full.contains(
+                " · Pricing: Anchoring sets what a price is compared with. — why: says the same\n"
+            ),
+            "{full}"
+        );
+        let full = library.full(library.get("k00003").unwrap());
+        assert!(full.ends_with("Linked from:\n  [s00001] (source) Lean handbook · Delivery flow: Lean handbook. · see k00001, k00003 — why: says the same\n"), "{full}");
+        // A topic opens with its overview, once.
+        let mut seen = BTreeSet::new();
+        let (text, _) = library.open(&["Delivery flow".into()], &mut seen);
+        assert!(
+            text.starts_with("TOPIC Delivery flow (3 notes)\nOverview: Start with [[k00001|Small batches]], then [[k00002|Limits]].\n[k00001] Small"),
+            "{text}"
+        );
+        assert!(!text.contains("[overview-delivery-flow]"), "{text}");
+        let (again, _) = library.open(&["delivery flow".into()], &mut seen);
+        assert!(
+            again.starts_with("TOPIC Delivery flow (3 notes)\n[k00001] Small"),
+            "{again}"
+        );
+    }
+    #[test]
     fn a_turn_opens_notes_by_id_or_title_and_topics_by_name() {
         let library = library();
         let mut seen = BTreeSet::new();
@@ -954,6 +1417,74 @@ mod tests {
         let (again, opened) = library.open(&["k00001".into(), "k00002".into()], &mut seen);
         assert_eq!(opened, ["k00002"]);
         assert!(again.starts_with("[k00001] is open above."), "{again}");
+    }
+    #[test]
+    fn words_are_searched_for_when_they_name_no_note() {
+        let mut flow = note(
+            "k00001",
+            "Small batches shorten feedback loops",
+            "Delivery flow",
+            &["batch size", "feedback"],
+            "Work released in small batches reaches users sooner.",
+        );
+        flow.links = vec!["k00002".into()];
+        flow.why = [("k00002".into(), "the step before it".into())].into();
+        flow.asset = "abc.pdf".into();
+        let mut limits = note(
+            "k00002",
+            "Limits on work in progress expose bottlenecks",
+            "Delivery flow",
+            &["wip limit", "bottleneck"],
+            "A cap on work in progress makes a queue visible.",
+        );
+        limits.links = vec!["k00001".into()];
+        limits.why = [(
+            "k00001".into(),
+            " Contradicts it: large batches hide queues".into(),
+        )]
+        .into();
+        let mut file = note(
+            "s00001",
+            "Lean notes on delivery",
+            "Delivery flow",
+            &["lean"],
+            "Notes from a talk on flow.",
+        );
+        (file.kind, file.asset) = (Kind::Source, "abc.pdf".into());
+        file.links = vec!["k00001".into()];
+        let own = note(
+            "mine",
+            "My own note",
+            "Delivery flow",
+            &[],
+            "Written by hand.",
+        );
+        let library = Library::of(vec![flow, limits, file, own]);
+        // A search finds notes of every kind and says which are already open.
+        assert_eq!(ids(&library.find("bottleneck", 5)), ["k00002"]);
+        assert!(ids(&library.find("lean talk", 5)).contains(&"s00001".to_owned()));
+        let seen: BTreeSet<String> = ["k00002".to_owned()].into();
+        let phrases = [
+            "bottleneck".to_owned(),
+            "zebra crossing".to_owned(),
+            " ".to_owned(),
+        ];
+        let (text, found) = library.found(&phrases, &seen);
+        assert_eq!(found, ["k00002"]);
+        assert_eq!(
+            text,
+            "FOUND \"bottleneck\" (1 note)\n[k00002] Limits on work in progress expose bottlenecks · Delivery flow: Limits on work in progress expose bottlenecks. · see k00001 · open above\n\nFOUND \"zebra crossing\": nothing. The notes may put it in other words.\n\n"
+        );
+        // Words that name no note or topic are searched for.
+        let mut seen = BTreeSet::new();
+        let (text, opened) = library.open(&["queue visible".into()], &mut seen);
+        assert!(opened.is_empty() && seen.is_empty());
+        assert!(
+            text.starts_with(
+                "The knowledge base holds no note or topic called \"queue visible\".\nFOUND \"queue visible\" (1 note)\n[k00002] "
+            ),
+            "{text}"
+        );
     }
     #[test]
     fn the_knowledge_base_is_beside_the_notebook() {

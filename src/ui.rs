@@ -1405,6 +1405,9 @@ impl State {
             (Outcome::Filed(filed), Some(job)) => {
                 let name = self.filing.remove(job).name;
                 match filed {
+                    Ok(0) => {
+                        self.status = format!("{name} says nothing the knowledge base did not hold")
+                    }
                     Ok(1) => self.status = format!("{name} is one note in the knowledge base"),
                     Ok(notes) => {
                         self.status = format!("{name} is {notes} notes in the knowledge base")
