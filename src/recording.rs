@@ -9,6 +9,9 @@ use std::time::Duration;
 
 /// A recording shorter than this holds one thought: not worth a round trip.
 const BRIEF: usize = 8;
+/// A recording longer than this is heard a piece at a time: one answer holds at most a hundred
+/// thoughts and has thirty seconds to arrive.
+const PIECE: usize = 500;
 
 pub struct Request {
     pub id: u64,
@@ -163,11 +166,45 @@ pub async fn sift(
     if count < BRIEF {
         return Ok(vec![text.to_owned()]);
     }
-    // An unreadable answer is asked for once more; a provider that fails is not asked again.
-    match parse(&hear(client, config, text, context, usage).await?, text) {
-        Err(_) => parse(&hear(client, config, text, context, usage).await?, text),
-        cut => cut,
+    let pieces = pieces(text);
+    let mut context = std::borrow::Cow::Borrowed(context);
+    let mut thoughts = Vec::new();
+    for (index, piece) in pieces.iter().enumerate() {
+        // An unreadable answer is asked for once more; a provider that fails is not asked again.
+        let cut = match parse(&hear(client, config, piece, &context, usage).await?, piece) {
+            Err(_) => parse(&hear(client, config, piece, &context, usage).await?, piece),
+            cut => cut,
+        }?;
+        // The next piece is heard as following this one.
+        if index + 1 < pieces.len() {
+            for thought in &cut {
+                context.to_mut().add(thought);
+            }
+        }
+        thoughts.extend(cut);
     }
+    Ok(thoughts)
+}
+/// A long recording as the pieces it is heard in: every byte kept, in order. A piece ends with
+/// a sentence where one ends in its second half, and a short remainder stays with the last.
+fn pieces(text: &str) -> Vec<&str> {
+    let words = tokens(text);
+    let closes = |index: &usize| {
+        words[*index]
+            .1
+            .ends_with(['.', '!', '?', '。', '！', '？', '…'])
+    };
+    let (mut pieces, mut start, mut from) = (Vec::new(), 0, 0);
+    while words.len() - start > PIECE + PIECE / 4 {
+        let end = (start + PIECE / 2..start + PIECE)
+            .rev()
+            .find(closes)
+            .map_or(start + PIECE, |last| last + 1);
+        pieces.push(&text[from..words[end].0]);
+        (start, from) = (end, words[end].0);
+    }
+    pieces.push(&text[from..]);
+    pieces
 }
 
 #[cfg(test)]
@@ -184,6 +221,23 @@ mod tests {
         assert_eq!(chunks.concat(), text);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[1], "But budgets don’t.  ");
+    }
+    #[test]
+    fn a_long_recording_is_heard_in_pieces_that_end_with_a_sentence() {
+        let short = "One point. ".repeat(PIECE / 2 + PIECE / 8);
+        assert_eq!(pieces(&short), vec![short.as_str()]);
+        // Sentences of seven words: a piece takes as many whole ones as fit.
+        let long = "Meetings take all day in this team.\n".repeat(200);
+        let heard = pieces(&long);
+        assert_eq!(heard.concat(), long);
+        let counts: Vec<usize> = heard.iter().map(|p| tokens(p).len()).collect();
+        assert_eq!(counts, [497, 497, 406]);
+        assert!(heard[1].starts_with("Meetings") && heard[1].ends_with("team.\n"));
+        // With no sentence to end on, a piece ends at its length.
+        let run = "word ".repeat(PIECE * 2);
+        let heard = pieces(&run);
+        assert_eq!(heard.concat(), run);
+        assert_eq!(tokens(heard[0]).len(), PIECE);
     }
     #[test]
     fn rejects_missing_repeated_reversed_and_out_of_range_boundaries() {

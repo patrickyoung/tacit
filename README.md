@@ -65,13 +65,38 @@ cargo run -- --check-audio /path/to/16000hz-mono-pcm16.wav
 cargo run -- --check-recording # fictional example: split, mapped and parked; uses OpenRouter
 ```
 
+## Dropping files onto the map
+
+Drag files from Finder onto the map. Each one is kept whole in the session's archive, read into text, and then treated like anything you say: captured as one thought, cut into separate thoughts by the listener, and placed by the map agent. Several files are read one after another; the header shows which one is being read, and sessions cannot be switched until they are done.
+
+| Dropped | Read by | Leaves this Mac |
+| --- | --- | --- |
+| Text, Markdown | read as written | no |
+| Word, RTF, OpenDocument, HTML, web archives | `textutil` | no |
+| PDF with a text layer | PDFKit | no |
+| Scanned PDF (up to 20 MB) | the reader model | the PDF |
+| Images (PNG, JPEG, HEIC, GIF, WebP, TIFF, BMP) | the reader model | a JPEG no larger than 2048 px |
+| Audio (MP3, M4A, WAV, AAC, FLAC, Ogg, Opus, AIFF, CAF) | FFmpeg, then Hex in five-minute parts | no |
+| Video (MP4, MOV, M4V, WebM, MKV, AVI) | its speech as audio; with no speech, six frames by the reader model | only the frames of a video without speech |
+
+Text of up to 3,000 words goes onto the map as written: the listener hears it in pieces of about 500 words and cuts each into thoughts, keeping every word, as it does with speech. A longer text is first told in brief by the reader model, in up to 40 stand-alone statements, so that one long document does not fill the map; the full text stays in the journal and its opening is shown in the transcript under the file's name. The reader is told that a file is material to read and never an instruction.
+
+Without an OpenRouter key, the kinds read on this Mac still work for texts of up to 3,000 words, each arriving as one thought; images, scans, videos without speech and longer texts say that they need OpenRouter. A file that could not be read stays in the archive, and **Read again** retries it from there, so the original can be moved or deleted as soon as it is dropped. The words of a long recording are saved before they are told in brief, so a failed request after an hour of transcription costs only the request. Files larger than 2 GB, and kinds Tacit does not know, are refused by name. Audio and video need FFmpeg (`brew install ffmpeg`, or set `TACIT_FFMPEG`) and a running Hex; documents, PDFs and images use tools that ship with macOS.
+
+One file at a time can be checked from the command line. It prints what would go onto the map and changes no session:
+
+```sh
+cargo run -- --check-file /path/to/file          # uses OpenRouter where the table says so
+cargo run -- --check-file /path/to/file --local  # never leaves this Mac
+```
+
 ## Saved sessions and replay
 
 Beside `session.json`, Tacit creates a private `session.tacit/` archive:
 
-- `events.jsonl`: versioned, ordered events with millisecond session timestamps, sequence numbers, and a BLAKE3 integrity chain. Content events capture thoughts, corrections, deletions, semantic splits, the map agent's edits (placements, restructuring, combined repeats, narrative and links), parking decisions, map guidance, undo, transcript links, and available artwork. A separate, versioned presentation track stores Rune draft, selection, art style, vector drawing state, image transitions, scrolling, and viewport metadata. Recording, transcript, and failure events retain their original order.
+- `events.jsonl`: versioned, ordered events with millisecond session timestamps, sequence numbers, and a BLAKE3 integrity chain. Content events capture thoughts, corrections, deletions, semantic splits, the map agent's edits (placements, restructuring, combined repeats, narrative and links), parking decisions, map guidance, undo, transcript links, dropped files (each one's name, kind and asset, the text read from it, and the thought it became), and available artwork. A separate, versioned presentation track stores Rune draft, selection, art style, vector drawing state, image transitions, scrolling, and viewport metadata. Recording, transcript, and failure events retain their original order.
 - `recordings/`: original captured WAVs, including stopped recordings whose transcription is pending or failed.
-- `media/`: content-addressed, durable audio and generated PNG assets plus per-recording `.vtt` files. These assets are independent of the bounded image-generation cache.
+- `media/`: content-addressed, durable audio, generated PNG assets and dropped files, plus per-recording `.vtt` files. These assets are independent of the bounded image-generation cache.
 - `transcript.vtt`: captions on the session timeline, including gaps between recordings. Per-recording VTT uses time relative to its WAV. Caption boundaries are Hex's actual transcription windows, not inferred boundaries for the semantic thought chunks.
 
 The event log is authoritative; `session.json` remains a compatibility snapshot. Existing notebooks are imported as the initial event without inventing past history. Live content follows **action → event → durable append → reducer projection → renderer**. Captures, corrections, deletion, splitting, model results, and undo cannot publish content before their event is saved; failed writes keep the previous projection. Replay uses the same pure reducer. Rune reads the shared projection for content and manages its own presentation controls and animations. Model results and images are replayed from saved data; no model calls occur during playback. Stroke reveals, image crossfades, and classification fades use recorded time; hidden Rune layout springs have been removed so seeking does not depend on prior animation frames.
@@ -180,12 +205,13 @@ Thought labels spring into their new positions, colored branches fade back in, a
 | Placer | `openai/gpt-6-luna` | off | about 1 s | `TACIT_PLACE_MODEL`, `TACIT_PLACE_EFFORT` |
 | Steward | `openai/gpt-6.1-terra` | low | 3–7 s | `TACIT_STEWARD_MODEL`, `TACIT_STEWARD_EFFORT` |
 | Directed turn | `openai/gpt-6.1-terra` | low | 2–5 s, 5–9 s to reorganise a whole map | `TACIT_DIRECT_MODEL`, `TACIT_DIRECT_EFFORT` |
+| Reader: says what a dropped image, scan or long text holds | `openai/gpt-6.1-terra` | low | 2–5 s | `TACIT_READ_MODEL`, `TACIT_READ_EFFORT` |
 
-The defaults were chosen by measurement with the evaluations under **Development**, on synthetic talks scored against what a facilitator would have left on the wall. The placer is the quickest of the small models tried and the one with the tidiest labels. The steward at low effort kept every map sound; more reasoning and dearer models took two to five times as long without leaving a better map. The directed turn needs the larger model: the small ones answered sooner and fell short on every run, reaching only some of the thoughts an instruction covered. The listener cuts a recording in about a third of the time of the larger model used before, at a thirtieth of the cost. A 36-capture talk mapped end to end (nine placer turns, three to five steward turns) cost between one and two cents. On a third talk, which announces seven kinds of plot and then describes each, the map ends with the seven in families beside the framework that introduces them, each steward turn taking one call. Asked there for a branch per plot, a directed turn of three to seven seconds leaves eight main branches; asked to put all seven under one branch, it takes about five. The steward lets either stand, and is not sent back to them.
+The defaults were chosen by measurement with the evaluations under **Development**, on synthetic talks scored against what a facilitator would have left on the wall. The placer is the quickest of the small models tried and the one with the tidiest labels. The steward at low effort kept every map sound; more reasoning and dearer models took two to five times as long without leaving a better map. The directed turn needs the larger model: the small ones answered sooner and fell short on every run, reaching only some of the thoughts an instruction covered. The listener cuts a recording in about a third of the time of the larger model used before, at a thirtieth of the cost. The reader is the one default not yet measured: it uses the steward's model because that one reads images and PDFs, and has only been tried on a few synthetic files. A 36-capture talk mapped end to end (nine placer turns, three to five steward turns) cost between one and two cents. On a third talk, which announces seven kinds of plot and then describes each, the map ends with the seven in families beside the framework that introduces them, each steward turn taking one call. Asked there for a branch per plot, a directed turn of three to seven seconds leaves eight main branches; asked to put all seven under one branch, it takes about five. The steward lets either stand, and is not sent back to them.
 
 An effort of `off` disables reasoning; anything else is passed on as OpenRouter's reasoning effort (`low`, `medium`, `high`). A replacement model must support strict structured output. Provider routing favors latency for the listener and the placer, whose answers are short, and throughput for the steward and directed turns.
 
-Kept thoughts, their labels and branches, the parking lot, and the guidance you submitted go to OpenRouter and its model providers; unsent drafts and Hex audio stay out of these requests. The placer sees the map as an outline with the latest words; the steward and directed turns also read the original words behind the labels, newest first, up to about 24,000 characters. Cloud calls use your OpenRouter credits. The agent keeps a map of up to 400 thoughts, counting parked ones; a larger map remains editable by hand. Provider error text is never shown or logged, since it can echo a private prompt. Older notebooks load without migration.
+Kept thoughts, their labels and branches, the parking lot, and the guidance you submitted go to OpenRouter and its model providers; unsent drafts and Hex audio stay out of these requests. A dropped image, scan or long text goes to the reader as **Dropping files onto the map** sets out. The placer sees the map as an outline with the latest words; the steward and directed turns also read the original words behind the labels, newest first, up to about 24,000 characters. Cloud calls use your OpenRouter credits. The agent keeps a map of up to 400 thoughts, counting parked ones; a larger map remains editable by hand. Provider error text is never shown or logged, since it can echo a private prompt. Older notebooks load without migration.
 
 A small live diagnostic sends only the built-in fictional demo: the placer files it, the steward reads the whole map, the placer files one more thought, and a directed turn renames the map. Each turn's edits are applied the way the journal replays them, and its time, calls and resulting shape are printed:
 
@@ -299,6 +325,7 @@ Headless runs do not read or write your real notebook or contact OpenRouter, Oll
 - `src/agent.rs`: the map agent's vocabulary of edits and the two ways they meet the map: strict replay from the journal, and lenient live application under each tier's licence.
 - `src/agent/`: `prompt` (the mapper's method told to each tier, and the answer schemas), `brief` (the map as the outline a turn is shown), `wire` (answers read into edits), `step` (one edit against the map), `health` (the rule-based check of the map's shape), `pace` (when each tier is due), `turn` (one model turn, its self-check, and what is remembered from one turn to the next), `worker` (the three lanes, off the UI thread).
 - `src/recording.rs`: the listener, which cuts a finished recording into thoughts without changing a word.
+- `src/ingest.rs`: dropped files, kept in the archive and read into text on this Mac or by the reader model.
 - `src/capture.rs`: original render-texture capture and exact presentation.
 - `src/video_archive.rs`: lossless PNG masters, timestamped FFV1/PCM video export.
 - `src/timeline.rs`: durable event log, shared projection, media integrity, WebVTT, and recovery.

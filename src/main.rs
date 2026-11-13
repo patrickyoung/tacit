@@ -41,6 +41,39 @@ fn main() {
         }
         return;
     }
+    if let Some(index) = args.iter().position(|a| a == "--check-file") {
+        let result = (|| -> Result<(), String> {
+            let path = std::path::Path::new(
+                args.get(index + 1)
+                    .ok_or("--check-file needs a file path, then --local to stay on this Mac")?,
+            );
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or("--check-file needs a file path")?;
+            let kind =
+                tacit::ingest::Kind::of(path).ok_or(format!("Tacit cannot read {name} yet"))?;
+            let config = if args.iter().any(|a| a == "--local") {
+                None
+            } else {
+                tacit::organizer::CloudConfig::from_env()?
+            };
+            let reader = tacit::ingest::Reader::new(config);
+            let reading = reader.read(path, &name, kind, &|note| eprintln!("{note}"), &|_| {})?;
+            println!(
+                "Read {name} as {kind:?}: {} words in the file, {} on the map",
+                reading.text.split_whitespace().count(),
+                reading.thought.split_whitespace().count()
+            );
+            println!("{}", reading.thought);
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if std::env::args().any(|a| a == "--check-recording") {
         let result = (|| -> Result<(), String> {
             let config = tacit::organizer::CloudConfig::from_env()?
@@ -153,6 +186,7 @@ fn main() {
                 ("hierarchy", |s| *s = ui::State::hierarchy_demo()),
                 ("mapped", |s| *s = ui::State::mapped_demo()),
                 ("parked", |s| *s = ui::State::parked_demo()),
+                ("dropping", |s| *s = ui::State::dropping_demo()),
                 ("file", |s| *s = ui::State::file_demo()),
                 ("art-draw", |s| *s = ui::State::art_demo()),
                 ("generated", |s| *s = ui::State::generated_demo()),

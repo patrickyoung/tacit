@@ -36,6 +36,14 @@ pub struct Audio {
     pub sample_rate: u32,
     pub samples: u64,
 }
+/// A file dropped onto the map. The original is kept whole in `media/` under its content hash.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub id: String,
+    pub name: String,
+    pub kind: crate::ingest::Kind,
+    pub asset: String,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -112,6 +120,18 @@ pub enum Event {
     Failure {
         operation: String,
         message: String,
+    },
+    AttachmentSaved {
+        attachment: Attachment,
+    },
+    /// Everything the file says, as read once: replay never reads the file again.
+    AttachmentRead {
+        attachment: String,
+        text: String,
+    },
+    AttachmentLinked {
+        attachment: String,
+        thought_id: u64,
     },
 }
 impl Event {
@@ -198,6 +218,10 @@ pub struct SessionView<'a> {
     pub direction_recordings: &'a std::collections::BTreeSet<String>,
     pub speech_segments:
         &'a std::collections::BTreeMap<String, std::collections::BTreeMap<u64, SpeechSegment>>,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub attachments: &'a [Attachment],
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub attachment_links: &'a std::collections::BTreeMap<String, u64>,
 }
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Projection {
@@ -216,6 +240,10 @@ pub struct Projection {
     pub direction_recordings: std::collections::BTreeSet<String>,
     pub speech_segments:
         std::collections::BTreeMap<String, std::collections::BTreeMap<u64, SpeechSegment>>,
+    pub attachments: Vec<Attachment>,
+    /// What each attachment says. Shared, since a long document is copied with every event.
+    pub readings: std::collections::BTreeMap<String, std::sync::Arc<str>>,
+    pub attachment_links: std::collections::BTreeMap<String, u64>,
 }
 impl Projection {
     pub fn content(&self) -> SessionView<'_> {
@@ -229,6 +257,8 @@ impl Projection {
             splits: &self.splits,
             direction_recordings: &self.direction_recordings,
             speech_segments: &self.speech_segments,
+            attachments: &self.attachments,
+            attachment_links: &self.attachment_links,
         }
     }
     fn retain_artwork(&mut self, artwork: SessionArtwork) {
@@ -498,6 +528,35 @@ impl Projection {
                     return Err(io::Error::other("Invalid audio event"));
                 }
                 self.audio.push(audio.clone());
+            }
+            Event::AttachmentSaved { attachment } => {
+                safe_asset(&attachment.asset)?;
+                safe_asset(&attachment.id)?;
+                if !attachment.id.starts_with("attachment-")
+                    || attachment.name.trim().is_empty()
+                    || self.attachments.iter().any(|a| a.id == attachment.id)
+                {
+                    return Err(io::Error::other("Invalid attachment event"));
+                }
+                self.attachments.push(attachment.clone());
+            }
+            Event::AttachmentRead { attachment, text } => {
+                if !self.attachments.iter().any(|a| &a.id == attachment) {
+                    return Err(io::Error::other("Reading has no attachment"));
+                }
+                // A file read again after a failure says what it said the last time it was read.
+                self.readings
+                    .insert(attachment.clone(), text.as_str().into());
+            }
+            Event::AttachmentLinked {
+                attachment,
+                thought_id,
+            } => {
+                if !self.attachments.iter().any(|a| &a.id == attachment) {
+                    return Err(io::Error::other("Link has no attachment"));
+                }
+                self.attachment_links
+                    .insert(attachment.clone(), *thought_id);
             }
             Event::Transcript {
                 recording,
@@ -846,6 +905,11 @@ impl Journal {
         let bytes = fs::read(source)?;
         self.import_bytes(&bytes, extension)
     }
+    /// The original of a dropped file, if it is still in the archive. Unlike the assets a
+    /// replay draws, an original may be removed to save space: what it said is in the journal.
+    pub fn original(&self, attachment: &Attachment) -> Option<PathBuf> {
+        self.asset(&attachment.asset).ok().filter(|p| p.is_file())
+    }
     pub fn import_bytes(&self, bytes: &[u8], extension: &str) -> io::Result<String> {
         let name = format!("{}.{}", blake3::hash(bytes).to_hex(), extension);
         let target = self.asset(&name)?;
@@ -920,6 +984,51 @@ pub fn vtt(p: &Projection, recording: Option<&str>) -> String {
         ));
     }
     output
+}
+/// The name a file's contents give it in `media/`, read through without holding it in memory.
+pub fn asset_name(source: &Path, extension: &str) -> io::Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(File::open(source)?)?;
+    let name = format!("{}.{}", hasher.finalize().to_hex(), extension);
+    safe_asset(&name)?;
+    Ok(name)
+}
+/// Keep a file of any size in `media/` under its content hash. The copy is made first and
+/// named from what was copied, so a file still being written cannot be stored under a hash
+/// it does not have.
+pub fn store(media: &Path, source: &Path, extension: &str) -> io::Result<String> {
+    private_dir(media)?;
+    let temp = media.join(format!("incoming-{}.tmp", std::process::id()));
+    let stored = (|| {
+        fs::copy(source, &temp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
+        }
+        // On Windows the copy of a read-only file is read-only too, and cannot be flushed.
+        #[cfg(windows)]
+        {
+            let mut permissions = fs::metadata(&temp)?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            fs::set_permissions(&temp, permissions)?;
+        }
+        let name = asset_name(&temp, extension)?;
+        let target = media.join(&name);
+        if target.exists() {
+            fs::remove_file(&temp)?;
+        } else {
+            // Opened for writing: Windows flushes no other kind of handle.
+            OpenOptions::new().write(true).open(&temp)?.sync_all()?;
+            fs::rename(&temp, target)?;
+        }
+        Ok(name)
+    })();
+    if stored.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    stored
 }
 pub fn private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;

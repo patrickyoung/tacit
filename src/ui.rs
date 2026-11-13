@@ -83,6 +83,17 @@ enum VoiceState {
     Unavailable,
 }
 
+/// A dropped file on its way onto the map.
+struct FileJob {
+    id: u64,
+    name: String,
+    kind: tacit::ingest::Kind,
+    /// Its entry in the journal, once the file is kept.
+    attachment: Option<String>,
+    /// Whether the journal already holds what the file says.
+    read: bool,
+    note: String,
+}
 struct Replay {
     at_ms: u64,
     playing: bool,
@@ -168,6 +179,14 @@ pub struct State {
     revealed_selection: Option<u64>,
     recording_worker: Option<tacit::recording::Worker>,
     pending_recordings: std::collections::BTreeSet<u64>,
+    ingest: Option<tacit::ingest::Worker>,
+    /// Dropped files not yet on the map, in the order they are read.
+    reading: Vec<FileJob>,
+    next_file: u64,
+    drop_over: bool,
+    /// What went wrong with a dropped file, and the attachment to read again if it was kept.
+    file_notice: String,
+    file_retry: Option<String>,
     voice_worker: Option<voice::Worker>,
     voice_state: VoiceState,
     voice_status: String,
@@ -325,12 +344,13 @@ impl State {
                 | VoiceState::Finishing
                 | VoiceState::Cancelling
         ) || !self.pending_recordings.is_empty()
+            || !self.reading.is_empty()
             || self.video_busy()
             || self.directing()
             || self.queued_direction.is_some()
         {
             self.status =
-                "Finish recording, transcription, map guidance, or video export before switching sessions".into();
+                "Finish recording, transcription, reading files, map guidance, or video export before switching sessions".into();
             return false;
         }
         true
@@ -479,6 +499,12 @@ impl State {
             revealed_selection: None,
             recording_worker: None,
             pending_recordings: Default::default(),
+            ingest: None,
+            reading: vec![],
+            next_file: 1,
+            drop_over: false,
+            file_notice: String::new(),
+            file_retry: None,
             voice_worker: None,
             voice_state: VoiceState::Unavailable,
             voice_status: "Hex is not connected".into(),
@@ -634,6 +660,22 @@ impl State {
     pub fn parked_demo() -> Self {
         let mut s = Self::mapped_demo();
         s.selected = s.projection.session.parked.last().map(|p| p.thought.id);
+        s
+    }
+    /// Files held over the map while an earlier one is read and another has failed.
+    pub fn dropping_demo() -> Self {
+        let mut s = Self::mapped_demo();
+        s.selected = None;
+        s.drop_over = true;
+        s.reading.push(FileJob {
+            id: 1,
+            name: "Offsite recording.mp3".into(),
+            kind: tacit::ingest::Kind::Audio,
+            attachment: None,
+            read: false,
+            note: "Transcribing with Hex · part 2 of 5".into(),
+        });
+        s.file_notice = "Reading images needs OpenRouter · Whiteboard.heic is kept".into();
         s
     }
     pub fn generated_demo() -> Self {
@@ -1211,6 +1253,228 @@ impl State {
             self.voice_status = "Full recording kept · automatic splitting needs OpenRouter".into();
         }
     }
+    /// The dropped file a thought was read from, by the name it was dropped under.
+    fn file_of(&self, thought: u64) -> Option<&str> {
+        let (id, _) = self
+            .projection
+            .attachment_links
+            .iter()
+            .find(|(_, linked)| **linked == thought)?;
+        let attachment = self.projection.attachments.iter().find(|a| &a.id == id)?;
+        Some(&attachment.name)
+    }
+    /// Files dropped onto the map. Each is kept in the archive, read into text, and then goes
+    /// the way of anything said: captured whole, separated into thoughts, placed on the map.
+    fn drop_files(&mut self, files: &[PathBuf]) {
+        self.drop_over = false;
+        if self.replay.is_some() || self.read_only {
+            return;
+        }
+        self.file_notice.clear();
+        self.file_retry = None;
+        for path in files {
+            let name = file_name(path);
+            let Some(kind) = tacit::ingest::Kind::of(path) else {
+                self.file_notice = format!("Tacit cannot read {name} yet");
+                continue;
+            };
+            if self.projection.session.thoughts.len() >= tacit::agent::MAX_THOUGHTS {
+                self.file_notice = format!("The map is full · {name} was not added");
+                break;
+            }
+            let job = self.next_file;
+            let request = tacit::ingest::Request {
+                job,
+                name: name.clone(),
+                kind,
+                path: path.clone(),
+                media: self.journal.as_ref().map(|j| j.root.join("media")),
+                text: None,
+            };
+            if !self
+                .ingest
+                .as_ref()
+                .is_some_and(|w| w.send.send(request).is_ok())
+            {
+                self.file_notice = format!("Files cannot be read here · {name} was not added");
+                break;
+            }
+            self.next_file += 1;
+            self.reading.push(FileJob {
+                id: job,
+                name,
+                kind,
+                attachment: None,
+                read: false,
+                note: String::new(),
+            });
+        }
+    }
+    fn refuse_files(&mut self, files: &[PathBuf]) {
+        self.drop_over = false;
+        if let Some(path) = files.first() {
+            self.file_retry = None;
+            self.file_notice = format!(
+                "Tacit cannot read {} yet · drop text, documents, PDFs, images, audio or video",
+                file_name(path)
+            );
+        }
+    }
+    /// Read a kept file again after a failure: its original is in the archive.
+    fn retry_file(&mut self) {
+        let Some(id) = self.file_retry.take() else {
+            return;
+        };
+        let Some((attachment, path)) = self.journal.as_ref().and_then(|j| {
+            let attachment = j.projection.attachments.iter().find(|a| a.id == id)?;
+            Some((attachment.clone(), j.original(attachment)?))
+        }) else {
+            self.file_notice = "The file is no longer in this session's archive".into();
+            return;
+        };
+        // A file whose words are already in the journal is not read a second time.
+        let text = self.projection.readings.get(&id).map(|t| t.to_string());
+        let read = text.is_some();
+        let job = self.next_file;
+        let request = tacit::ingest::Request {
+            job,
+            name: attachment.name.clone(),
+            kind: attachment.kind,
+            path,
+            media: None,
+            text,
+        };
+        if self
+            .ingest
+            .as_ref()
+            .is_some_and(|w| w.send.send(request).is_ok())
+        {
+            self.next_file += 1;
+            self.file_notice.clear();
+            self.reading.push(FileJob {
+                id: job,
+                name: attachment.name,
+                kind: attachment.kind,
+                attachment: Some(attachment.id),
+                read,
+                note: String::new(),
+            });
+        }
+    }
+    fn receive_file(&mut self, response: tacit::ingest::Response) {
+        use tacit::ingest::Outcome;
+        let Some(index) = self.reading.iter().position(|j| j.id == response.job) else {
+            return;
+        };
+        if self.read_only || self.replay.is_some() {
+            self.reading.remove(index);
+            return;
+        }
+        match response.outcome {
+            // A file read again is already in the journal.
+            Outcome::Stored(_) if self.reading[index].attachment.is_some() => {}
+            Outcome::Stored(asset) => {
+                let job = &self.reading[index];
+                let taken = |n: &usize| {
+                    let id = format!("attachment-{n}");
+                    self.projection.attachments.iter().any(|a| a.id == id)
+                };
+                let number = (self.projection.attachments.len() + 1..)
+                    .find(|n| !taken(n))
+                    .unwrap_or_default();
+                let id = format!("attachment-{number}");
+                let attachment = tacit::timeline::Attachment {
+                    id: id.clone(),
+                    name: job.name.clone(),
+                    kind: job.kind,
+                    asset,
+                };
+                if self
+                    .dispatch(tacit::timeline::Event::AttachmentSaved { attachment })
+                    .is_ok()
+                {
+                    self.reading[index].attachment = Some(id);
+                } else {
+                    self.reading.remove(index);
+                }
+            }
+            Outcome::Progress(note) => self.reading[index].note = note,
+            Outcome::Text(text) => {
+                let job = &self.reading[index];
+                let Some(attachment) = job.attachment.clone().filter(|_| !job.read) else {
+                    return;
+                };
+                if self
+                    .dispatch(tacit::timeline::Event::AttachmentRead { attachment, text })
+                    .is_ok()
+                {
+                    self.reading[index].read = true;
+                    self.reading[index].note = "Telling it in brief".into();
+                } else {
+                    self.reading.remove(index);
+                }
+            }
+            Outcome::Read(Ok(reading)) => {
+                let job = self.reading.remove(index);
+                self.capture_file(job, reading);
+            }
+            Outcome::Read(Err(message)) => {
+                let job = self.reading.remove(index);
+                self.timeline_event(tacit::timeline::Event::Failure {
+                    operation: "attachment/reading".into(),
+                    message: message.clone(),
+                });
+                self.file_notice = message;
+                self.file_retry = job.attachment;
+            }
+        }
+    }
+    fn capture_file(&mut self, job: FileJob, reading: tacit::ingest::Reading) {
+        let mut events = vec![];
+        if let Some(attachment) = job.attachment.as_ref().filter(|_| !job.read) {
+            events.push(tacit::timeline::Event::AttachmentRead {
+                attachment: attachment.clone(),
+                text: reading.text,
+            });
+        }
+        // What the file says is kept even when the map has no room left for it.
+        let room = self.projection.session.thoughts.len() < tacit::agent::MAX_THOUGHTS
+            && !reading.thought.trim().is_empty();
+        let thought_id = self.projection.session.next_id;
+        if room {
+            events.push(tacit::timeline::Event::SessionChanged {
+                change: SessionEvent::capture(&self.projection.session, &reading.thought),
+            });
+            if let Some(attachment) = &job.attachment {
+                events.push(tacit::timeline::Event::AttachmentLinked {
+                    attachment: attachment.clone(),
+                    thought_id,
+                });
+            }
+            self.checkpoint();
+        }
+        if self
+            .dispatch(tacit::timeline::Event::Transaction { events })
+            .is_err()
+        {
+            return;
+        }
+        if !room {
+            self.file_notice = format!("The map is full · {} was read but not added", job.name);
+            return;
+        }
+        self.selected = Some(thought_id);
+        self.save();
+        self.schedule_recording_split(thought_id, &reading.thought);
+        self.voice_status = if self.pending_recordings.contains(&thought_id) {
+            format!("{} read · separating ideas in context…", job.name)
+        } else {
+            format!(
+                "{} read as one thought · automatic splitting needs OpenRouter",
+                job.name
+            )
+        };
+    }
     fn receive_recording(&mut self, response: tacit::recording::Response) {
         if !self.pending_recordings.remove(&response.id) || self.read_only {
             return;
@@ -1227,7 +1491,10 @@ impl State {
         match response.result {
             // Already one thought: nothing to split, and nothing for undo to step over.
             Ok(chunks) if chunks.len() == 1 && chunks[0] == response.text => {
-                self.voice_status = "Recording saved as one thought".into();
+                self.voice_status = match self.file_of(response.id) {
+                    Some(name) => format!("{name} added as one thought"),
+                    None => "Recording saved as one thought".into(),
+                };
             }
             Ok(chunks)
                 if !chunks.is_empty()
@@ -1236,6 +1503,7 @@ impl State {
             {
                 self.checkpoint();
                 let count = chunks.len();
+                let source = self.file_of(response.id).unwrap_or("Recording").to_owned();
                 if self
                     .dispatch_session(SessionEvent::Split {
                         source_id: response.id,
@@ -1246,10 +1514,15 @@ impl State {
                 {
                     return;
                 }
-                self.voice_status = format!("Recording → {count} thoughts · organizing in context");
+                self.voice_status = format!("{source} → {count} thoughts · organizing in context");
                 self.save();
             }
-            Err(error) => self.voice_status = format!("{error} · full recording kept"),
+            Err(error) => {
+                self.voice_status = match self.file_of(response.id) {
+                    Some(name) => format!("{error} · {name} kept as one thought"),
+                    None => format!("{error} · full recording kept"),
+                }
+            }
             _ => self.voice_status = "Invalid split · full recording kept".into(),
         }
     }
@@ -3987,6 +4260,22 @@ pub fn on_key(s: &mut State, event: &KeyEvent, tx: &mut Tx) -> bool {
     }
 }
 
+/// A dropped file's name as it is shown and journaled: its last component, kept short.
+fn file_name(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.chars().count() > 60 {
+        let start: String = name.chars().take(40).collect();
+        let end: String = name.chars().skip(name.chars().count() - 16).collect();
+        format!("{start}…{end}")
+    } else if name.trim().is_empty() {
+        "file".into()
+    } else {
+        name
+    }
+}
 pub fn setup(s: &mut State, wake: rune::Waker) {
     s.wake = Some(wake.clone());
     s.image_cache = rune::ImageCache::new(wake.clone());
@@ -4024,8 +4313,15 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
         .unwrap_or_else(|| tacit::timeline::root_for(&storage::default_path()).join("recordings"));
     s.voice_worker = Some(voice::Worker::start(audio_root, move || voice_wake()));
     s.voice_command(VoiceCommand::Check);
+    // Text, documents, audio and video are read on this machine, so files can be dropped
+    // with no model at all. Images and long files then say that they need one.
+    let files = |s: &mut State, config| {
+        let wake = wake.clone();
+        s.ingest = Some(tacit::ingest::Worker::start(config, move || wake()));
+    };
     let backend = std::env::var("TACIT_ORGANIZER").unwrap_or_default();
     if backend == "offline" {
+        files(s, None);
         return;
     }
     let cloud = if backend == "ollama" {
@@ -4044,14 +4340,16 @@ pub fn setup(s: &mut State, wake: rune::Waker) {
             s.recording_worker = Some(tacit::recording::Worker::start(config.clone(), move || {
                 recording_wake()
             }));
+            files(s, Some(config.clone()));
             s.agent = Some(tacit::agent::Worker::start(config, move || wake()));
             return;
         }
         Err(error) => {
             s.organizer_status = error;
+            files(s, None);
             return;
         }
-        Ok(None) => {}
+        Ok(None) => files(s, None),
     }
     if let Ok(model) = std::env::var("TACIT_MODEL")
         && !model.trim().is_empty()
@@ -4282,6 +4580,10 @@ fn poll_live(s: &mut State, now: f64, tx: &mut Tx) -> bool {
         .and_then(|w| w.receive.try_recv().ok())
     {
         s.receive_recording(response);
+        changed = true;
+    }
+    while let Some(response) = s.ingest.as_ref().and_then(|w| w.receive.try_recv().ok()) {
+        s.receive_file(response);
         changed = true;
     }
     // Guidance waits for the agent, and without one nothing would ever take it from the queue.
@@ -7113,5 +7415,291 @@ mod tests {
             "PERF replay_ms_per_seek {:.3}",
             started.elapsed().as_secs_f64() * 1000.0 / 100.0
         );
+    }
+    fn file_worker(
+        s: &mut State,
+    ) -> (
+        std::sync::mpsc::Receiver<tacit::ingest::Request>,
+        std::sync::mpsc::Sender<tacit::ingest::Response>,
+    ) {
+        let (send, requests) = std::sync::mpsc::channel();
+        let (responses, receive) = std::sync::mpsc::channel();
+        s.ingest = Some(tacit::ingest::Worker { send, receive });
+        (requests, responses)
+    }
+    #[test]
+    fn files_dragged_over_the_map_are_offered_a_place_and_taken_when_dropped() {
+        use tacit::ingest::{Kind, Outcome, Reading, Response};
+        let mut rt = runtime((1280.0, 860.0));
+        let (requests, responses) = file_worker(&mut rt.state);
+        let before = rt.state.projection.session.thoughts.len();
+        let at = rt.find("drop-zone");
+        assert!(at.is_some() && rt.find("drop-hint").is_none());
+        let plan = PathBuf::from("/nowhere/Quarterly plan.PDF");
+        rt.drag_files(vec![plan.clone()], at);
+        rt.frame(0.1);
+        rt.frame(0.2);
+        assert!(rt.state.drop_over);
+        assert_eq!(rt.drop_hovered().as_deref(), Some("drop-zone"));
+        assert!(rt.find("drop-hint").is_some());
+        rt.drag_files_leave();
+        rt.frame(0.3);
+        rt.frame(0.4);
+        assert!(!rt.state.drop_over && rt.find("drop-hint").is_none());
+
+        // A file Tacit cannot read is named, and the ones it can are taken all the same.
+        rt.drop_files(
+            vec![
+                plan.clone(),
+                PathBuf::from("/nowhere/archive.zip"),
+                PathBuf::from("/nowhere/standup.mp3"),
+            ],
+            at,
+        );
+        rt.frame(0.5);
+        rt.frame(0.6);
+        assert!(!rt.state.drop_over);
+        let first = requests.try_recv().unwrap();
+        assert_eq!(
+            (first.job, first.name.as_str(), first.kind, &first.path),
+            (1, "Quarterly plan.PDF", Kind::Pdf, &plan)
+        );
+        // No archive in this window, so there is nowhere to keep the file but where it is.
+        assert!(first.media.is_none());
+        let second = requests.try_recv().unwrap();
+        assert_eq!((second.job, second.kind), (2, Kind::Audio));
+        assert!(requests.try_recv().is_err());
+        assert!(
+            rt.state
+                .file_notice
+                .starts_with("Tacit cannot read archive.zip yet")
+        );
+        assert!(rt.find("file-progress").is_some() && rt.find("file-notice").is_some());
+        assert!(rt.find("retry-file").is_none());
+        assert!(!rt.state.can_switch_session());
+        click(&mut rt, "file-dismiss");
+        assert!(rt.state.file_notice.is_empty() && rt.find("file-notice").is_none());
+        // Nothing reaches the map until a file has been read.
+        assert_eq!(rt.state.projection.session.thoughts.len(), before);
+
+        for outcome in [
+            Outcome::Stored("aa.pdf".into()),
+            Outcome::Progress("page 2".into()),
+            Outcome::Read(Ok(Reading {
+                text: "We ship the importer in March.\nThe budget is 40,000 dollars.".into(),
+                thought: "We ship the importer in March. The budget is 40,000 dollars.".into(),
+            })),
+        ] {
+            responses.send(Response { job: 1, outcome }).unwrap();
+        }
+        poll_live(&mut rt.state, 2.0, &mut Tx::default());
+        let s = &rt.state;
+        assert_eq!(s.reading.len(), 1);
+        assert_eq!(s.projection.session.thoughts.len(), before + 1);
+        let thought = s.projection.session.thoughts.last().unwrap();
+        assert_eq!(
+            thought.text,
+            "We ship the importer in March. The budget is 40,000 dollars."
+        );
+        assert_eq!(s.selected, Some(thought.id));
+        assert_eq!(s.file_of(thought.id), Some("Quarterly plan.PDF"));
+        assert_eq!(s.projection.attachments[0].asset, "aa.pdf");
+        assert_eq!(
+            s.voice_status,
+            "Quarterly plan.PDF read as one thought · automatic splitting needs OpenRouter"
+        );
+        // The recording that could not be read says so, and offers nothing to read again:
+        // without an archive there is no copy of it.
+        responses
+            .send(Response {
+                job: 2,
+                outcome: Outcome::Read(Err("No speech was found in standup.mp3".into())),
+            })
+            .unwrap();
+        poll_live(&mut rt.state, 3.0, &mut Tx::default());
+        rt.frame(3.1);
+        assert!(rt.state.reading.is_empty() && rt.find("file-progress").is_none());
+        assert_eq!(rt.state.file_notice, "No speech was found in standup.mp3");
+        assert!(rt.find("file-notice").is_some() && rt.find("retry-file").is_none());
+        assert_eq!(rt.state.projection.session.thoughts.len(), before + 1);
+        // A late answer for a file nobody is waiting on changes nothing.
+        responses
+            .send(Response {
+                job: 2,
+                outcome: Outcome::Stored("bb.mp3".into()),
+            })
+            .unwrap();
+        poll_live(&mut rt.state, 4.0, &mut Tx::default());
+        assert_eq!(rt.state.projection.attachments.len(), 1);
+        // The transcript shows what the file said under the file's name.
+        rt.state.selected = None;
+        rt.frame(5.0);
+        assert!(rt.find("file-attachment-1").is_some());
+    }
+    #[test]
+    fn a_dropped_file_is_kept_read_and_split_like_a_recording() {
+        use tacit::ingest::{Kind, Outcome, Reading, Response};
+        use tacit::timeline::{Event, Journal};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mut s = State::empty();
+        s.journal = Some(Journal::open(&path, Session::default()).unwrap());
+        let media = s.journal.as_ref().unwrap().root.join("media");
+        let (requests, responses) = file_worker(&mut s);
+        let (send, splits) = std::sync::mpsc::channel();
+        let (split_results, receive) = std::sync::mpsc::channel();
+        s.recording_worker = Some(tacit::recording::Worker { send, receive });
+        let source = dir.path().join("notes.md");
+        std::fs::write(
+            &source,
+            "Hosting costs doubled. We could remove unused replicas.",
+        )
+        .unwrap();
+
+        s.drop_files(std::slice::from_ref(&source));
+        let request = requests.try_recv().unwrap();
+        assert_eq!(request.kind, Kind::Text);
+        assert_eq!(request.media.as_deref(), Some(media.as_path()));
+        // The worker keeps the file, then reads it: here both are done by hand.
+        let asset = tacit::timeline::store(&media, &source, "md").unwrap();
+        responses
+            .send(Response {
+                job: request.job,
+                outcome: Outcome::Stored(asset.clone()),
+            })
+            .unwrap();
+        poll_live(&mut s, 1.0, &mut Tx::default());
+        assert_eq!(s.projection.attachments[0].id, "attachment-1");
+        assert_eq!(s.reading[0].attachment.as_deref(), Some("attachment-1"));
+        assert!(s.projection.session.thoughts.is_empty());
+
+        // The first reading fails. The file is kept, so it can be read again.
+        responses
+            .send(Response {
+                job: request.job,
+                outcome: Outcome::Read(Err("Synthetic reading failure".into())),
+            })
+            .unwrap();
+        poll_live(&mut s, 2.0, &mut Tx::default());
+        assert_eq!(s.file_notice, "Synthetic reading failure");
+        assert_eq!(s.file_retry.as_deref(), Some("attachment-1"));
+        assert!(s.reading.is_empty() && s.projection.session.thoughts.is_empty());
+        assert!(matches!(
+            &s.journal.as_ref().unwrap().entries.last().unwrap().event,
+            Event::Failure { operation, .. } if operation == "attachment/reading"
+        ));
+        s.retry_file();
+        let again = requests.try_recv().unwrap();
+        assert_eq!(again.path, media.join(&asset));
+        assert!(again.media.is_none() && again.job != request.job);
+        assert!(s.file_notice.is_empty() && s.file_retry.is_none());
+        let words = "Hosting costs doubled. We could remove unused replicas.";
+        for outcome in [
+            Outcome::Stored(asset.clone()),
+            Outcome::Read(Ok(Reading {
+                text: words.into(),
+                thought: words.into(),
+            })),
+        ] {
+            responses
+                .send(Response {
+                    job: again.job,
+                    outcome,
+                })
+                .unwrap();
+        }
+        poll_live(&mut s, 3.0, &mut Tx::default());
+        // Kept once, read, captured and linked.
+        assert_eq!(s.projection.attachments.len(), 1);
+        assert_eq!(&*s.projection.readings["attachment-1"], words);
+        assert_eq!(s.projection.attachment_links["attachment-1"], 1);
+        assert_eq!(s.projection.session.thoughts[0].text, words);
+        assert_eq!(s.history.len(), 1);
+        // From here it is a recording: the listener separates it in the map's context.
+        let split = splits.try_recv().unwrap();
+        assert_eq!((split.id, split.text.as_str()), (1, words));
+        assert!(s.pending_recordings.contains(&1));
+        assert_eq!(
+            s.voice_status,
+            "notes.md read · separating ideas in context…"
+        );
+        split_results
+            .send(tacit::recording::Response {
+                id: 1,
+                text: words.into(),
+                result: Ok(vec![
+                    "Hosting costs doubled. ".into(),
+                    "We could remove unused replicas.".into(),
+                ]),
+            })
+            .unwrap();
+        poll_live(&mut s, 4.0, &mut Tx::default());
+        assert_eq!(s.projection.session.thoughts.len(), 2);
+        assert_eq!(
+            s.voice_status,
+            "notes.md → 2 thoughts · organizing in context"
+        );
+        assert!(s.can_switch_session());
+
+        // A long file's words reach the journal before it is told in brief, so a failure
+        // after that costs only the telling, and reading it again starts from those words.
+        let talk = dir.path().join("talk.mp3");
+        std::fs::write(&talk, "not really sound").unwrap();
+        s.drop_files(std::slice::from_ref(&talk));
+        let request = requests.try_recv().unwrap();
+        assert!(request.text.is_none());
+        let asset = tacit::timeline::store(&media, &talk, "mp3").unwrap();
+        for outcome in [
+            Outcome::Stored(asset),
+            Outcome::Text("Everything said in the talk.".into()),
+            Outcome::Read(Err(
+                "The file reader did not answer · talk.mp3 is kept".into()
+            )),
+        ] {
+            responses
+                .send(Response {
+                    job: request.job,
+                    outcome,
+                })
+                .unwrap();
+        }
+        poll_live(&mut s, 5.0, &mut Tx::default());
+        assert_eq!(
+            &*s.projection.readings["attachment-2"],
+            "Everything said in the talk."
+        );
+        assert_eq!(s.file_retry.as_deref(), Some("attachment-2"));
+        assert_eq!(s.projection.session.thoughts.len(), 2);
+        s.retry_file();
+        let again = requests.try_recv().unwrap();
+        assert_eq!(again.text.as_deref(), Some("Everything said in the talk."));
+        responses
+            .send(Response {
+                job: again.job,
+                outcome: Outcome::Read(Ok(Reading {
+                    text: "Everything said in the talk.".into(),
+                    thought: "The talk in brief.".into(),
+                })),
+            })
+            .unwrap();
+        poll_live(&mut s, 6.0, &mut Tx::default());
+        assert_eq!(s.projection.session.thoughts.len(), 3);
+        assert_eq!(s.projection.attachment_links["attachment-2"], 3);
+        // The journal holds the words once, not again with the capture.
+        let events = s.journal.as_ref().unwrap().root.join("events.jsonl");
+        let written = std::fs::read_to_string(events).unwrap();
+        assert_eq!(written.matches("Everything said in the talk.").count(), 1);
+        splits.try_recv().unwrap();
+        s.pending_recordings.clear();
+        // All of it replays from the journal alone.
+        let replayed = Journal::read(&path).unwrap();
+        assert_eq!(replayed.projection.session, s.projection.session);
+        assert_eq!(replayed.projection.attachments, s.projection.attachments);
+        assert_eq!(replayed.projection.readings, s.projection.readings);
+
+        // A session that only replays takes no files.
+        s.read_only = true;
+        s.drop_files(std::slice::from_ref(&source));
+        assert!(requests.try_recv().is_err() && s.reading.is_empty());
     }
 }

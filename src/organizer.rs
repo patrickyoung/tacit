@@ -70,6 +70,11 @@ pub const STEWARD_EFFORT: &str = "low";
 /// reorganisation left a branch too crowded.
 pub const DIRECT_MODEL: &str = STEWARD_MODEL;
 pub const DIRECT_EFFORT: &str = STEWARD_EFFORT;
+/// The reader writes down what a dropped file holds (`ingest`): the words in an image, what a
+/// diagram shows, the main points of a long document. It is the steward's model because that
+/// one takes images and PDFs and is the careful one; this choice has not been measured.
+pub const READ_MODEL: &str = STEWARD_MODEL;
+pub const READ_EFFORT: &str = STEWARD_EFFORT;
 
 #[derive(Clone)]
 pub struct CloudConfig {
@@ -82,6 +87,8 @@ pub struct CloudConfig {
     pub steward_effort: String,
     pub direct_model: String,
     pub direct_effort: String,
+    pub read_model: String,
+    pub read_effort: String,
 }
 impl CloudConfig {
     /// One client is one connection pool: keep it for as long as the calls keep coming.
@@ -131,6 +138,8 @@ impl CloudConfig {
             steward_effort: var("TACIT_STEWARD_EFFORT", STEWARD_EFFORT),
             direct_model: var("TACIT_DIRECT_MODEL", DIRECT_MODEL),
             direct_effort: var("TACIT_DIRECT_EFFORT", DIRECT_EFFORT),
+            read_model: var("TACIT_READ_MODEL", READ_MODEL),
+            read_effort: var("TACIT_READ_EFFORT", READ_EFFORT),
         }))
     }
 }
