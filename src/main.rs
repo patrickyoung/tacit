@@ -74,6 +74,61 @@ fn main() {
         }
         return;
     }
+    if let Some(index) = args.iter().position(|a| a == "--ask-knowledge") {
+        let result = (|| -> Result<(), String> {
+            use tacit::knowledge::research::{Lead, Outcome, Request, Worker};
+            let usage = "--ask-knowledge needs the folder the notes are in, then a question";
+            let root = std::path::PathBuf::from(args.get(index + 1).ok_or(usage)?);
+            let question = args.get(index + 2).ok_or(usage)?.clone();
+            let library = std::sync::Arc::new(tacit::knowledge::Library::load(&root));
+            let title = |id: &str| match library.get(id) {
+                Some(note) => format!("{} [[{id}]]", note.title),
+                None => format!("[[{id}]]"),
+            };
+            let researcher = Worker::start(tacit::organizer::CloudConfig::from_env()?, || {});
+            let request = Request {
+                job: 1,
+                question,
+                library: library.clone(),
+            };
+            researcher.send.send(request).map_err(|e| e.to_string())?;
+            let finding = loop {
+                let heard = researcher.receive.recv().map_err(|e| e.to_string())?;
+                match heard.outcome {
+                    Outcome::Progress(note) => eprintln!("{note}"),
+                    Outcome::Found(found) => break found?,
+                }
+            };
+            println!("{}", finding.reply);
+            for (at, point) in finding.points.iter().enumerate() {
+                println!("  [{}] {} · {}", at + 1, title(&point.note), point.says);
+            }
+            for clash in &finding.clashes {
+                let sides = clash.notes.iter().map(|id| title(id)).collect::<Vec<_>>();
+                println!("Disagree · {} · {}", clash.over, sides.join(" / "));
+            }
+            for gap in &finding.gaps {
+                println!("Not in the notes · {gap}");
+            }
+            for onward in &finding.next {
+                let to = match &onward.to {
+                    Lead::Note(id) => title(id),
+                    Lead::Topic(name) => format!("the topic {name}"),
+                };
+                println!("Read next · {to} · {}", onward.why);
+            }
+            for step in &finding.trail {
+                println!("Way · {}", step.text);
+            }
+            println!("{} note(s) read in full · {}", finding.read, finding.spent);
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Some(index) = args.iter().position(|a| a == "--check-knowledge") {
         let result = (|| -> Result<(), String> {
             use tacit::knowledge::librarian::{Outcome, Request, Worker};
@@ -289,6 +344,8 @@ fn main() {
                 ("parked", |s| *s = ui::State::parked_demo()),
                 ("dropping", |s| *s = ui::State::dropping_demo()),
                 ("knowledge", |s| *s = ui::State::knowledge_demo()),
+                ("room", |s| *s = ui::State::room_demo()),
+                ("answer", |s| *s = ui::State::answer_demo()),
                 ("file", |s| *s = ui::State::file_demo()),
                 ("art-draw", |s| *s = ui::State::art_demo()),
                 ("generated", |s| *s = ui::State::generated_demo()),

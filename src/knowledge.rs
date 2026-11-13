@@ -20,6 +20,12 @@
 //! ([`Library::open`]), which the steward and a directed turn ask for by name.
 //!
 //! Knowledge tells the agent how a subject is organised. It is never put on a map.
+//!
+//! Reading goes the other way from filing, and is modelled on how a practised reader uses a
+//! zettelkasten ([`research`]): come in by a topic and its overview, search in the notes' own
+//! words ([`Library::find`]), read a note whole before relying on it, follow a link for the
+//! reason it gives in either direction ([`Library::ties`]), and go back to the file a note
+//! was taken from ([`Library::source_of`]).
 use crate::timeline;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -27,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 pub mod librarian;
+pub mod research;
 
 /// Notes one consultation opens in full, the cards it shows of one topic, and the linked
 /// notes it shows each way of a note opened.
@@ -92,6 +99,26 @@ pub struct Note {
     pub asset: String,
     /// When it was filed, in seconds since 1970.
     pub created: u64,
+}
+
+/// A note another is linked with, the way a reader follows it.
+#[derive(Clone, Copy, Debug)]
+pub struct Tie<'a> {
+    pub note: &'a Note,
+    /// Why the link is there, as the note that holds it says, or nothing.
+    pub why: &'a str,
+    /// The link leads from the note being read to this one, and not back to it.
+    pub out: bool,
+}
+impl Tie<'_> {
+    /// The two notes pull against each other: the librarian opens such a reason with
+    /// "contradicts it".
+    pub fn disputes(&self) -> bool {
+        self.why
+            .trim_start()
+            .to_lowercase()
+            .starts_with("contradict")
+    }
 }
 
 /// The knowledge base beside a notebook: `session.knowledge` beside `session.json`.
@@ -163,6 +190,10 @@ fn reason(text: &str) -> String {
 }
 
 impl Note {
+    /// The day it was filed, "2026-11-12", when that is known.
+    pub fn filed(&self) -> Option<String> {
+        (self.created > 0).then(|| date(self.created)[..10].to_owned())
+    }
     /// The note as its markdown file, sealed as the librarian's own. `titled` names the notes
     /// it links to.
     fn page(&self, titled: &dyn Fn(&str) -> Option<String>) -> String {
@@ -826,6 +857,64 @@ impl Library {
     pub fn find(&self, words: &str, limit: usize) -> Vec<&Note> {
         self.nearest(&[(1.0, words)], limit)
     }
+    /// Every note this one is linked with, each with the reason the note that holds the link
+    /// gives: first the notes it leads to, then the notes that lead to it. A note linked both
+    /// ways is given both ways, since each note says its own reason.
+    pub fn ties<'a>(&'a self, note: &'a Note) -> Vec<Tie<'a>> {
+        let reason = |holder: &'a Note, to: &str| holder.why.get(to).map_or("", String::as_str);
+        let out = note
+            .links
+            .iter()
+            .filter_map(|id| self.get(id))
+            .map(|to| Tie {
+                note: to,
+                why: reason(note, &to.id),
+                out: true,
+            });
+        let back = self.linked_from(&note.id).into_iter().map(|from| Tie {
+            note: from,
+            why: reason(from, &note.id),
+            out: false,
+        });
+        out.chain(back).collect()
+    }
+    /// The note on the file this note was taken from.
+    pub fn source_of(&self, note: &Note) -> Option<&Note> {
+        let from = |other: &&Note| other.kind == Kind::Source && other.asset == note.asset;
+        match note.kind == Kind::Source || note.asset.is_empty() {
+            true => None,
+            false => self.notes.iter().find(from),
+        }
+    }
+    /// The ideas taken from the file a source note is about, in the order they were filed.
+    pub fn taken_from(&self, source: &Note) -> Vec<&Note> {
+        let taken = |note: &&Note| note.kind == Kind::Idea && note.asset == source.asset;
+        match source.asset.is_empty() {
+            true => vec![],
+            false => self.notes.iter().filter(taken).collect(),
+        }
+    }
+
+    /// A note's text as someone reads it: every `[[id|Title]]` as the title it names, and a
+    /// bare `[[id]]` as the title of the note it leads to.
+    pub fn prose(&self, text: &str) -> String {
+        let (mut out, mut rest) = (String::new(), text);
+        while let Some(start) = rest.find("[[") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find("]]") else { break };
+            out.push_str(&rest[..start]);
+            let (id, title) = after[..end].split_once('|').unwrap_or((&after[..end], ""));
+            let held = self.get(&id_of(id)).map(|note| note.title.as_str());
+            out.push_str(match (title.trim(), held) {
+                ("", Some(held)) => held,
+                ("", None) => id.trim(),
+                (title, _) => title,
+            });
+            rest = &after[end + 2..];
+        }
+        out + rest
+    }
+
     /// The first level: what the knowledge base holds, by topic.
     pub fn index(&self) -> String {
         let topics = self.topics();
@@ -1419,7 +1508,7 @@ mod tests {
         assert!(again.starts_with("[k00001] is open above."), "{again}");
     }
     #[test]
-    fn words_are_searched_for_when_they_name_no_note() {
+    fn a_reader_searches_follows_links_and_goes_to_the_source() {
         let mut flow = note(
             "k00001",
             "Small batches shorten feedback loops",
@@ -1460,6 +1549,43 @@ mod tests {
             "Written by hand.",
         );
         let library = Library::of(vec![flow, limits, file, own]);
+        let (flow, limits) = (
+            library.get("k00001").unwrap(),
+            library.get("k00002").unwrap(),
+        );
+        let (file, own) = (library.get("s00001").unwrap(), library.get("mine").unwrap());
+
+        // A note's ties are the notes it leads to, then the notes that lead to it, each with
+        // the reason its holder gives.
+        let ties = library.ties(flow);
+        let told: Vec<(&str, &str, bool, bool)> = ties
+            .iter()
+            .map(|tie| (tie.note.id.as_str(), tie.why, tie.out, tie.disputes()))
+            .collect();
+        assert_eq!(
+            told,
+            [
+                ("k00002", "the step before it", true, false),
+                (
+                    "k00002",
+                    " Contradicts it: large batches hide queues",
+                    false,
+                    true
+                ),
+                ("s00001", "", false, false),
+            ]
+        );
+        assert!(library.ties(own).is_empty());
+        // A note leads back to the file it was taken from, and the file to its notes.
+        assert_eq!(
+            library.source_of(flow).map(|note| note.id.as_str()),
+            Some("s00001")
+        );
+        assert!(library.source_of(limits).is_none());
+        assert!(library.source_of(file).is_none());
+        assert_eq!(ids(&library.taken_from(file)), ["k00001"]);
+        assert!(library.taken_from(own).is_empty());
+
         // A search finds notes of every kind and says which are already open.
         assert_eq!(ids(&library.find("bottleneck", 5)), ["k00002"]);
         assert!(ids(&library.find("lean talk", 5)).contains(&"s00001".to_owned()));
@@ -1475,6 +1601,21 @@ mod tests {
             text,
             "FOUND \"bottleneck\" (1 note)\n[k00002] Limits on work in progress expose bottlenecks · Delivery flow: Limits on work in progress expose bottlenecks. · see k00001 · open above\n\nFOUND \"zebra crossing\": nothing. The notes may put it in other words.\n\n"
         );
+        // Links read as the titles they lead to.
+        assert_eq!(
+            library.prose("Start with [[k00001|Small batches]], then [[k00002]] and [[gone]]."),
+            "Start with Small batches, then Limits on work in progress expose bottlenecks and gone."
+        );
+        assert_eq!(
+            library.prose("An open [[bracket stays"),
+            "An open [[bracket stays"
+        );
+        assert_eq!(library.get("k00001").unwrap().filed(), None);
+        let dated = Note {
+            created: 1_794_500_000,
+            ..Default::default()
+        };
+        assert_eq!(dated.filed().as_deref(), Some("2026-11-12"));
         // Words that name no note or topic are searched for.
         let mut seen = BTreeSet::new();
         let (text, opened) = library.open(&["queue visible".into()], &mut seen);

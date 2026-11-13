@@ -1734,24 +1734,23 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
             } else {
                 format!("{held} notes")
             };
-            header = header.child(
-                kit::tool(
-                    Some(Icon::Folder),
-                    &title,
-                    "knowledge",
-                    State::show_knowledge,
-                )
-                .help("The knowledge base that informs how your maps are organized. Shows the folder its notes are kept in."),
-            );
+            header = header.child(if s.reading_notes() {
+                kit::tool(Some(Icon::Map), "Back to map", "knowledge", State::close_room)
+            } else {
+                kit::tool(Some(Icon::Folder), &title, "knowledge", State::open_room)
+                    .help("The knowledge base that informs how your maps are organized. Opens it to read, search and ask.")
+            });
         }
-        if !s.story {
+        if !s.story && !s.reading_notes() {
             header = artwork(s, header);
         }
-        if !s.read_only && (!s.history.is_empty() || s.queued_direction.is_some() || s.directing())
+        if !s.read_only
+            && !s.reading_notes()
+            && (!s.history.is_empty() || s.queued_direction.is_some() || s.directing())
         {
             header = header.child(kit::tool(Some(Icon::Undo), "Undo", "undo", State::undo));
         }
-        if !empty || s.story {
+        if (!empty || s.story) && !s.reading_notes() {
             header = header.child(kit::tool(
                 Some(if s.story { Icon::Map } else { Icon::Thread }),
                 if s.story {
@@ -1764,7 +1763,9 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
             ));
         }
     }
-    let main = if s.story {
+    let main = if s.reading_notes() {
+        room::view(s)
+    } else if s.story {
         kit::stage(col().key("story"))
             .grow(1.0)
             .min_h(0.0)
@@ -1800,8 +1801,11 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
         .h_full()
         .gap(12.0)
         .child(header)
-        .child(drop_zone(s, main))
-        .child(dock(s));
+        .child(drop_zone(s, main));
+    // Reading is not adding: the dock that takes thoughts waits until the map is back.
+    if !s.reading_notes() {
+        center = center.child(dock(s));
+    }
     if s.replay.is_some() {
         center = center.child(replay_controls(s));
     } else if s.art_style != Style::Off

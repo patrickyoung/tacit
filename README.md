@@ -92,7 +92,7 @@ cargo run -- --check-file /path/to/file --local  # never leaves this Mac
 
 ## The knowledge base
 
-A dragged file has a second place to land. While files are over the window, the map shows two targets: **Drop to add to this map**, as above, and **Drop to file in the knowledge base**. A file dropped on the second is not turned into thoughts. It is kept, read the same way (the table above applies), and filed by the librarian as a zettelkasten: small notes of one idea each, fitted into what the knowledge base already holds. Nothing is added to the map. The header shows which file is being filed and how far along it is, and afterwards a button with the number of notes, which opens their folder.
+A dragged file has a second place to land. While files are over the window, the map shows two targets: **Drop to add to this map**, as above, and **Drop to file in the knowledge base**. A file dropped on the second is not turned into thoughts. It is kept, read the same way (the table above applies), and filed by the librarian as a zettelkasten: small notes of one idea each, fitted into what the knowledge base already holds. Nothing is added to the map. The header shows which file is being filed and how far along it is, and afterwards a button with the number of notes, which opens them to read (**Reading the knowledge base**, below).
 
 ### How the librarian works
 
@@ -142,6 +142,32 @@ A knowledge base can be filled and looked at from the command line, without open
 cargo run -- --check-knowledge /path/to/folder file.pdf notes.md
 cargo run -- --check-knowledge /path/to/folder --say "Agendas arrive late." --say "No one keeps time." \
   --ask "Arrange this the way my handbook says meetings should run."
+```
+
+### Reading the knowledge base
+
+The button with the number of notes opens the knowledge room in the map's place; **Back to map** returns. The room is laid out for the way someone practised at a zettelkasten reads one, which is a handful of moves:
+
+- **Come in from the top.** The way in lists the topics, each with its overview in a sentence, the files the notes were taken from, and what was filed last. A topic opens on its overview, and lists its notes in the order the overview takes them.
+- **Read one note whole.** Its claim, its text, its keywords and the day it was filed. A page you wrote or changed yourself is marked **Yours**.
+- **Follow a link for its reason.** Under the note are the notes it leads to and the notes that lead to it, each with why it is linked. A note that contradicts it is marked **Disagrees**, in red, in whichever direction the link runs.
+- **Go back to the source.** A note names the file it was taken from, and the file's own note lists every idea taken from it.
+- **Look for a word.** Type in the field and press Enter (or **Find**): the notes nearest those words are listed, nearest first.
+- **Retrace your steps.** **Back**, or Escape, goes to where you were reading, and from the way in back to the map. The room is as you left it when you open it again.
+
+**Ask** hands the question in the field to the **researcher**, an agent that goes through the notes with the same moves. It starts from the question, comes in through the overviews of the topics the question falls in, searches in the notes' words, opens notes in full, follows links by their reasons, and answers only from what it read. Code checks the answer against the reading:
+
+- every note the answer rests on was opened in full; one it had only seen the card of is opened and the answer asked for again, once, and after that the note is left out;
+- a note the answer rests on that another note contradicts is never taken alone: the other is opened too, and the disagreement is shown whether or not the answer mentions it.
+
+The answer page shows the reply with numbered references, the notes it **rests on**, where **the notes disagree**, what is **not in the notes**, what to **read next**, **how it was found** (each search and each note read, which you can follow), and what it cost. The researcher is told never to fill a gap from what it knows itself; asked about something the notes do not hold, it says so and lists what it searched for.
+
+Looking, reading and following links happen on this Mac with no model call. Only **Ask** uses OpenRouter: the question goes to the researcher model with the index, the overviews and cards near the question, and every note it opens on the way. A question takes two to seven model calls; the two tried on a small synthetic knowledge base took two and three calls, 7 to 15 seconds, and about half a cent or less. The researcher uses the librarian's model and effort. Without a key, **Ask** says so and the rest of the room works. What you read in the room is no part of the session: nothing there reaches a map, and the room is left out of the session's recording, as the sessions drawer is. A session that is open read-only can still read.
+
+A question can be asked from the command line. It prints the answer, what it rests on, disagreements, gaps, the way it was found and the cost:
+
+```sh
+cargo run -- --ask-knowledge /path/to/folder "How many people should be in a meeting?"
 ```
 
 ## Saved sessions and replay
@@ -261,12 +287,13 @@ Thought labels spring into their new positions, colored branches fade back in, a
 | Directed turn | `openai/gpt-6.1-terra` | low | 2–5 s, 5–9 s to reorganise a whole map | `TACIT_DIRECT_MODEL`, `TACIT_DIRECT_EFFORT` |
 | Reader: says what a dropped image, scan or long text holds | `openai/gpt-6.1-terra` | low | 2–5 s | `TACIT_READ_MODEL`, `TACIT_READ_EFFORT` |
 | Librarian: reads a filed file, writes its notes, tends the topics | `openai/gpt-6.1-terra` | low | not yet measured | `TACIT_LIBRARY_MODEL`, `TACIT_LIBRARY_EFFORT` |
+| Researcher: answers a question from the notes | the librarian's | the librarian's | 7–15 s on two questions tried | `TACIT_LIBRARY_MODEL`, `TACIT_LIBRARY_EFFORT` |
 
 The defaults were chosen by measurement with the evaluations under **Development**, on synthetic talks scored against what a facilitator would have left on the wall. The placer is the quickest of the small models tried and the one with the tidiest labels. The steward at low effort kept every map sound; more reasoning and dearer models took two to five times as long without leaving a better map. The directed turn needs the larger model: the small ones answered sooner and fell short on every run, reaching only some of the thoughts an instruction covered. The listener cuts a recording in about a third of the time of the larger model used before, at a thirtieth of the cost. The reader and the librarian are the defaults not yet measured: both use the steward's model, the reader because that one reads images and PDFs, and each has only been tried on a few synthetic files. A 36-capture talk mapped end to end (nine placer turns, three to five steward turns) cost between one and two cents. On a third talk, which announces seven kinds of plot and then describes each, the map ends with the seven in families beside the framework that introduces them, each steward turn taking one call. Asked there for a branch per plot, a directed turn of three to seven seconds leaves eight main branches; asked to put all seven under one branch, it takes about five. The steward lets either stand, and is not sent back to them.
 
 An effort of `off` disables reasoning; anything else is passed on as OpenRouter's reasoning effort (`low`, `medium`, `high`). A replacement model must support strict structured output. Provider routing favors latency for the listener and the placer, whose answers are short, and throughput for the steward and directed turns.
 
-Kept thoughts, their labels and branches, the parking lot, and the guidance you submitted go to OpenRouter and its model providers; unsent drafts and Hex audio stay out of these requests. A dropped image, scan or long text goes to the reader as **Dropping files onto the map** sets out, and what a filed file says to the librarian, as do the notes near a map to the map agents, as **The knowledge base** sets out. The placer sees the map as an outline with the latest words; the steward and directed turns also read the original words behind the labels, newest first, up to about 24,000 characters. Cloud calls use your OpenRouter credits. The agent keeps a map of up to 400 thoughts, counting parked ones; a larger map remains editable by hand. Provider error text is never shown or logged, since it can echo a private prompt. Older notebooks load without migration.
+Kept thoughts, their labels and branches, the parking lot, and the guidance you submitted go to OpenRouter and its model providers; unsent drafts and Hex audio stay out of these requests. A dropped image, scan or long text goes to the reader as **Dropping files onto the map** sets out, and what a filed file says to the librarian, as do the notes near a map to the map agents and, when you press **Ask**, your question and the notes read for it to the researcher, as **The knowledge base** sets out. The placer sees the map as an outline with the latest words; the steward and directed turns also read the original words behind the labels, newest first, up to about 24,000 characters. Cloud calls use your OpenRouter credits. The agent keeps a map of up to 400 thoughts, counting parked ones; a larger map remains editable by hand. Provider error text is never shown or logged, since it can echo a private prompt. Older notebooks load without migration.
 
 A small live diagnostic sends only the built-in fictional demo: the placer files it, the steward reads the whole map, the placer files one more thought, and a directed turn renames the map. Each turn's edits are applied the way the journal replays them, and its time, calls and resulting shape are printed:
 
@@ -366,9 +393,11 @@ cargo run -- --scene themes --snap /tmp/tacit-themes.png --size 1280x860
 cargo run -- --scene hierarchy --snap /tmp/tacit-hierarchy.png --size 1680x1000
 cargo run -- --scene mapped --snap /tmp/tacit-mapped.png --size 1280x860
 cargo run -- --scene parked --snap /tmp/tacit-parked.png --size 1280x860
+cargo run -- --scene room --snap /tmp/tacit-room.png --size 1280x860
+cargo run -- --scene answer --snap /tmp/tacit-answer.png --size 1280x860
 ```
 
-`mapped` is a fictional map as the agent leaves one (keyword labels, a repeat combined, links, a thread to read, and a parking lot of each kind); `parked` is the same map with the parking lot open.
+`mapped` is a fictional map as the agent leaves one (keyword labels, a repeat combined, links, a thread to read, and a parking lot of each kind); `parked` is the same map with the parking lot open. `room` is one note open in the knowledge room, over a small fictional knowledge base, and `answer` is a question answered from it.
 
 Headless runs do not read or write your real notebook or contact OpenRouter, Ollama, or Hex. Tests exercise real text entry, selection, reclassification, deletion, undo, storage, locking, organizer validation, and stale-result handling.
 
@@ -381,7 +410,7 @@ Headless runs do not read or write your real notebook or contact OpenRouter, Oll
 - `src/agent/`: `prompt` (the mapper's method told to each tier, and the answer schemas), `brief` (the map as the outline a turn is shown), `wire` (answers read into edits), `step` (one edit against the map), `health` (the rule-based check of the map's shape), `pace` (when each tier is due), `turn` (one model turn, its self-check, and what is remembered from one turn to the next), `worker` (the three lanes, off the UI thread).
 - `src/recording.rs`: the listener, which cuts a finished recording into thoughts without changing a word.
 - `src/ingest.rs`: dropped files, kept in the archive and read into text on this Mac or by the reader model.
-- `src/knowledge.rs`: the knowledge base: notes as Markdown files, their links, which notes are near a text, which pages are the user's own, and the levels an agent is shown them at. `src/knowledge/librarian.rs` is the librarian: the reader, the writer and the curator, and the checks on what they return.
+- `src/knowledge.rs`: the knowledge base: notes as Markdown files, their links, which notes are near a text, which pages are the user's own, and the levels an agent is shown them at. `src/knowledge/librarian.rs` is the librarian: the reader, the writer and the curator, and the checks on what they return. `src/knowledge/research.rs` is the researcher: one question answered by searching and opening notes, and the checks of the answer against what was read.
 - `src/capture.rs`: original render-texture capture and exact presentation.
 - `src/video_archive.rs`: lossless PNG masters, timestamped FFV1/PCM video export.
 - `src/timeline.rs`: durable event log, shared projection, media integrity, WebVTT, and recovery.
@@ -392,7 +421,7 @@ Headless runs do not read or write your real notebook or contact OpenRouter, Oll
 - `src/evolution.rs`: the source ledger (the words behind every thought) and retired thoughts; the whole-map revisions of older journals still replay from here.
 - `src/direction.rs`: the facilitator commands of journals written before the map agent, kept so those journals still replay.
 - `src/voice.rs`: Rune WAV capture, authenticated Hex transcription streams, and exact sample uploads.
-- `src/ui.rs`: Rune canvas, vector illustrations, input, inspector, and narrative view.
+- `src/ui.rs`: Rune canvas, vector illustrations, input, inspector, and narrative view. `src/ui/room.rs` is the knowledge room: the notes read by topic, link, source and search, and the researcher's answers.
 - `design/living-map.html`: the earlier conceptual exploration, independent of the Rust app.
 
 This is a first working vertical slice. With the map agent the tree keeps three to seven main branches (an eighth on your word; four narrative lenses offline) and nests at most three levels deep. Drag positioning, relationship rejection, and SVG/PDF export remain future work. The agent's judgment is measured on synthetic talks only; how it does on a real discussion depends on the configured models. The local-model integration is tested with fixtures; model quality and live inference still need validation with an installed model.
